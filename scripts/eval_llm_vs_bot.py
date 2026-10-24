@@ -223,12 +223,44 @@ def make_opponent(args: argparse.Namespace, task: "HandTask") -> Any:
     )
 
 
-def estimate_hand_cost(input_tokens: int, output_tokens: int, args: argparse.Namespace) -> float:
-    """Estimate RMB cost from reported tokens using the configured prices."""
+def resolve_cache_price(args: argparse.Namespace) -> float:
+    """Return the cached-input price, falling back to the plain input price."""
+    price_cached = getattr(args, "price_cache_input", None)
+    if price_cached is None:
+        return float(getattr(args, "price_input", 0.045))
+    return float(price_cached)
+
+
+def cache_hit_rate(input_tokens: int, cached_tokens: int) -> float:
+    """Return the cached share of input tokens, or 0 when input is empty."""
+    total = max(0, int(input_tokens or 0))
+    if total <= 0:
+        return 0.0
+    cached = min(max(0, int(cached_tokens or 0)), total)
+    return cached / total
+
+
+def estimate_hand_cost(
+    input_tokens: int,
+    output_tokens: int,
+    args: argparse.Namespace,
+    cached_tokens: int = 0,
+) -> float:
+    """Estimate RMB cost from reported tokens using the configured prices.
+
+    Cached input tokens are billed at ``--price-cache-input``, which falls back
+    to ``--price-input`` when unset, so old runs keep their previous cost. The
+    remaining input tokens (misses) are billed at ``--price-input``.
+    """
     price_in = float(getattr(args, "price_input", 0.045))
     price_out = float(getattr(args, "price_output", 0.225))
+    price_cached = resolve_cache_price(args)
+    input_total = max(0, int(input_tokens or 0))
+    cached = min(max(0, int(cached_tokens or 0)), input_total)
+    cache_miss = max(0, input_total - cached)
     return (
-        int(input_tokens) * price_in / 1_000_000.0
+        cache_miss * price_in / 1_000_000.0
+        + cached * price_cached / 1_000_000.0
         + int(output_tokens) * price_out / 1_000_000.0
     )
 
@@ -299,6 +331,9 @@ CSV_FIELDS = [
     "call_ev_not_applicable",
     "api_calls",
     "input_tokens",
+    "cached_input_tokens",
+    "cache_miss_input_tokens",
+    "cache_hit_rate",
     "output_tokens",
     "reasoning_tokens",
     "est_cost_cny",
@@ -392,6 +427,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Input price in RMB per 1M tokens (default 4Router standard tier).",
     )
     parser.add_argument(
+        "--price-cache-input",
+        type=float,
+        default=None,
+        help=(
+            "Cached input price in RMB per 1M tokens; "
+            "defaults to --price-input when omitted."
+        ),
+    )
+    parser.add_argument(
         "--price-output",
         type=float,
         default=0.225,
@@ -429,6 +473,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     thinking.add_argument("--no-thinking", dest="thinking", action="store_false")
     parser.set_defaults(thinking=None)
     parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument(
+        "--context-policy",
+        default=None,
+        choices=("legacy", "full", "compact", "compact_slim"),
+        help="Override runtime.context_policy for this evaluation run.",
+    )
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=None,
+        help="Override runtime.max_context_tokens_estimate; 0 means automatic.",
+    )
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--connect-timeout", type=float, default=20.0)
     parser.add_argument("--retries", type=int, default=1, help="Retries for API/fatal failures.")
@@ -483,6 +539,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("timeouts must be positive")
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error("--max-steps must be positive")
+    if args.max_context_tokens is not None and args.max_context_tokens < 0:
+        parser.error("--max-context-tokens cannot be negative")
     if args.max_tokens is not None and args.max_tokens <= 0:
         parser.error("--max-tokens must be positive")
     if args.temperature is not None and not 0 <= args.temperature <= 2:
@@ -491,6 +549,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--top-p must be in (0, 1]")
     if args.price_input < 0 or args.price_output < 0:
         parser.error("token prices cannot be negative")
+    if args.price_cache_input is not None and args.price_cache_input < 0:
+        parser.error("--price-cache-input cannot be negative")
     if args.budget_cny < 0:
         parser.error("--budget-cny cannot be negative")
     if args.batch_size <= 0:
@@ -542,6 +602,10 @@ def load_runtime(args: argparse.Namespace) -> dict:
     runtime = dict(config.get("llm_runtime", {}))
     if args.max_steps is not None:
         runtime["max_steps_per_turn"] = int(args.max_steps)
+    if args.context_policy is not None:
+        runtime["context_policy"] = str(args.context_policy)
+    if args.max_context_tokens is not None:
+        runtime["max_context_tokens_estimate"] = int(args.max_context_tokens)
     return runtime
 
 
@@ -839,6 +903,14 @@ def play_hand(
 
         input_tokens = int(llm.total_usage.get("input_tokens", 0))
         output_tokens = int(llm.total_usage.get("output_tokens", 0))
+        cached_tokens = max(0, int(llm.total_usage.get("cached_input_tokens", 0)))
+        cache_miss_tokens = max(
+            0,
+            int(
+                llm.total_usage.get("cache_miss_input_tokens")
+                or max(0, input_tokens - cached_tokens)
+            ),
+        )
         row = {
             "hand_index": task.index,
             "group": getattr(args, "group", ""),
@@ -863,9 +935,20 @@ def play_hand(
             **tool_stats,
             "api_calls": api_calls,
             "input_tokens": input_tokens,
+            "cached_input_tokens": cached_tokens,
+            "cache_miss_input_tokens": cache_miss_tokens,
+            "cache_hit_rate": round(cache_hit_rate(input_tokens, cached_tokens), 4),
             "output_tokens": output_tokens,
             "reasoning_tokens": int(llm.total_usage.get("reasoning_tokens", 0)),
-            "est_cost_cny": round(estimate_hand_cost(input_tokens, output_tokens, args), 6),
+            "est_cost_cny": round(
+                estimate_hand_cost(
+                    input_tokens,
+                    output_tokens,
+                    args,
+                    cached_tokens=cached_tokens,
+                ),
+                6,
+            ),
             "auto_turns": auto_turns,
             "invalid_action_auto": invalid_auto,
             "api_error_auto": api_error_auto,
@@ -912,6 +995,9 @@ def play_hand(
             "call_ev_not_applicable": 0,
             "api_calls": 0,
             "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_miss_input_tokens": 0,
+            "cache_hit_rate": 0.0,
             "output_tokens": 0,
             "reasoning_tokens": 0,
             "est_cost_cny": 0.0,
@@ -978,6 +1064,10 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
                 getattr(args, "opponent_kind", "project"), "Opponent"
             ),
             "input_tokens": 0,
+            "total_cached_input_tokens": 0,
+            "total_cache_miss_input_tokens": 0,
+            "cache_hit_rate": 0.0,
+            "cache_hit_rate_mean": 0.0,
             "output_tokens": 0,
             "est_cost_cny": 0.0,
             "error": "all hands failed",
@@ -1047,6 +1137,26 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
     call_ev_not_applicable = sum(
         int(row.get("call_ev_not_applicable", 0)) for row in valid
     )
+    total_input_tokens = sum(int(row.get("input_tokens", 0)) for row in valid)
+    total_output_tokens = sum(int(row.get("output_tokens", 0)) for row in valid)
+    total_cached_input_tokens = sum(
+        int(row.get("cached_input_tokens", 0)) for row in valid
+    )
+    total_cache_miss_input_tokens = sum(
+        int(row.get("cache_miss_input_tokens", 0)) for row in valid
+    )
+    if total_input_tokens > 0 and not (
+        total_cached_input_tokens or total_cache_miss_input_tokens
+    ):
+        # Rows produced before cache accounting existed: treat all input as miss.
+        total_cache_miss_input_tokens = total_input_tokens
+    hand_cache_hit_rates = [
+        cache_hit_rate(
+            int(row.get("input_tokens", 0)),
+            int(row.get("cached_input_tokens", 0)),
+        )
+        for row in valid
+    ]
     api_latencies = [
         float(event.get("latency_ms", 0.0))
         for row in valid
@@ -1124,8 +1234,18 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
         "call_ev_not_applicable": call_ev_not_applicable,
         "call_ev_applicable_calls": call_ev_calls - call_ev_not_applicable,
         "api_calls": sum(int(row.get("api_calls", 0)) for row in valid),
-        "input_tokens": sum(int(row.get("input_tokens", 0)) for row in valid),
-        "output_tokens": sum(int(row.get("output_tokens", 0)) for row in valid),
+        "input_tokens": total_input_tokens,
+        "total_cached_input_tokens": total_cached_input_tokens,
+        "total_cache_miss_input_tokens": total_cache_miss_input_tokens,
+        "cache_hit_rate": round(
+            cache_hit_rate(total_input_tokens, total_cached_input_tokens), 4
+        ),
+        "cache_hit_rate_mean": round(
+            statistics.fmean(hand_cache_hit_rates), 4
+        )
+        if hand_cache_hit_rates
+        else 0.0,
+        "output_tokens": total_output_tokens,
         "reasoning_tokens": sum(int(row.get("reasoning_tokens", 0)) for row in valid),
         "est_cost_cny": round(
             sum(float(row.get("est_cost_cny", 0.0)) for row in valid), 6
@@ -1217,6 +1337,7 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         f"- 提示词工具推荐: {recommend_text}",
         f"- 手数: {summary.get('hands', 0)}，同牌换座组: {summary.get('paired_deals', 0)}",
         f"- 规则: {args.chips} 筹码，盲注 {args.sb}/{args.bb}，每手重置筹码",
+        f"- 单价: 输入 ¥{args.price_input}/M，缓存输入 ¥{resolve_cache_price(args)}/M，输出 ¥{args.price_output}/M",
         "",
         "## 结果",
         "",
@@ -1232,6 +1353,9 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         f"| 摊牌率 | {summary.get('showdown_pct', 0):.1f}% |",
         f"| 全下手牌占比 | {summary.get('allin_hand_pct', 0):.1f}% |",
         f"| API 错误手数 | {summary.get('hands_with_api_error', 0)} |",
+        f"| 缓存命中输入 token | {summary.get('total_cached_input_tokens', 0)} |",
+        f"| 缓存未命中输入 token | {summary.get('total_cache_miss_input_tokens', 0)} |",
+        f"| 缓存命中率 | {summary.get('cache_hit_rate', 0.0) * 100:.1f}% |",
         f"| 估算费用 | ¥{summary.get('est_cost_cny', 0.0):.4f} |",
         f"| 自动行动回合 | {summary.get('auto_turns', 0)} |",
         f"| 其中 API 错误导致 | {summary.get('api_error_auto', 0)} |",
@@ -1269,7 +1393,8 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         "- `invalid_action_auto` 记录模型连续非法动作或超步数导致的自动跟注/弃牌。",
         "- `api_error_auto` 记录 API 失败后系统自动跟注/过牌/弃牌的回合。",
         "- 工具使用统计来自 `tool_result` 事件，`call_ev` 在无跟注时返回 `applicable=false`，仍计入调用次数。",
-        "- 费用按输入 ¥/1M 与输出 ¥/1M 的配置单价估算，不含缓存；Provider 未返回 usage 时会偏保守。",
+        "- 费用按缓存未命中输入、缓存命中输入与输出三档单价估算；未指定 `--price-cache-input` 时缓存命中输入按 `--price-input` 计，等价于旧的估算方式。",
+        "- 缓存命中率按总输入 token 加权（缓存命中 / 输入）；Provider 未返回缓存字段时按全部未命中处理，结果会偏保守。",
     ]
     if "call_ev" in tools:
         lines.append(
@@ -1403,6 +1528,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "random_calls": 0,
                         "call_ev_calls": 0,
                         "call_ev_not_applicable": 0,
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_miss_input_tokens": 0,
+                        "cache_hit_rate": 0.0,
+                        "output_tokens": 0,
+                        "reasoning_tokens": 0,
                         "est_cost_cny": 0.0,
                         "duration_sec": 0.0,
                         "attempts": 0,
@@ -1475,9 +1606,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary["duplicate"] = bool(args.duplicate)
     summary["workers"] = args.workers
     summary["llm_params"] = params
+    summary["context_policy"] = str(runtime.get("context_policy") or "legacy")
+    summary["max_context_tokens_estimate"] = int(
+        runtime.get("max_context_tokens_estimate", 0) or 0
+    )
+    summary["context_high_water_tokens"] = int(
+        runtime.get("context_high_water_tokens", 0) or 0
+    )
+    summary["context_low_water_tokens"] = int(
+        runtime.get("context_low_water_tokens", 0) or 0
+    )
     summary["opponent_kind"] = args.opponent_kind
     summary["opponent_name"] = args.opponent_name
     summary["price_input_per_m"] = args.price_input
+    cache_price = resolve_cache_price(args)
+    summary["price_cache_input"] = cache_price
+    summary["price_cache_input_per_m"] = cache_price
     summary["price_output_per_m"] = args.price_output
     summary["budget_cny"] = args.budget_cny
     summary["stopped_for_budget"] = stopped_for_budget
@@ -1512,6 +1656,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         f"api: {summary.get('api_calls', 0)} calls, "
         f"{summary.get('input_tokens', 0)} input / {summary.get('output_tokens', 0)} output tokens, "
+        f"cache hit {summary.get('cache_hit_rate', 0.0) * 100:.1f}% "
+        f"({summary.get('total_cached_input_tokens', 0)} cached / "
+        f"{summary.get('total_cache_miss_input_tokens', 0)} miss), "
         f"est cost Y{summary.get('est_cost_cny', 0.0):.4f}, "
         f"{summary.get('hands_with_api_error', 0)} hands with errors, "
         f"{summary.get('invalid_action_auto', 0)} invalid-action auto turns, "

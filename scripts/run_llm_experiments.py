@@ -78,6 +78,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--retry-backoff", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--connect-timeout", type=float, default=8.0)
+    parser.add_argument(
+        "--context-policy",
+        default=None,
+        choices=("legacy", "full", "compact", "compact_slim"),
+    )
+    parser.add_argument("--max-context-tokens", type=int, default=None)
     parser.add_argument("--pilot-hands", type=int, default=20)
     parser.add_argument("--full-hands", type=int, default=400)
     parser.add_argument("--condition-attempts", type=int, default=3)
@@ -87,6 +93,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--relay-wait", type=float, default=1800.0)
     parser.add_argument("--budget-cny", type=float, default=22.0)
     parser.add_argument("--price-input", type=float, default=0.045)
+    parser.add_argument(
+        "--price-cache-input",
+        type=float,
+        default=None,
+        help="Cached input price; defaults to --price-input when omitted.",
+    )
     parser.add_argument("--price-output", type=float, default=0.225)
     parser.add_argument("--chips", type=int, default=1000)
     parser.add_argument("--sb", type=int, default=5)
@@ -107,6 +119,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--retry-backoff cannot be negative")
     if args.timeout <= 0 or args.connect_timeout <= 0:
         parser.error("timeouts must be positive")
+    if args.max_context_tokens is not None and args.max_context_tokens < 0:
+        parser.error("--max-context-tokens cannot be negative")
     if args.condition_attempts <= 0:
         parser.error("--condition-attempts must be positive")
     if args.retry_pause < 0:
@@ -121,6 +135,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--budget-cny must be positive")
     if args.price_input < 0 or args.price_output < 0:
         parser.error("token prices cannot be negative")
+    if args.price_cache_input is not None and args.price_cache_input < 0:
+        parser.error("--price-cache-input cannot be negative")
     args.output = args.output or (
         PROJECT_ROOT
         / "tmp"
@@ -219,6 +235,16 @@ def build_command(
         str(args.seed),
         "--deal-offset",
         str(args.deal_offset),
+        *(
+            ["--context-policy", str(args.context_policy)]
+            if args.context_policy is not None
+            else []
+        ),
+        *(
+            ["--max-context-tokens", str(args.max_context_tokens)]
+            if args.max_context_tokens is not None
+            else []
+        ),
         "--agent-locale",
         args.agent_locale,
         "--reasoning-effort",
@@ -233,6 +259,11 @@ def build_command(
         f"{max(0.05, remaining_budget):.4f}",
         "--price-input",
         str(args.price_input),
+        *(
+            ["--price-cache-input", str(args.price_cache_input)]
+            if args.price_cache_input is not None
+            else []
+        ),
         "--price-output",
         str(args.price_output),
         "--retries",
@@ -346,9 +377,16 @@ def budget_payload(
         "spent_cny": round(spent, 6),
         "remaining_cny": round(max(0.0, args.budget_cny - spent), 6),
         "price_input_per_m": args.price_input,
+        "price_cache_input_per_m": (
+            args.price_input
+            if args.price_cache_input is None
+            else args.price_cache_input
+        ),
         "price_output_per_m": args.price_output,
         "seed": args.seed,
         "deal_offset": args.deal_offset,
+        "context_policy": args.context_policy,
+        "max_context_tokens_estimate": args.max_context_tokens,
         "conditions": list(rows),
     }
 
@@ -395,7 +433,7 @@ def write_top_report(
         f"- 并发: {args.workers}",
         f"- 每组手数: {full_hands}（{full_hands // 2} 副牌 × 2 个座位）",
         f"- 累计估算费用: ¥{spent:.4f} / 预算 ¥{args.budget_cny:.2f}",
-        f"- 单价: 输入 ¥{args.price_input:.4f}/M，输出 ¥{args.price_output:.4f}/M",
+        f"- 单价: 输入 ¥{args.price_input:.4f}/M，缓存输入 ¥{args.price_input if args.price_cache_input is None else args.price_cache_input:.4f}/M，输出 ¥{args.price_output:.4f}/M",
         "",
     ]
     if args.experiment in ("all", "a"):

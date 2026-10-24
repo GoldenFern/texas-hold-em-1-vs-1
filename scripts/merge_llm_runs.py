@@ -38,9 +38,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--provider-config", default="")
     parser.add_argument("--llm-name", default="GPT-6 Luna (DXH)")
     parser.add_argument("--price-input", type=float, default=0.0198)
+    parser.add_argument("--price-cache-input", type=float, default=None)
     parser.add_argument("--price-output", type=float, default=0.099)
     parser.add_argument("--expected-hands", type=int, default=0)
     args = parser.parse_args(argv)
+    if args.price_input < 0 or args.price_output < 0:
+        parser.error("token prices cannot be negative")
+    if args.price_cache_input is not None and args.price_cache_input < 0:
+        parser.error("--price-cache-input cannot be negative")
     args.runs = [path.resolve() for path in args.runs]
     args.output = args.output.resolve()
     return args
@@ -124,6 +129,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "llm_name": args.llm_name,
                 "source_runs": [str(path) for path in args.runs],
                 "price_input_per_m": args.price_input,
+                "price_cache_input_per_m": (
+                    args.price_input
+                    if args.price_cache_input is None
+                    else args.price_cache_input
+                ),
                 "price_output_per_m": args.price_output,
             }
         )
@@ -159,6 +169,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "provider_config": args.provider_config,
         "llm_name": args.llm_name,
         "source_runs": [str(path) for path in args.runs],
+        "price_input_per_m": args.price_input,
+        "price_cache_input_per_m": (
+            args.price_input
+            if args.price_cache_input is None
+            else args.price_cache_input
+        ),
+        "price_output_per_m": args.price_output,
         "hands_per_group": {
             group: summaries[group].get("hands", 0)
             for group in summaries
@@ -182,7 +199,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"- 合并运行: {len(args.runs)} 次",
         f"- 每组手数: {', '.join(f'{GROUP_LABELS.get(g, g)} {summaries[g].get('hands', 0)}' for g in summaries)}",
         f"- 累计估算费用: ¥{combined['total_cost_cny']:.4f}",
-        f"- 单价: 输入 ¥{args.price_input:.4f}/M，输出 ¥{args.price_output:.4f}/M",
+        f"- 单价: 输入 ¥{args.price_input:.4f}/M，缓存输入 ¥{args.price_input if args.price_cache_input is None else args.price_cache_input:.4f}/M，输出 ¥{args.price_output:.4f}/M",
         "",
         "## 总表",
         "",

@@ -88,6 +88,16 @@ class ModelSpec:
         else:
             params["reasoning_effort"] = ""
 
+        # The provider counts prompt + completion against the same window.
+        # Keep a small prompt reserve even when the model advertises a very
+        # large max output (Doubao Seed 2.1 lists 256K output on a 256K window).
+        if self.context_window > 0:
+            safe_max = max(1024, int(self.context_window) - 8192)
+            params["max_tokens"] = min(
+                int(params.get("max_tokens", 32768)),
+                safe_max,
+            )
+
         # Some models require a slightly higher temperature in thinking mode.
         if self.provider_id == "qwen" and params.get("thinking"):
             params["temperature"] = max(float(params.get("temperature", 0.7)), 0.6)

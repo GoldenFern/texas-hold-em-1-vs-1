@@ -77,7 +77,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--high-water", type=int, default=30000)
     parser.add_argument("--low-water", type=int, default=12000)
     parser.add_argument("--keep-hands", type=int, default=2)
-    parser.add_argument("--max-context", type=int, default=220000)
+    parser.add_argument(
+        "--max-context",
+        type=int,
+        default=0,
+        help="Hard prompt budget; 0 uses the model context window minus output reserve.",
+    )
     parser.add_argument("--stream-usage", action="store_true")
     parser.add_argument(
         "--cache-scope",
@@ -202,9 +207,7 @@ def play_session(args: argparse.Namespace) -> dict:
             "context_keep_recent_hands": args.keep_hands,
             "state_detail": "compact" if args.policy == "compact_slim" else "full",
             "tool_detail": "compact" if args.policy == "compact_slim" else "full",
-            "max_context_tokens_estimate": (
-                900000 if args.policy == "full" else args.max_context
-            ),
+            "max_context_tokens_estimate": args.max_context,
         }
     )
 
@@ -506,7 +509,9 @@ def summarize(session: dict, requests: Sequence[dict]) -> dict:
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
         "cache_scope": args.cache_scope,
-        "context_limit": args.max_context if args.policy == "legacy" else args.high_water,
+        "context_limit": (args.max_context or "auto")
+        if args.policy == "legacy"
+        else args.high_water,
         "high_water": args.high_water,
         "low_water": args.low_water,
         "keep_hands": args.keep_hands,

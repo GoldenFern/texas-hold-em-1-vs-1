@@ -111,6 +111,7 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - `config/experiments/dxh_providers.json` 是实验专用配置，不接入前端和服务端 Provider 列表；用 `--provider dxh --provider-config config/experiments/dxh_providers.json --model gpt-6-luna` 使用。DXH 中转（`https://api.430123.xyz/v1`，`DXH_API_KEY`）的流式、工具调用和 usage 正常，16 并发小样本无 429；它的 prompt token 统计明显高于 4Router。DXH 实验单价按 4Router 标准档的 44% 计：输入 ¥0.0198/M、输出 ¥0.099/M。
 - `scripts/run_llm_experiments.py --experiment b` 只跑五组工具对照，不跑三个固定策略 Bot；`--price-input`/`--price-output` 用于不同中转站的单价，`--relay-host` 用于切换健康检查域名。
 - 补跑牌局用 `--deal-offset` 指定新的 deal 区间，避免和已有牌局重叠；`scripts/merge_llm_runs.py` 按 `(deal_index, assignment)` 合并多次运行，重算 1000 手级别的汇总和配对比较。
+- 长实验跨时间补跑时必须固定上下文策略：`eval_llm_vs_bot.py --context-policy legacy --max-context-tokens 220000`（或统一用新的 `compact_slim`），否则默认值切换会让同一实验的前后条件不可比。`run_llm_experiments.py` 已透传这两个参数。
 - `build_system_prompt(..., extra_instructions=...)` 只给实验附加“强烈推荐但非强制”的工具建议；默认不传，UI 提示词仍由模型自行判断是否调用工具。
 - 上下文预算会计入 `reasoning_content`、工具名、参数和 tool id；每轮模型调用前都会重新检查并裁剪。
 - `LLMAgent.cancel()` 会设置取消标记，客户端在每次流式读取前检查，旧比赛不会继续烧模型调用。
@@ -122,23 +123,27 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - 客户端在 400 时会自动去掉可选厂商字段（`thinking`、`reasoning_effort`、`tool_stream`、`stream_options`、`preserve_thinking`、`reasoning_content`）重试一次。
 - `LLMAgent` 不拥有引擎；通过 `validate_action` 回调让 session 用 `game.preview()` 在副本上校验。
 
-## 上下文策略（预实验）
+## 上下文策略（默认 compact_slim / fresh）
 
-- `LLMAgent` 的 `runtime.context_policy` 支持 `legacy` / `full` / `compact` / `compact_slim`；默认 `legacy`，不要在没有对照结果前改默认。`config/game.json` 的 `llm_runtime` 已暴露 `context_policy`、高/低水位、保留手数和 `final_talk_context`，默认仍是 `legacy` / `full`。
+- `LLMAgent` 的 `runtime.context_policy` 支持 `legacy` / `full` / `compact` / `compact_slim`。当前默认已切到 `compact_slim`，`final_talk_context` 默认 `fresh`；`legacy` / `full` 只作为回退。`config/game.json` 暴露 `context_policy`、高/低水位、保留手数和 `final_talk_context`。
+- 如果回退到 `legacy`，建议同时把 `max_context_tokens_estimate` 设为正数硬上限；`0` 自动预算在 1M 模型上会让 legacy 一直长到接近窗口上限。
 - `legacy` 保持原有行为：超过 `max_context_tokens_estimate` 后从最早的 turn 开始删。它会改变 system prompt 之后的前缀，长对局缓存命中会明显下降。
 - `compact` 每手结束写一条 `【手牌摘要 · 第 N 手】` 用户消息，只保留最近 `context_keep_recent_hands` 手的详情，超过 `context_high_water_tokens` 时整段丢弃旧手消息。当前手永不裁。
 - 压缩只删除完整消息，不修改保留的 assistant 消息；DeepSeek 工具模式要求回传的 `reasoning_content` 必须原样保留。
 - `compact_slim` 额外使用精简回合状态（`build_compact_turn_message`）和精简工具结果（去掉重复 `note`、`lose`、`ev_fold` 等字段）。被删掉字段的单位和假设已补到 `src/llm/tools.py` 的 tool description，不要重新塞回每次工具结果。
-- `ContextSettings.with_context_window()` 会按 `max_context_tokens - 4096` clamp 高/低水位；小上下文模型不会因为配置的 120k 高水位而绕过压缩。
+- `ContextSettings.with_context_window()` 会按 `max_context_tokens - 4096` clamp 高/低水位；小上下文模型不会因为配置的高水位而绕过压缩。
+- `max_context_tokens_estimate=0` 表示自动预算：`context_window - max_tokens - 2048`；正数才作为硬上限。当前默认高水位 160k、低水位 50k，配合自动预算，避免所有模型都被 220k 一刀切。
 - `LLMAgent` 用 `MatchStats` 聚合赛后摘要；`hand_results` 只保留最近 200 手用于调试，不再无限增长。`final_talk_response` / `final_talk_end` 事件会带赛后喊话自己的 usage。
 - `ChatResult.usage` 现在包含 `cached_input_tokens`、`cache_miss_input_tokens`；`message_end` 事件会透传，评测脚本可直接统计。DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 会解析，前端暂未展示。
 - `LLMClient` 支持可选 `user_id`；DeepSeek 用它做 KV cache 隔离。实验脚本用 `--cache-scope` 给每个 run 独立缓存域，避免跨 run 共享缓存污染命中率。
-- `runtime.final_talk_context` 支持 `full` / `fresh`；`fresh` 使用短 system prompt + 比赛摘要 + 最后一手结果，不改动比赛历史。默认 `full` 保持旧行为。
+- `runtime.final_talk_context` 支持 `full` / `fresh`；`fresh` 使用短 system prompt + 比赛摘要 + 最后一手结果，不改动比赛历史。当前默认 `fresh`，`full` 保留回退。
 - `scripts/preview_context.py` 是短程连续对局预实验，输出到 `tmp/context_preview/`，并保存 `messages.json` 供赛后喊话对照使用；结果和注意事项见 `docs/context_preview.md`。
 - `scripts/preview_final_talk.py` 读取 `messages.json`，用同一终局对比 `full` 和 `fresh` 赛后喊话的 token、缓存、延迟和文本；结果见 `docs/final_talk_preview.md`。
-- 2026-10-24 赛后喊话预实验（20 手历史，5 次重复）：`fresh` 输入 615 token，`full` 108,500；热缓存费用约 `$0.00009` vs `$0.00044`，冷缓存约 `$0.000145` vs `$0.0162`。`fresh` 可读但更模板化，默认切换前先确认这个取舍。
+- 2026-10-24 赛后喊话预实验（20 手历史，5 次重复）：`fresh` 输入 615 token，`full` 108,500；热缓存费用约 `$0.00009` vs `$0.00044`，冷缓存约 `$0.000145` vs `$0.0162`。`fresh` 已作为默认，`full` 保留回退；如果觉得太模板化，下一步试 `fresh + 最近 3 手摘要`。
 - 2026-10-24 预实验（20 手，20k 上限，独立 `user_id`）：`legacy` 缓存命中 44.9%，`compact_slim` 96.9%；费用/turn `$0.00236` vs `$0.00025`。
-- 2026-10-24 B 组（50 手，seed 2027）：`legacy` 缓存命中 31.1%，76 次裁剪，费用/turn `$0.00265`；`compact_slim` 96.7%，6 次压缩，费用/turn `$0.00035`。净筹码 `-848` vs `+2524`，但 50 手 CI 很宽、行动不同，不能据此判断胜率。
+- 2026-10-24 B 组（50 手，seed 2027，20k 高水位）：`legacy` 缓存命中 31.1%，76 次裁剪，费用/turn `$0.00265`；`compact_slim` 96.7%，6 次压缩，费用/turn `$0.00035`。净筹码 `-848` vs `+2524`。
+- 2026-10-24 P1 验证（50 手，seed 2027，160k 高水位）：`compact_slim` 缓存命中 99.5%，0 次压缩，费用 `$0.1037`，费用/turn `$0.00065`，终局上下文约 118k。比 20k 高水位贵约 1.7 倍，但上下文空间大得多；这是当前默认。
+- 以上净筹码和 bb/100 的 CI 都很宽、行动不同，只能看方向，不能据此判断胜率。
 
 ## 桌边喊话（LLM vs LLM）
 
@@ -155,16 +160,17 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 
 ## Provider 事实（2026-10）
 
-- DeepSeek：`thinking: {type}` + `reasoning_effort: low/high/max`；思考模式工具回合必须回传 reasoning_content，否则 400。
-- 火山方舟：OpenAI 兼容，`thinking: {type: enabled/disabled}`；模型 `doubao-seed-2-1-turbo-260628`。
-- MiniMax M3.1 Flash：始终思考，`thinking.type` 只接受 adaptive；忽略 temperature/top_p；有 `reasoning_effort`。
-- Qwen3.8 Flash：`enable_thinking`（extra_body），`preserve_thinking` 默认 true；思考模式 temperature 低于 0.6 会被抬高。
-- GLM-5.3 Flash：思考常开，`reasoning_effort` low/high/max，推荐 temperature 1.0、top_p 0.95；支持 `tool_stream`。
-- Kimi K2.7 Code：强制思考，262K 上下文，`reasoning_content` 保留；不要发送不支持的 thinking 参数。
-- LongCat 2.5 Preview：`thinking: {type}`，思考开启时 temperature 固定 1.0，128K 输出上限。
+- DeepSeek：`thinking: {type}` + `reasoning_effort: low/high/max`；思考模式工具回合必须回传 reasoning_content，否则 400。官方上下文 1,048,576，最大输出 393,216（384K）。
+- 火山方舟：OpenAI 兼容，`thinking: {type: enabled/disabled}`；模型 `doubao-seed-2-1-turbo-260628`，256K 上下文、256K 最大输出。
+- MiniMax M3.1 Flash：始终思考，`thinking.type` 只接受 adaptive；忽略 temperature/top_p；有 `reasoning_effort`；1M 上下文、128K 输出。
+- Qwen3.8 Flash：`enable_thinking`（extra_body），`preserve_thinking` 默认 true；思考模式 temperature 低于 0.6 会被抬高；1M 上下文、131K 输出。
+- GLM-5.3 Flash：思考常开，`reasoning_effort` low/high/max，推荐 temperature 1.0、top_p 0.95；支持 `tool_stream`；1M 上下文、128K 输出。
+- Kimi K2.7 Code：强制思考，262K 上下文，最大输出 32,768；`reasoning_content` 保留；不要发送不支持的 thinking 参数。不要把 max_output 配成 131K。
+- LongCat 2.5 Preview：`thinking: {type}`，思考开启时 temperature 固定 1.0，1M 上下文、128K 输出上限。
 - MiMo V2.6 Flash：`thinking: {type: enabled/disabled}`，1M 上下文、128K 输出，`reasoning_content` 在流式和非流式都会返回，工具回合需要原样回传；思考模式下 temperature/top_p 被强制为 1.0/0.95。Key 为 `.env` 的 `MIMO_API_KEY`。
-- GPT-6 Luna（4Router 中转，0.45 分组）：OpenAI 兼容，只有 `reasoning_effort`（none/low/medium/high/xhigh/max）可调，始终推理；4Router 目前不回传 `reasoning_content`，但会消耗 reasoning tokens。Key 为 `.env` 的 `FOURROUTER_API_KEY`，base URL `https://4router.net/v1`。
-- 默认 `max_tokens=32768`；不要改回 3000 这种保守值。UI 控件范围来自 `config/providers.json`。
+- GPT-6 Luna（4Router 中转，0.45 分组）：OpenAI 兼容，只有 `reasoning_effort`（none/low/medium/high/xhigh/max）可调，始终推理；4Router 目前不回传 `reasoning_content`，但会消耗 reasoning tokens。Key 为 `.env` 的 `FOURROUTER_API_KEY`，base URL `https://4router.net/v1`。官方硬窗口 1,050,000（输入上限 922K、输出 128K），但输入超过 272K 时整次请求按 2x input / 1.5x output 计费；本项目按 272K 运营预算配置，避免跨入高价档。
+- 2026-10-24 4Router GPT-6 Luna 冒烟未完成：45 秒读超时、5 次重试下 10 分钟仍无结果，已手动停止；配置按官方文档更新，但中转连通性需要单独排查。
+- 默认 `max_tokens=32768`；不要改回 3000 这种保守值。UI 控件范围来自 `config/providers.json`。`ModelSpec.normalize_params` 会把 `max_tokens` 限制在 `context_window - 8192`，避免 Doubao 这类“256K 上下文 + 256K 输出”的模型把 prompt 空间吃光。
 
 新增/修改 Provider：改 `config/providers.json` 的 `request` 与 `controls`，然后在 `src/llm/providers.py` 的 `build_payload` 里确认映射。前端会自动渲染参数控件。
 

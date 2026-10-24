@@ -9,11 +9,13 @@ import pytest
 from scripts.eval_llm_vs_bot import (
     HandTask,
     build_tool_recommendation,
+    cache_hit_rate,
     count_auto_turns,
     estimate_hand_cost,
     hand_tool_stats,
     make_opponent,
     resolve_tool_names,
+    summarize,
 )
 from src.agents.scripted_bot import ScriptedBot
 
@@ -118,6 +120,94 @@ def test_estimate_hand_cost_uses_per_million_prices() -> None:
     args = SimpleNamespace(price_input=0.045, price_output=0.225)
     assert estimate_hand_cost(1_000_000, 1_000_000, args) == pytest.approx(0.27)
     assert estimate_hand_cost(0, 0, args) == 0.0
+
+
+def test_estimate_hand_cost_charges_cached_input_at_cache_price() -> None:
+    args = SimpleNamespace(
+        price_input=0.045,
+        price_cache_input=0.003,
+        price_output=0.225,
+    )
+    cost = estimate_hand_cost(
+        1_000_000,
+        1_000_000,
+        args,
+        cached_tokens=400_000,
+    )
+    # 600k miss at 0.045 + 400k cached at 0.003 + 1M output at 0.225.
+    assert cost == pytest.approx(0.2532)
+
+
+def test_estimate_hand_cost_falls_back_to_input_price_without_cache_price() -> None:
+    args = SimpleNamespace(
+        price_input=0.045,
+        price_cache_input=None,
+        price_output=0.225,
+    )
+    assert estimate_hand_cost(
+        1_000_000, 0, args, cached_tokens=1_000_000
+    ) == pytest.approx(0.045)
+    # Backwards compatible with legacy args that predate --price-cache-input.
+    legacy_args = SimpleNamespace(price_input=0.045, price_output=0.225)
+    assert estimate_hand_cost(
+        1_000_000, 0, legacy_args, cached_tokens=1_000_000
+    ) == pytest.approx(0.045)
+
+
+def test_cache_hit_rate_handles_empty_and_bounded_input() -> None:
+    assert cache_hit_rate(1_000, 250) == pytest.approx(0.25)
+    assert cache_hit_rate(0, 0) == 0.0
+    assert cache_hit_rate(1_000, 0) == 0.0
+    assert cache_hit_rate(100, 200) == pytest.approx(1.0)
+
+
+def _cache_row(
+    hand_index: int,
+    input_tokens: int,
+    cached_tokens: int,
+) -> dict:
+    return {
+        "hand_index": hand_index,
+        "deal_index": hand_index,
+        "llm_seat": 0,
+        "net_llm": 0,
+        "net_bot": 0,
+        "pot": 20,
+        "llm_actions_count": 1,
+        "bot_actions_count": 1,
+        "duration_sec": 1.0,
+        "auto_turns": 0,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_tokens,
+        "cache_miss_input_tokens": max(0, input_tokens - cached_tokens),
+        "cache_hit_rate": cache_hit_rate(input_tokens, cached_tokens),
+        "output_tokens": 0,
+        "actions": [],
+    }
+
+
+def test_summarize_weights_cache_hit_rate_by_input_tokens() -> None:
+    rows = [
+        _cache_row(0, input_tokens=3_000, cached_tokens=3_000),
+        _cache_row(1, input_tokens=1_000, cached_tokens=0),
+    ]
+    summary = summarize(rows, SimpleNamespace(bb=10, agent_locale="zh-CN"))
+    assert summary["input_tokens"] == 4_000
+    assert summary["total_cached_input_tokens"] == 3_000
+    assert summary["total_cache_miss_input_tokens"] == 1_000
+    # Weighted rate is 0.75; the per-hand mean would be 0.5.
+    assert summary["cache_hit_rate"] == pytest.approx(0.75)
+    assert summary["cache_hit_rate_mean"] == pytest.approx(0.5)
+
+
+def test_summarize_counts_legacy_rows_without_cache_fields_as_misses() -> None:
+    row = _cache_row(0, input_tokens=1_000, cached_tokens=0)
+    for key in ("cached_input_tokens", "cache_miss_input_tokens", "cache_hit_rate"):
+        row.pop(key)
+    summary = summarize([row], SimpleNamespace(bb=10, agent_locale="zh-CN"))
+    assert summary["total_cached_input_tokens"] == 0
+    assert summary["total_cache_miss_input_tokens"] == 1_000
+    assert summary["cache_hit_rate"] == 0.0
 
 
 def test_make_opponent_selects_scripted_policy() -> None:

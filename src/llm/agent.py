@@ -119,12 +119,23 @@ class LLMAgent(BaseAgent):
         self.skip_estimate_on_complete_board = bool(
             runtime.get("skip_estimate_on_complete_board", False)
         )
-        runtime_budget = int(runtime.get("max_context_tokens_estimate", 220000))
+        # Context budget: ``max_context_tokens_estimate=0`` means automatic,
+        # i.e. the model window minus the reserved output tokens minus a
+        # 2048-token safety margin.  A positive runtime value is a hard cap
+        # that can only tighten the automatic model budget; when the model
+        # window is unknown it is used as-is, with 220000 as the last resort.
+        runtime_cap = int(runtime.get("max_context_tokens_estimate", 0) or 0)
         reserved_output = int(self.params.get("max_tokens", 32768))
         context_window = int(getattr(spec, "context_window", 0) or 0)
         if context_window > 0:
-            runtime_budget = min(runtime_budget, context_window - reserved_output - 2048)
-        self.max_context_tokens = max(8000, runtime_budget)
+            model_budget = max(8000, context_window - reserved_output - 2048)
+            if runtime_cap > 0:
+                prompt_budget = min(runtime_cap, model_budget)
+            else:
+                prompt_budget = model_budget
+        else:
+            prompt_budget = runtime_cap if runtime_cap > 0 else 220000
+        self.max_context_tokens = max(8000, prompt_budget)
         self.context = self.context.with_context_window(self.max_context_tokens)
         self.max_estimate_calls = int(runtime.get("max_estimate_calls_per_turn", 2))
         self.max_estimate_iterations = int(runtime.get("max_estimate_iterations", 50000))

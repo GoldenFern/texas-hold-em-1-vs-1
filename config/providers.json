@@ -19,8 +19,8 @@
           "id": "deepseek-flash",
           "name": "DeepSeek V4.1 Flash",
           "tagline": "1M 上下文 · 原生工具调用",
-          "context_window": 1000000,
-          "max_output": 131072,
+          "context_window": 1048576,
+          "max_output": 393216,
           "defaults": {
             "temperature": 1.0,
             "top_p": 1.0,
@@ -48,10 +48,10 @@
             "max_tokens": {
               "show": true,
               "min": 1024,
-              "max": 131072,
+              "max": 393216,
               "step": 1024,
-              "hint": "输出上限 131072，别把思考预算卡太死",
-              "hint_en": "Output cap 131072; don't squeeze the thinking budget"
+              "hint": "输出上限 393216，别把思考预算卡太死",
+              "hint_en": "Output cap 393216; don't squeeze the thinking budget"
             },
             "thinking": {
               "mode": "toggle",
@@ -96,7 +96,7 @@
           "name": "Doubao Seed 2.1 Turbo",
           "tagline": "Agent 通用模型 · 256K 上下文",
           "context_window": 256000,
-          "max_output": 131072,
+          "max_output": 256000,
           "defaults": {
             "temperature": 0.8,
             "top_p": 0.95,
@@ -124,7 +124,7 @@
             "max_tokens": {
               "show": true,
               "min": 1024,
-              "max": 131072,
+              "max": 256000,
               "step": 1024,
               "hint": "Seed 2.1 支持长输出",
               "hint_en": "Seed 2.1 supports long outputs"
@@ -317,7 +317,7 @@
           "id": "glm-5.3-flash",
           "name": "GLM-5.3 Flash",
           "tagline": "1M 上下文 · 原生多模态 · 长程 Agent",
-          "context_window": 1000000,
+          "context_window": 1048576,
           "max_output": 131072,
           "defaults": {
             "temperature": 1.0,
@@ -394,7 +394,7 @@
           "name": "Kimi K2.7 Code",
           "tagline": "262K 上下文 · 强制思考 · 交错工具调用",
           "context_window": 262144,
-          "max_output": 131072,
+          "max_output": 32768,
           "defaults": {
             "temperature": 1.0,
             "top_p": 0.95,
@@ -422,10 +422,10 @@
             "max_tokens": {
               "show": true,
               "min": 1024,
-              "max": 131072,
+              "max": 32768,
               "step": 1024,
-              "hint": "模型最大输出约 235K，这里保守用 131072 上限",
-              "hint_en": "Model max output is about 235K; capped here at 131072"
+              "hint": "输出上限 32768",
+              "hint_en": "Output cap 32768"
             },
             "thinking": {
               "mode": "always",
@@ -603,8 +603,8 @@
           "id": "gpt-6-luna",
           "name": "GPT-6 Luna",
           "icon": "openai.svg",
-          "tagline": "1M 上下文 · 推理模型 · 4Router 0.45 分组",
-          "context_window": 1050000,
+          "tagline": "272K 预算档 · 推理模型 · 4Router 0.45 分组",
+          "context_window": 272000,
           "max_output": 128000,
           "defaults": {
             "temperature": 1.0,
@@ -659,7 +659,7 @@
               "hint_en": "Reasoning depth; default high"
             }
           },
-          "tagline_en": "1M context · reasoning model · 4Router 0.45 tier"
+          "tagline_en": "272K budget tier · reasoning model · 4Router 0.45 tier"
         }
       ],
       "name_en": "4Router"

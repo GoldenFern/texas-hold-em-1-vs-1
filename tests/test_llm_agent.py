@@ -124,9 +124,11 @@ def build_agent(
     tools: list[str] | None = None,
     system_prompt: str | None = None,
     submit_table_talk=None,
+    spec=None,
+    params: dict | None = None,
 ):
     registry = ProviderRegistry()
-    spec = registry.resolve("deepseek", "deepseek-flash")
+    spec = spec if spec is not None else registry.resolve("deepseek", "deepseek-flash")
     events = []
 
     def validate(action: Action):
@@ -147,7 +149,7 @@ def build_agent(
         seat=0,
         name="Hero",
         spec=spec,
-        params={},
+        params=params or {},
         client=FakeClient(responses),
         analyzer=HandDistributionAnalyzer(),
         validate_action=validator or validate,
@@ -1109,3 +1111,79 @@ def test_context_watermarks_are_clamped_to_context_budget() -> None:
     )
     assert tiny.context.high_water_tokens == 3904
     assert tiny.context.low_water_tokens == 1000
+
+
+def test_context_budget_auto_follows_real_model_window() -> None:
+    registry = ProviderRegistry()
+    spec = registry.resolve("deepseek", "deepseek-flash")
+    agent, _ = build_agent(
+        [],
+        runtime={"max_context_tokens_estimate": 0},
+        spec=spec,
+    )
+    reserved = spec.normalize_params({})["max_tokens"]
+    expected = max(8000, spec.context_window - reserved - 2048)
+    assert agent.max_context_tokens == expected
+    assert agent.context.high_water_tokens <= agent.max_context_tokens - 4096
+
+
+def test_context_budget_auto_uses_synthetic_272k_window() -> None:
+    registry = ProviderRegistry()
+    spec = replace(
+        registry.resolve("deepseek", "deepseek-flash"),
+        context_window=272000,
+    )
+    agent, _ = build_agent(
+        [],
+        runtime={"max_context_tokens_estimate": 0},
+        spec=spec,
+        params={"max_tokens": 32768},
+    )
+    assert agent.params["max_tokens"] == 32768
+    assert agent.max_context_tokens == 272000 - 32768 - 2048
+    assert agent.max_context_tokens == 237184
+
+
+def test_positive_runtime_cap_tightens_model_budget() -> None:
+    registry = ProviderRegistry()
+    spec = replace(
+        registry.resolve("deepseek", "deepseek-flash"),
+        context_window=272000,
+    )
+    smaller, _ = build_agent(
+        [],
+        runtime={"max_context_tokens_estimate": 64000},
+        spec=spec,
+        params={"max_tokens": 32768},
+    )
+    assert smaller.max_context_tokens == 64000
+
+    larger, _ = build_agent(
+        [],
+        runtime={"max_context_tokens_estimate": 500000},
+        spec=spec,
+        params={"max_tokens": 32768},
+    )
+    assert larger.max_context_tokens == 237184
+
+
+def test_tiny_context_window_keeps_minimum_budget() -> None:
+    registry = ProviderRegistry()
+    spec = replace(
+        registry.resolve("deepseek", "deepseek-flash"),
+        context_window=20000,
+    )
+    tiny, _ = build_agent(
+        [],
+        runtime={"max_context_tokens_estimate": 0},
+        spec=spec,
+        params={"max_tokens": 32768},
+    )
+    assert tiny.max_context_tokens == 8000
+
+    unknown, _ = build_agent(
+        [],
+        runtime={"max_context_tokens_estimate": 0},
+        spec=replace(spec, context_window=0),
+    )
+    assert unknown.max_context_tokens == 220000

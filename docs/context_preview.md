@@ -129,6 +129,30 @@
 - 50 手结果方向性很强（+2,524 vs -848），但 95% CI 很宽，且行动不同导致后续状态不同。不能据此断定 `compact_slim` 更强，只能说明它没有出现明显退化，而且更愿意下注/跟注。
 - 把 A/B 两组同策略合并（70 手）：`legacy` -128.3 ± 389.2 bb/100，`compact_slim` +174.1 ± 628.2 bb/100。方向仍然偏正，但置信区间大幅重叠，仍然不能当作胜率结论。
 
+### P1：160k 高水位生产候选
+
+B 组的 20k 是为了在 50 手内逼出压缩的压力设置。按新的自动预算和 160k 高水位，再用同 seed 跑 50 手 `compact_slim`：
+
+| 指标 | 160k 高水位 | 20k 高水位（B 组） |
+|---|---:|---:|
+| 手数 | 50 | 50 |
+| turn | 159 | 173 |
+| 压缩次数 | 0 | 6 |
+| 缓存命中 | 99.5% | 96.7% |
+| 每手首请求命中 | 99.5% | 97.2% |
+| 输入 token | 11,363,072 | 2,661,115 |
+| 缓存 miss | 55,680 | 86,651 |
+| 输出 token | 102,349 | 65,372 |
+| 费用 | $0.1037 | $0.0599 |
+| 费用/turn | $0.00065 | $0.00035 |
+| miss/turn | 350 | 501 |
+| 终局上下文 | 约 118k | 被压到 20k 以下 |
+| 净筹码 | +1,634 | +2,524 |
+
+- 160k 没有触发压缩，上下文自然长到 118k；缓存命中 99.5%，费用/turn 约为 20k 的 1.9 倍，但仍然明显低于 legacy。
+- 20k 更便宜，但压缩 6 次，每次压缩后的第一条请求会掉缓存。
+- 新默认选择 160k：给上下文留出空间，同时用自动预算避免把 1M 模型一刀切到 220k。
+
 ## 注意
 
 - 这不是配对实验。LLM 行动不同，后续牌局状态、turn 数、手牌长度都不同，`bb/100` 和总 token 不能直接比较。上表主要看缓存命中、miss/turn 和费用/turn。
@@ -143,9 +167,10 @@
 1. 已完成：`LLMClient` 支持可选 `user_id`，每个 run 用独立 `--cache-scope`，20 手复核确认首请求命中 0.0%。
 2. 已完成：50 手连续对局，`legacy` vs `compact_slim`，见下方 B 组结果。
 3. 已完成：赛后喊话 full vs fresh，见 `docs/final_talk_preview.md`。热缓存约 5 倍差距，冷缓存约 100 倍。
-4. 根据结果调高高水位，避免压缩过于频繁；优先默认 `compact_slim`，`legacy` 只作为回退。
-5. 用更大样本或固定 warm-up 的配对实验，确认 B 组 `compact_slim` 的 +2,524 是压缩带来的效果还是 50 手方差。
+4. 已完成：默认切到 `compact_slim`，`max_context_tokens_estimate=0` 自动预算，高水位 160k、低水位 50k；赛后喊话默认 `fresh`。`legacy` / `full` 只作为回退。
+5. 用更大样本或固定 warm-up 的配对实验，确认 `compact_slim` 的净筹码差异是压缩效果还是 50 手方差。
 6. 赛后喊话可以再试一版 `fresh + 最近 3 手摘要`，看能否在 token 仍然很低的情况下保留更多具体细节。
+7. 4Router GPT-6 Luna 的实体请求在 45 秒读超时和 5 次重试下仍未完成，已手动停止；配置值已按官方文档更新，但中转连通性需要单独排查。
 
 ## 复现
 
@@ -159,6 +184,7 @@ python scripts/preview_context.py --policy legacy --hands 20 --seed 2026 --max-c
 python scripts/preview_context.py --policy compact_slim --hands 20 --seed 2026 --high-water 20000 --low-water 8000 --keep-hands 2 --stream-usage --cache-scope ctx-a-slim-20k-20261024
 python scripts/preview_context.py --policy legacy --hands 50 --seed 2027 --max-context 20000 --stream-usage --cache-scope ctx-b-legacy-50-20261024
 python scripts/preview_context.py --policy compact_slim --hands 50 --seed 2027 --high-water 20000 --low-water 8000 --keep-hands 2 --stream-usage --cache-scope ctx-b-slim-50-20261024
+python scripts/preview_context.py --policy compact_slim --hands 50 --seed 2027 --high-water 160000 --low-water 50000 --keep-hands 2 --stream-usage --cache-scope p1-slim-160k
 ```
 
 输出目录在 `tmp/context_preview/`，每组包含 `hands.csv`、`requests.csv`、`hands.jsonl`、`summary.json` 和 `report.md`。

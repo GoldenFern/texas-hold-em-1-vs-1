@@ -22,7 +22,7 @@
           "icon": "openai.svg",
           "tagline": "实验用 DXH 中转 · GPT-6 Luna",
           "tagline_en": "Experiment-only DXH relay · GPT-6 Luna",
-          "context_window": 1050000,
+          "context_window": 272000,
           "max_output": 128000,
           "defaults": {
             "temperature": 1.0,

@@ -72,6 +72,6 @@ python scripts/preview_final_talk.py --history tmp/context_preview/20261024_0427
 
 ## 下一步
 
-- 如果接受稍微模板化，赛后喊话可以默认 `fresh`。
+- 已默认切到 `fresh`，`full` 保留回退。
 - 如果希望更具体，做一组 `fresh + 最近 3 手摘要` 的对照，看 token 和质量的折中。
 - 把 `final_talk_context` 的 token/缓存字段接入评测 CSV 和前端。
