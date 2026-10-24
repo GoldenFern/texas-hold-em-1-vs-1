@@ -228,6 +228,73 @@ def build_turn_message(
     return "\n".join(lines)
 
 
+def build_compact_turn_message(
+    view: AgentView,
+    require_table_talk: bool = False,
+    locale: str = "zh-CN",
+) -> str:
+    """Build a smaller turn update for context experiments.
+
+    The full state already contains the same values as the human-readable
+    header lines, and it repeats the last few hands and actions.  This version
+    keeps one canonical state block, only the most recent actions, and no
+    match note or recent-hand list.
+    """
+    locale = _locale(locale)
+    text = prompt_text(locale)
+    state = view.to_prompt_dict()
+    recent_actions = [
+        {
+            "seat": item.get("seat"),
+            "type": item.get("type"),
+            "amount": item.get("amount"),
+        }
+        for item in state["actions_this_hand"][-6:]
+    ]
+    compact_state = {
+        "hand_id": state["hand_id"],
+        "street": state["street"],
+        "position": state["position"],
+        "hole_cards": state["hole_cards"],
+        "community_cards": state["community_cards"],
+        "pot": state["pot"],
+        "your_chips": state["your_chips"],
+        "opponent_chips": state["opponent_chips"],
+        "your_street_bet": state["your_street_bet"],
+        "opponent_street_bet": state["opponent_street_bet"],
+        "current_bet": state["current_bet"],
+        "to_call": state["to_call"],
+        "call_amount": state["call_amount"],
+        "min_raise_to": state["min_raise_to"],
+        "max_raise_to": state["max_raise_to"],
+        "legal_actions": state["legal_actions"],
+        "blinds": state["blinds"],
+        "recent_actions": recent_actions,
+    }
+    lines = [
+        text["turn_header"].format(
+            hand=view.hand_number,
+            street=_street_name(view.street, locale),
+        ),
+        f"```json\n{json.dumps(compact_state, ensure_ascii=False, separators=(',', ':'))}\n```",
+    ]
+    if view.table_talk:
+        lines.extend([text["turn_talk_header"], text["turn_talk_warning"]])
+        for item in view.table_talk:
+            lines.append(
+                text["turn_talk_item"].format(
+                    hand=int(item.get("hand_id") or 0),
+                    street=_street_name(str(item.get("street") or ""), locale),
+                    name=str(item.get("name") or text["opponent"]),
+                    text=str(item.get("text") or ""),
+                )
+            )
+    if require_table_talk:
+        lines.append(text["turn_talk_required"])
+    lines.append(text["turn_closing_compact"])
+    return "\n".join(lines)
+
+
 def build_nudge_message(require_table_talk: bool = False, locale: str = "zh-CN") -> str:
     locale = _locale(locale)
     text = prompt_text(locale)
@@ -243,6 +310,7 @@ def build_hand_result_message(
     seat: int,
     name: str,
     locale: str = "zh-CN",
+    final: bool = False,
 ) -> str:
     locale = _locale(locale)
     text = prompt_text(locale)
@@ -283,11 +351,61 @@ def build_hand_result_message(
         )
     if result.get("reason") == "fold":
         lines.append(text["result_fold"])
-    if result.get("match_over"):
-        lines.append(text["result_match_over"])
-    else:
-        lines.append(text["result_next_hand"])
+    if not final:
+        if result.get("match_over"):
+            lines.append(text["result_match_over"])
+        else:
+            lines.append(text["result_next_hand"])
     return "\n".join(lines)
+
+
+def build_hand_summary_message(
+    result: Optional[dict],
+    seat: int,
+    locale: str = "zh-CN",
+) -> str:
+    """Build a compact one-message summary for a completed hand."""
+    locale = _locale(locale)
+    text = prompt_text(locale)
+    if not result:
+        return text["result_empty"]
+    winner_seats = result.get("winner_seats") or []
+    won = seat in winner_seats
+    players = {item.get("seat"): item for item in result.get("players", [])}
+    mine = players.get(seat, {})
+    net = int(mine.get("net", 0) or 0)
+    chips = mine.get("chips_after", 0)
+    board = " ".join(result.get("board") or []) or text["none"]
+    outcome = text["result_summary_won"] if won else text["result_summary_lost"]
+    if result.get("reason") == "fold":
+        outcome += text["result_summary_fold"]
+    showdown = ""
+    entries = result.get("showdown") or []
+    if entries:
+        categories = {
+            item.get("seat"): hand_category_name(
+                str(item.get("category") or ""),
+                locale,
+                str(item.get("category_name") or ""),
+            )
+            for item in entries
+        }
+        mine_category = categories.get(seat)
+        other_category = categories.get(1 - seat)
+        if mine_category and other_category:
+            showdown = text["result_summary_showdown"].format(
+                mine=mine_category,
+                theirs=other_category,
+            )
+    return text["result_summary"].format(
+        hand=result.get("hand_id", 0),
+        outcome=outcome,
+        pot=int(result.get("pot", 0) or 0),
+        net=net,
+        chips=chips,
+        board=board,
+        showdown=showdown,
+    )
 
 
 def build_final_table_talk_message(
@@ -299,12 +417,72 @@ def build_final_table_talk_message(
     """Prompt one optional post-match table-talk message."""
     locale = _locale(locale)
     text = prompt_text(locale)
-    base = build_hand_result_message(result, seat, name, locale)
+    base = build_hand_result_message(result, seat, name, locale, final=True)
     return (
         f"{base}\n\n"
         f"{text['final_header']}\n"
         f"{text['final_instructions']}"
     )
+
+
+def build_final_talk_system_prompt(name: str, locale: str = "zh-CN") -> str:
+    """Build a short system prompt for the post-match table-talk call."""
+    locale = _locale(locale)
+    return prompt_text(locale)["final_system"].format(name=name)
+
+
+def build_final_talk_summary(
+    hand_results: Sequence[dict],
+    seat: int,
+    locale: str = "zh-CN",
+) -> str:
+    """Summarize the match for the fresh post-match context."""
+    locale = _locale(locale)
+    text = prompt_text(locale)
+    results = [item for item in hand_results if item]
+    hands = len(results)
+    wins = sum(1 for item in results if seat in (item.get("winner_seats") or []))
+    losses = hands - wins
+    net = 0
+    chips = 0
+    opponent_chips = 0
+    for item in results:
+        players = {entry.get("seat"): entry for entry in item.get("players", [])}
+        net += int(players.get(seat, {}).get("net", 0) or 0)
+    if results:
+        final_players = {
+            entry.get("seat"): entry for entry in results[-1].get("players", [])
+        }
+        chips = int(final_players.get(seat, {}).get("chips_after", 0) or 0)
+        opponent_chips = int(
+            final_players.get(1 - seat, {}).get("chips_after", 0) or 0
+        )
+    if net > 0:
+        result_label = text["final_result_profit"]
+    elif net < 0:
+        result_label = text["final_result_loss"]
+    else:
+        result_label = text["final_result_even"]
+    return text["final_summary"].format(
+        hands=hands,
+        wins=wins,
+        losses=losses,
+        net=net,
+        result_label=result_label,
+        chips=chips,
+        opponent=opponent_chips,
+    )
+
+
+def build_final_talk_fresh_message(
+    result: Optional[dict],
+    seat: int,
+    hand_results: Sequence[dict],
+    locale: str = "zh-CN",
+) -> str:
+    """Build a compact post-match user message with a match summary."""
+    summary = build_final_talk_summary(hand_results, seat, locale)
+    return f"{summary}\n\n{build_final_table_talk_message(result, seat, '', locale)}"
 
 
 def _street_name(street: str, locale: str = "zh-CN") -> str:
@@ -319,8 +497,13 @@ __all__ = [
     "SYSTEM_PROMPT",
     "SYSTEM_PROMPT_EN",
     "TABLE_TALK_TOOL_NAME",
+    "build_compact_turn_message",
     "build_final_table_talk_message",
+    "build_final_talk_fresh_message",
+    "build_final_talk_summary",
+    "build_final_talk_system_prompt",
     "build_hand_result_message",
+    "build_hand_summary_message",
     "build_nudge_message",
     "build_system_prompt",
     "build_table_talk_section",

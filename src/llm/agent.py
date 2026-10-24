@@ -25,10 +25,15 @@ from src.engine.evaluator import hand_category_name
 from src.i18n import normalize_locale, tr
 
 from .client import LLMClient, LLMError, ToolCall, estimate_tokens
+from .context import ContextSettings, compact_history, compact_tool_payload
 from .prompt import (
     TABLE_TALK_TOOL_NAME,
+    build_compact_turn_message,
     build_final_table_talk_message,
+    build_final_talk_fresh_message,
+    build_final_talk_system_prompt,
     build_hand_result_message,
+    build_hand_summary_message,
     build_nudge_message,
     build_system_prompt,
     build_turn_message,
@@ -90,7 +95,10 @@ class LLMAgent(BaseAgent):
         self.spec = spec
         self.params = spec.normalize_params(params)
         self.locale = normalize_locale(locale, "zh-CN") or "zh-CN"
-        self._turn_marker = prompt_text(self.locale)["turn_marker"]
+        self._prompt_text = prompt_text(self.locale)
+        self._turn_marker = self._prompt_text["turn_marker"]
+        self._summary_marker = self._prompt_text["summary_marker"]
+        self.context = ContextSettings.from_runtime(runtime)
         self.client = client
         self.analyzer = analyzer
         self.equity_analyzer = equity_analyzer or EquityAnalyzer()
@@ -134,6 +142,7 @@ class LLMAgent(BaseAgent):
                 locale=self.locale,
             )
         self.messages: List[dict] = [{"role": "system", "content": self.system_prompt}]
+        self.hand_results: List[dict] = []
         self.turn_count = 0
         self._estimated_keys: set[tuple[int, str]] = set()
         self._nudged_keys: set[tuple[int, str]] = set()
@@ -144,9 +153,16 @@ class LLMAgent(BaseAgent):
         self._equity_iterations_this_turn = 0
         self._talk_count_this_turn = 0
         self._tools_tokens = estimate_tokens(json.dumps(self.tools, ensure_ascii=False))
-        self.total_usage = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+        self.total_usage = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_miss_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+        }
         self.last_error = ""
         self._trimmed = False
+        self._compactions = 0
         self._cancel_event = threading.Event()
 
     def _t(self, message_key: str, **params: object) -> str:
@@ -163,10 +179,18 @@ class LLMAgent(BaseAgent):
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
+        self.hand_results = []
         self.turn_count = 0
-        self.total_usage = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+        self.total_usage = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_miss_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+        }
         self.last_error = ""
         self._trimmed = False
+        self._compactions = 0
         self._estimated_keys.clear()
         self._nudged_keys.clear()
         self._estimated_this_turn = False
@@ -184,7 +208,13 @@ class LLMAgent(BaseAgent):
     def on_hand_finished(self, result: Optional[dict]) -> None:
         if not result:
             return
-        text = build_hand_result_message(result, self.seat, self.name, locale=self.locale)
+        self.hand_results.append(result)
+        if self.context.compacts:
+            text = build_hand_summary_message(result, self.seat, locale=self.locale)
+        else:
+            text = build_hand_result_message(
+                result, self.seat, self.name, locale=self.locale
+            )
         self.messages.append({"role": "user", "content": text})
 
     def final_table_talk(
@@ -197,19 +227,46 @@ class LLMAgent(BaseAgent):
         if not self.table_talk_required or self._cancel_event.is_set():
             return
         self._sync_client_locale()
-        prompt = build_final_table_talk_message(
-            result, self.seat, self.name, locale=self.locale
-        )
-        self.messages.append({"role": "user", "content": prompt})
-        self._trim_context(emit)
+        mode = self.context.final_talk_context
+        if mode == "fresh":
+            messages: List[dict] = [
+                {
+                    "role": "system",
+                    "content": build_final_talk_system_prompt(self.name, self.locale),
+                },
+                {
+                    "role": "user",
+                    "content": build_final_talk_fresh_message(
+                        result,
+                        self.seat,
+                        self.hand_results,
+                        locale=self.locale,
+                    ),
+                },
+            ]
+        else:
+            prompt = build_final_table_talk_message(
+                result, self.seat, self.name, locale=self.locale
+            )
+            self.messages.append({"role": "user", "content": prompt})
+            self._prepare_context(emit)
+            messages = self.messages
         tools = [build_table_talk_tool(self.locale)]
+        emit(
+            {
+                "type": "final_talk_start",
+                "mode": mode,
+                "message_count": len(messages),
+                "estimated_tokens": self._messages_tokens(messages),
+            }
+        )
         for attempt in range(2):
             if self._cancel_event.is_set():
                 return
             try:
                 response = self.client.stream(
                     self.spec,
-                    self.messages,
+                    messages,
                     tools,
                     self.params,
                     lambda _event: None,
@@ -239,7 +296,7 @@ class LLMAgent(BaseAgent):
             self.last_error = ""
             for key in self.total_usage:
                 self.total_usage[key] += int(response.usage.get(key, 0))
-            self.messages.append(
+            messages.append(
                 response.assistant_message(
                     bool(self.spec.request.get("reasoning_echo", False))
                 )
@@ -249,7 +306,7 @@ class LLMAgent(BaseAgent):
                 if item.name == TABLE_TALK_TOOL_NAME and talk_call is None:
                     talk_call = item
                     continue
-                self.messages.append(
+                messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": item.id,
@@ -278,7 +335,7 @@ class LLMAgent(BaseAgent):
                             "ok": False,
                             "error": f"{type(exc).__name__}: {exc}",
                         }
-                    self.messages.append(
+                    messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": talk_call.id,
@@ -287,8 +344,10 @@ class LLMAgent(BaseAgent):
                         }
                     )
                     if submitted.get("ok"):
+                        if mode == "full":
+                            self.messages = messages
                         return
-                    self.messages.append(
+                    messages.append(
                         {
                             "role": "user",
                             "content": self._t(
@@ -298,7 +357,7 @@ class LLMAgent(BaseAgent):
                         }
                     )
                     continue
-                self.messages.append(
+                messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": talk_call.id,
@@ -310,12 +369,14 @@ class LLMAgent(BaseAgent):
                     }
                 )
             if attempt == 0:
-                self.messages.append(
+                messages.append(
                     {
                         "role": "user",
                         "content": self._t("agent.final.instruction"),
                     }
                 )
+        if mode == "full":
+            self.messages = messages
         emit(
             {
                 "type": "note",
@@ -337,6 +398,15 @@ class LLMAgent(BaseAgent):
             "usage": dict(self.total_usage),
             "last_error": self.last_error,
             "table_talk": TABLE_TALK_TOOL_NAME in self.tool_names,
+            "context": {
+                "policy": self.context.policy,
+                "high_water_tokens": self.context.high_water_tokens,
+                "low_water_tokens": self.context.low_water_tokens,
+                "keep_recent_hands": self.context.keep_recent_hands,
+                "state_detail": self.context.state_detail,
+                "tool_detail": self.context.tool_detail,
+                "final_talk_context": self.context.final_talk_context,
+            },
         }
 
     # ------------------------------------------------------------------
@@ -347,7 +417,7 @@ class LLMAgent(BaseAgent):
         self._sync_client_locale()
         turn_id = uuid.uuid4().hex[:12]
         started = time.perf_counter()
-        usage_total = {"input_tokens": 0, "output_tokens": 0, "reasoning_tokens": 0}
+        usage_total = {key: 0 for key in self.total_usage}
         steps = 0
         failures = 0
         self.turn_count += 1
@@ -376,20 +446,27 @@ class LLMAgent(BaseAgent):
                 "table_talk_received": len(view.table_talk),
             }
         )
-        turn_message = build_turn_message(
-            view,
-            require_table_talk=self.table_talk_required,
-            locale=self.locale,
-        )
+        if self.context.state_detail == "compact":
+            turn_message = build_compact_turn_message(
+                view,
+                require_table_talk=self.table_talk_required,
+                locale=self.locale,
+            )
+        else:
+            turn_message = build_turn_message(
+                view,
+                require_table_talk=self.table_talk_required,
+                locale=self.locale,
+            )
         self.messages.append({"role": "user", "content": turn_message})
         emit({"type": "turn_state", "turn_id": turn_id, "text": turn_message})
-        self._trim_context(emit)
+        self._prepare_context(emit)
 
         while steps < self.max_steps:
             if self._cancel_event.is_set():
                 return Action(view.seat, ActionType.FOLD, source="llm", auto=True)
             steps += 1
-            self._trim_context(emit)
+            self._prepare_context(emit)
             message_id = uuid.uuid4().hex[:12]
             emit(
                 {
@@ -511,10 +588,9 @@ class LLMAgent(BaseAgent):
                 )
 
             for key in usage_total:
-                usage_total[key] += int(result.usage.get(key, 0))
-            self.total_usage["input_tokens"] += int(result.usage.get("input_tokens", 0))
-            self.total_usage["output_tokens"] += int(result.usage.get("output_tokens", 0))
-            self.total_usage["reasoning_tokens"] += int(result.usage.get("reasoning_tokens", 0))
+                amount = int(result.usage.get(key, 0))
+                usage_total[key] += amount
+                self.total_usage[key] = self.total_usage.get(key, 0) + amount
 
             emit(
                 {
@@ -1382,12 +1458,17 @@ class LLMAgent(BaseAgent):
         ui_result: Optional[dict] = None,
         summary: str = "",
     ) -> None:
+        model_payload = (
+            compact_tool_payload(call.name, payload)
+            if self.context.tool_detail == "compact"
+            else payload
+        )
         self.messages.append(
             {
                 "role": "tool",
                 "tool_call_id": call.id,
                 "name": call.name,
-                "content": json.dumps(payload, ensure_ascii=False),
+                "content": json.dumps(model_payload, ensure_ascii=False),
             }
         )
         emit(
@@ -1504,8 +1585,11 @@ class LLMAgent(BaseAgent):
         return action
 
     def _context_tokens(self) -> int:
+        return self._messages_tokens(self.messages)
+
+    def _messages_tokens(self, messages: Sequence[dict]) -> int:
         total = self._tools_tokens
-        for message in self.messages:
+        for message in messages:
             total += 6
             content = message.get("content")
             if isinstance(content, str):
@@ -1523,7 +1607,82 @@ class LLMAgent(BaseAgent):
                 total += estimate_tokens(str(function.get("arguments") or ""))
         return total
 
+    def _prepare_context(self, emit, force: bool = False) -> None:
+        """Apply the configured context policy before a model request."""
+        if self.context.policy == "full":
+            return
+        if self.context.policy == "legacy":
+            self._trim_context(emit, force=force)
+            return
+        self._compact_context(emit, force=force)
+
+    def _compact_context(self, emit, force: bool = False) -> None:
+        """Drop old hand detail blocks, keeping compact summaries and recent hands."""
+        before_tokens = self._context_tokens()
+        if not force and before_tokens <= self.context.high_water_tokens:
+            return
+        before_count = len(self.messages)
+        keep = self.context.keep_recent_hands
+        compacted, dropped = compact_history(
+            self.messages,
+            keep,
+            self._turn_marker,
+            self._summary_marker,
+        )
+        if not dropped:
+            if force:
+                self._trim_context(emit, force=True)
+            return
+        self.messages = compacted
+        # If the recent window is still too large, shrink it one hand at a time.
+        while (
+            keep > 1
+            and self._context_tokens() > self.context.high_water_tokens
+        ):
+            keep -= 1
+            compacted, extra = compact_history(
+                self.messages,
+                keep,
+                self._turn_marker,
+                self._summary_marker,
+            )
+            if not extra:
+                break
+            self.messages = compacted
+            dropped += extra
+        if self._context_tokens() > self.context.high_water_tokens:
+            # Last resort: reuse the legacy turn-level trim.  This still cuts at
+            # complete turn boundaries and never edits a retained message.
+            self._trim_context(emit, force=False)
+        after_tokens = self._context_tokens()
+        self._compactions += 1
+        emit(
+            {
+                "type": "context_compacted",
+                "policy": self.context.policy,
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
+                "before_messages": before_count,
+                "after_messages": len(self.messages),
+                "dropped_messages": dropped,
+                "keep_recent_hands": keep,
+            }
+        )
+        emit(
+            {
+                "type": "note",
+                "level": "warn",
+                "text": self._t(
+                    "agent.note.context_compacted",
+                    removed=dropped,
+                    tokens=after_tokens,
+                ),
+            }
+        )
+
     def _trim_context(self, emit, force: bool = False) -> None:
+        before_tokens = self._context_tokens()
+        before_count = len(self.messages)
         removed = 0
         while self._context_tokens() > self.max_context_tokens or (force and removed == 0):
             turn_starts = [
@@ -1539,6 +1698,18 @@ class LLMAgent(BaseAgent):
             removed += cut - 1
             self.messages = [self.messages[0]] + self.messages[cut:]
             force = False
+        if removed:
+            emit(
+                {
+                    "type": "context_trimmed",
+                    "policy": "legacy",
+                    "before_tokens": before_tokens,
+                    "after_tokens": self._context_tokens(),
+                    "before_messages": before_count,
+                    "after_messages": len(self.messages),
+                    "dropped_messages": removed,
+                }
+            )
         if removed and not self._trimmed:
             self._trimmed = True
             emit(

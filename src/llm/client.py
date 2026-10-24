@@ -138,10 +138,27 @@ def _usage_from(payload: dict) -> dict:
     output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
     details = usage.get("completion_tokens_details") or {}
     reasoning_tokens = details.get("reasoning_tokens", 0) if isinstance(details, dict) else 0
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    cached_tokens = (
+        prompt_details.get("cached_tokens")
+        if isinstance(prompt_details, dict)
+        else None
+    )
+    if cached_tokens is None:
+        cached_tokens = usage.get("prompt_cache_hit_tokens")
+    if cached_tokens is None:
+        cached_tokens = usage.get("cache_read_input_tokens")
+    if cached_tokens is None:
+        cached_tokens = usage.get("cached_tokens")
+    cache_miss_tokens = usage.get("prompt_cache_miss_tokens")
+    if cache_miss_tokens is None:
+        cache_miss_tokens = max(0, int(input_tokens or 0) - int(cached_tokens or 0))
     if not input_tokens and not output_tokens:
         return {}
     return {
         "input_tokens": int(input_tokens or 0),
+        "cached_input_tokens": int(cached_tokens or 0),
+        "cache_miss_input_tokens": int(cache_miss_tokens or 0),
         "output_tokens": int(output_tokens or 0),
         "reasoning_tokens": int(reasoning_tokens or 0),
         "total_tokens": int(usage.get("total_tokens", 0) or 0),
@@ -197,11 +214,15 @@ class LLMClient:
         connect_timeout: float = 20.0,
         read_timeout: float = 300.0,
         locale: str = "zh-CN",
+        user_id: Optional[str] = None,
     ) -> None:
         self.registry = registry
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.locale = normalize_locale(locale, "zh-CN") or "zh-CN"
+        # DeepSeek uses user_id as a KV-cache isolation key.  Other providers
+        # may ignore it; only send it when explicitly configured.
+        self.user_id = str(user_id or "").strip() or None
         self._local = threading.local()
         self._sessions: List[requests.Session] = []
         self._session_lock = threading.Lock()
@@ -245,6 +266,8 @@ class LLMClient:
     ) -> ChatResult:
         api_key = ProviderRegistry.get_api_key(spec, locale=self.locale)
         payload = self.registry.build_payload(spec, messages, tools, params, stream=True)
+        if self.user_id:
+            payload["user_id"] = self.user_id
         dropped = self._degraded_fields(spec)
         if dropped:
             payload = _apply_payload_drops(payload, dropped)
@@ -486,6 +509,8 @@ class LLMClient:
             prompt_text = json.dumps(payload.get("messages", []), ensure_ascii=False)
             usage = {
                 "input_tokens": estimate_tokens(prompt_text),
+                "cached_input_tokens": 0,
+                "cache_miss_input_tokens": 0,
                 "output_tokens": estimate_tokens(content + reasoning),
                 "reasoning_tokens": 0,
                 "total_tokens": 0,
@@ -598,6 +623,8 @@ class LLMClient:
         if not usage:
             usage = {
                 "input_tokens": estimate_tokens(json.dumps(payload.get("messages", []), ensure_ascii=False)),
+                "cached_input_tokens": 0,
+                "cache_miss_input_tokens": 0,
                 "output_tokens": estimate_tokens(content + reasoning),
                 "reasoning_tokens": 0,
                 "total_tokens": 0,

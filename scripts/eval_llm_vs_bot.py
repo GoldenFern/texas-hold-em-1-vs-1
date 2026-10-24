@@ -48,11 +48,12 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 from src.agents.base import AgentView
 from src.agents.project_bot import ProjectBot
+from src.agents.scripted_bot import ScriptedBot
 from src.analysis.hand_distribution import HandDistributionAnalyzer
 from src.engine.actions import Action, ActionType
 from src.engine.heads_up import HeadsUpGame, Street
 from src.llm.agent import LLMAgent, select_tools
-from src.llm.client import LLMClient
+from src.llm.client import LLMClient, LLMError
 from src.llm.prompt import ALL_TOOL_NAMES, build_system_prompt
 from src.llm.providers import ModelSpec, ProviderRegistry
 
@@ -61,6 +62,22 @@ GAME_CONFIG_PATH = PROJECT_ROOT / "config" / "game.json"
 MAX_ACTIONS_PER_HAND = 500
 
 AUX_TOOL_NAMES = tuple(name for name in ALL_TOOL_NAMES if name != "apply_action")
+
+OPPONENT_KINDS = (
+    "project",
+    "always_all_in",
+    "always_raise",
+    "call_check",
+    "random",
+)
+
+OPPONENT_LABELS = {
+    "project": "Project DQN",
+    "always_all_in": "All-in Bot",
+    "always_raise": "Min-Raise Bot",
+    "call_check": "Call/Check Bot",
+    "random": "Random Bot",
+}
 
 INVALID_ACTION_REASONS = (
     "连续三次无效动作",
@@ -190,6 +207,67 @@ def build_eval_prompt(
     return build_system_prompt(tool_names, extra_instructions=extra, locale=locale)
 
 
+def make_opponent(args: argparse.Namespace, task: "HandTask") -> Any:
+    """Create the configured opponent for one independent hand."""
+    kind = str(getattr(args, "opponent_kind", "project"))
+    if kind == "project":
+        return ProjectBot(
+            name=OPPONENT_LABELS[kind],
+            model_path=str(args.bot_model),
+            algorithm=args.bot_algorithm,
+        )
+    return ScriptedBot(
+        name=OPPONENT_LABELS.get(kind, kind),
+        policy=kind,
+        seed=task.seed,
+    )
+
+
+def estimate_hand_cost(input_tokens: int, output_tokens: int, args: argparse.Namespace) -> float:
+    """Estimate RMB cost from reported tokens using the configured prices."""
+    price_in = float(getattr(args, "price_input", 0.045))
+    price_out = float(getattr(args, "price_output", 0.225))
+    return (
+        int(input_tokens) * price_in / 1_000_000.0
+        + int(output_tokens) * price_out / 1_000_000.0
+    )
+
+
+class RetryingClient:
+    """Add bounded exponential backoff around transient relay failures."""
+
+    TRANSIENT = ("rate_limit", "timeout", "network", "server", "unknown")
+
+    def __init__(
+        self,
+        client: LLMClient,
+        attempts: int = 4,
+        backoff: float = 2.0,
+    ) -> None:
+        self.client = client
+        self.attempts = max(1, int(attempts))
+        self.backoff = max(0.0, float(backoff))
+        self.locale = getattr(client, "locale", "zh-CN")
+
+    def stream(self, *args: Any, **kwargs: Any) -> Any:
+        last: Optional[LLMError] = None
+        for attempt in range(self.attempts):
+            try:
+                return self.client.stream(*args, **kwargs)
+            except LLMError as exc:
+                last = exc
+                if exc.kind not in self.TRANSIENT or attempt >= self.attempts - 1:
+                    raise
+                delay = self.backoff * (2**attempt) + 0.25 * attempt
+                time.sleep(delay)
+        if last is not None:
+            raise last
+        raise LLMError("unknown", "retry loop exited unexpectedly")
+
+    def close(self) -> None:
+        self.client.close()
+
+
 CSV_FIELDS = [
     "hand_index",
     "group",
@@ -198,6 +276,8 @@ CSV_FIELDS = [
     "llm_seat",
     "button",
     "seed",
+    "bot_name",
+    "opponent_kind",
     "hole_llm",
     "hole_bot",
     "board",
@@ -221,6 +301,7 @@ CSV_FIELDS = [
     "input_tokens",
     "output_tokens",
     "reasoning_tokens",
+    "est_cost_cny",
     "auto_turns",
     "invalid_action_auto",
     "api_error_auto",
@@ -253,12 +334,24 @@ class HandTask:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run concurrent LLM vs project-bot heads-up hands."
+        description="Run concurrent LLM vs scripted or project-bot heads-up hands."
     )
     parser.add_argument("--hands", type=int, default=25, help="Total hands to play.")
     parser.add_argument("--workers", type=int, default=25, help="Concurrent hands.")
+    parser.add_argument(
+        "--deal-offset",
+        type=int,
+        default=0,
+        help="Start deal_index at this value, for appending new deals.",
+    )
     parser.add_argument("--provider", default="deepseek")
     parser.add_argument("--model", default="deepseek-flash")
+    parser.add_argument(
+        "--provider-config",
+        type=Path,
+        default=None,
+        help="Optional alternate providers.json for experiment-only relays.",
+    )
     parser.add_argument(
         "--group",
         default="",
@@ -286,6 +379,36 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--bot-model", type=Path, default=DEFAULT_BOT_MODEL)
     parser.add_argument("--bot-algorithm", default="dqn", choices=("dqn", "nfsp"))
+    parser.add_argument(
+        "--opponent-kind",
+        default="project",
+        choices=OPPONENT_KINDS,
+        help="Opponent policy: project checkpoint or a built-in scripted bot.",
+    )
+    parser.add_argument(
+        "--price-input",
+        type=float,
+        default=0.045,
+        help="Input price in RMB per 1M tokens (default 4Router standard tier).",
+    )
+    parser.add_argument(
+        "--price-output",
+        type=float,
+        default=0.225,
+        help="Output price in RMB per 1M tokens (default 4Router standard tier).",
+    )
+    parser.add_argument(
+        "--budget-cny",
+        type=float,
+        default=0.0,
+        help="Stop starting new batches after this estimated spend; 0 disables.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="Hands per budget-checked batch.",
+    )
     parser.add_argument("--chips", type=int, default=1000)
     parser.add_argument("--sb", type=int, default=5)
     parser.add_argument("--bb", type=int, default=10)
@@ -310,6 +433,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--connect-timeout", type=float, default=20.0)
     parser.add_argument("--retries", type=int, default=1, help="Retries for API/fatal failures.")
     parser.add_argument(
+        "--llm-retries",
+        type=int,
+        default=4,
+        help="Per-call retries for transient relay failures.",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=2.0,
+        help="Base seconds for exponential retry backoff.",
+    )
+    parser.add_argument(
         "--no-duplicate",
         dest="duplicate",
         action="store_false",
@@ -330,6 +465,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args.group = str(args.group).strip()
     if args.hands <= 0:
         parser.error("--hands must be positive")
+    if args.deal_offset < 0:
+        parser.error("--deal-offset cannot be negative")
     if args.workers <= 0:
         parser.error("--workers must be positive")
     if args.chips <= 0:
@@ -338,6 +475,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("blinds must satisfy 0 < sb <= bb")
     if args.retries < 0:
         parser.error("--retries cannot be negative")
+    if args.llm_retries <= 0:
+        parser.error("--llm-retries must be positive")
+    if args.retry_backoff < 0:
+        parser.error("--retry-backoff cannot be negative")
     if args.timeout <= 0 or args.connect_timeout <= 0:
         parser.error("timeouts must be positive")
     if args.max_steps is not None and args.max_steps <= 0:
@@ -348,6 +489,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         parser.error("--temperature must be between 0 and 2")
     if args.top_p is not None and not 0 < args.top_p <= 1:
         parser.error("--top-p must be in (0, 1]")
+    if args.price_input < 0 or args.price_output < 0:
+        parser.error("token prices cannot be negative")
+    if args.budget_cny < 0:
+        parser.error("--budget-cny cannot be negative")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
     args.workers = min(args.workers, args.hands)
     return args
 
@@ -359,14 +506,16 @@ def derive_seed(master: int, deal_index: int) -> int:
 def build_tasks(args: argparse.Namespace) -> List[HandTask]:
     """Build hand tasks, mirroring decks across seats when possible."""
     tasks: List[HandTask] = []
+    offset = int(getattr(args, "deal_offset", 0))
     if args.duplicate:
         pairs = args.hands // 2
-        for deal_index in range(pairs):
+        for local_index in range(pairs):
+            deal_index = offset + local_index
             seed = derive_seed(args.seed, deal_index)
             tasks.append(HandTask(len(tasks), deal_index, 0, seed))
             tasks.append(HandTask(len(tasks), deal_index, 1, seed))
         if args.hands % 2:
-            deal_index = pairs
+            deal_index = offset + pairs
             seed = derive_seed(args.seed, deal_index)
             # Keep the seat split within one hand.
             assignment = 0 if sum(t.assignment == 0 for t in tasks) <= sum(
@@ -375,12 +524,13 @@ def build_tasks(args: argparse.Namespace) -> List[HandTask]:
             tasks.append(HandTask(len(tasks), deal_index, assignment, seed))
     else:
         for hand_index in range(args.hands):
+            deal_index = offset + hand_index
             tasks.append(
                 HandTask(
                     index=hand_index,
-                    deal_index=hand_index,
+                    deal_index=deal_index,
                     assignment=hand_index % 2,
-                    seed=derive_seed(args.seed, hand_index),
+                    seed=derive_seed(args.seed, deal_index),
                 )
             )
     return tasks
@@ -552,7 +702,7 @@ def make_llm_agent(
     analyzer: HandDistributionAnalyzer,
     params: dict,
     runtime: dict,
-    client: LLMClient,
+    client: Any,
     llm_name: str,
     tool_names: Sequence[str],
     system_prompt: str,
@@ -584,7 +734,7 @@ def play_hand(
     started = time.perf_counter()
     events: List[dict] = []
     game: Optional[HeadsUpGame] = None
-    client: Optional[LLMClient] = None
+    client: Optional[RetryingClient] = None
 
     def emit(event: dict) -> None:
         event = dict(event)
@@ -611,9 +761,10 @@ def play_hand(
             bool(getattr(args, "recommend_tools", False)),
             args.agent_locale,
         )
+        bot = make_opponent(args, task)
         names = {
             llm_seat: (llm_name, "llm"),
-            bot_seat: ("Project DQN", "bot"),
+            bot_seat: (bot.name, "bot"),
         }
         game.configure_players(
             {"name": names[0][0], "kind": names[0][1]},
@@ -624,11 +775,15 @@ def play_hand(
         analyzer = HandDistributionAnalyzer()
         params = resolve_params(spec, args)
 
-        client = LLMClient(
-            registry,
-            connect_timeout=float(args.connect_timeout),
-            read_timeout=float(args.timeout),
-            locale=args.agent_locale,
+        client = RetryingClient(
+            LLMClient(
+                registry,
+                connect_timeout=float(args.connect_timeout),
+                read_timeout=float(args.timeout),
+                locale=args.agent_locale,
+            ),
+            attempts=int(args.llm_retries),
+            backoff=float(args.retry_backoff),
         )
         llm = make_llm_agent(
             task,
@@ -643,12 +798,6 @@ def play_hand(
             system_prompt,
             args.agent_locale,
         )
-        bot = ProjectBot(
-            name="Project DQN",
-            model_path=str(args.bot_model),
-            algorithm=args.bot_algorithm,
-        )
-
         action_count = 0
         fallbacks = 0
         while game.street != Street.FINISHED:
@@ -688,6 +837,8 @@ def play_hand(
         llm_turns = sum(1 for event in events if event.get("type") == "turn_start")
         api_calls = sum(1 for event in events if event.get("type") == "llm_request")
 
+        input_tokens = int(llm.total_usage.get("input_tokens", 0))
+        output_tokens = int(llm.total_usage.get("output_tokens", 0))
         row = {
             "hand_index": task.index,
             "group": getattr(args, "group", ""),
@@ -696,6 +847,8 @@ def play_hand(
             "llm_seat": llm_seat,
             "button": game.button_index,
             "seed": task.seed,
+            "bot_name": bot.name,
+            "opponent_kind": getattr(args, "opponent_kind", "project"),
             "hole_llm": " ".join(card.code for card in game.players[llm_seat].hole_cards),
             "hole_bot": " ".join(card.code for card in game.players[bot_seat].hole_cards),
             "board": " ".join(result.get("board") or []),
@@ -709,9 +862,10 @@ def play_hand(
             "llm_turns": llm_turns,
             **tool_stats,
             "api_calls": api_calls,
-            "input_tokens": int(llm.total_usage.get("input_tokens", 0)),
-            "output_tokens": int(llm.total_usage.get("output_tokens", 0)),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
             "reasoning_tokens": int(llm.total_usage.get("reasoning_tokens", 0)),
+            "est_cost_cny": round(estimate_hand_cost(input_tokens, output_tokens, args), 6),
             "auto_turns": auto_turns,
             "invalid_action_auto": invalid_auto,
             "api_error_auto": api_error_auto,
@@ -733,6 +887,10 @@ def play_hand(
             "llm_seat": task.llm_seat,
             "button": game.button_index if game else None,
             "seed": task.seed,
+            "bot_name": OPPONENT_LABELS.get(
+                getattr(args, "opponent_kind", "project"), "Opponent"
+            ),
+            "opponent_kind": getattr(args, "opponent_kind", "project"),
             "hole_llm": "",
             "hole_bot": "",
             "board": "",
@@ -756,6 +914,7 @@ def play_hand(
             "input_tokens": 0,
             "output_tokens": 0,
             "reasoning_tokens": 0,
+            "est_cost_cny": 0.0,
             "auto_turns": 0,
             "invalid_action_auto": 0,
             "api_error_auto": 0,
@@ -814,6 +973,13 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
             "mean_net": 0.0,
             "mean_bb100": 0.0,
             "win_pct": 0.0,
+            "opponent_kind": getattr(args, "opponent_kind", "project"),
+            "opponent_name": OPPONENT_LABELS.get(
+                getattr(args, "opponent_kind", "project"), "Opponent"
+            ),
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "est_cost_cny": 0.0,
             "error": "all hands failed",
         }
 
@@ -961,6 +1127,13 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
         "input_tokens": sum(int(row.get("input_tokens", 0)) for row in valid),
         "output_tokens": sum(int(row.get("output_tokens", 0)) for row in valid),
         "reasoning_tokens": sum(int(row.get("reasoning_tokens", 0)) for row in valid),
+        "est_cost_cny": round(
+            sum(float(row.get("est_cost_cny", 0.0)) for row in valid), 6
+        ),
+        "opponent_kind": getattr(args, "opponent_kind", "project"),
+        "opponent_name": OPPONENT_LABELS.get(
+            getattr(args, "opponent_kind", "project"), "Opponent"
+        ),
         "api_errors": api_errors,
         "hands_with_api_error": sum(
             1 for row in valid if int(row.get("api_errors", 0)) > 0
@@ -1018,6 +1191,8 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
     llm_name = getattr(args, "llm_name", None) or args.model
     tools = list(getattr(args, "tool_names", ()))
     group = getattr(args, "group", "")
+    opponent_kind = getattr(args, "opponent_kind", "project")
+    bot_label = OPPONENT_LABELS.get(opponent_kind, opponent_kind)
     tool_text = "、".join(f"`{name}`" for name in tools) if tools else "无"
     has_auxiliary = any(name != "apply_action" for name in tools)
     if not has_auxiliary:
@@ -1026,14 +1201,18 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         recommend_text = "开启（强烈推荐，非强制）"
     else:
         recommend_text = "关闭"
+    if opponent_kind == "project":
+        opponent_line = f"- Bot: `{args.bot_algorithm}` / `{args.bot_model}`"
+    else:
+        opponent_line = f"- Bot: `{opponent_kind}`（内置脚本策略）"
     lines = [
-        f"# {llm_name} vs Project DQN（{group}）",
+        f"# {llm_name} vs {bot_label}（{group}）",
         "",
         f"- 生成时间: {datetime.now(timezone.utc).isoformat()}",
         f"- 组别: `{group}`",
         f"- 模型: `{args.provider}/{args.model}`",
         f"- Agent 语言: `{args.agent_locale}`",
-        f"- Bot: `{args.bot_algorithm}` / `{args.bot_model}`",
+        opponent_line,
         f"- 工具: {tool_text}",
         f"- 提示词工具推荐: {recommend_text}",
         f"- 手数: {summary.get('hands', 0)}，同牌换座组: {summary.get('paired_deals', 0)}",
@@ -1053,6 +1232,7 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         f"| 摊牌率 | {summary.get('showdown_pct', 0):.1f}% |",
         f"| 全下手牌占比 | {summary.get('allin_hand_pct', 0):.1f}% |",
         f"| API 错误手数 | {summary.get('hands_with_api_error', 0)} |",
+        f"| 估算费用 | ¥{summary.get('est_cost_cny', 0.0):.4f} |",
         f"| 自动行动回合 | {summary.get('auto_turns', 0)} |",
         f"| 其中 API 错误导致 | {summary.get('api_error_auto', 0)} |",
         "",
@@ -1072,7 +1252,7 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         "",
         "## 行动分布",
         "",
-        f"| 动作 | {llm_name} | Project DQN |",
+        f"| 动作 | {llm_name} | {bot_label} |",
         "|---|---:|---:|",
         f"| fold | {summary.get('llm_fold_pct', 0):.1f}% | {summary.get('bot_fold_pct', 0):.1f}% |",
         f"| check | {summary.get('llm_check_pct', 0):.1f}% | {summary.get('bot_check_pct', 0):.1f}% |",
@@ -1089,6 +1269,7 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         "- `invalid_action_auto` 记录模型连续非法动作或超步数导致的自动跟注/弃牌。",
         "- `api_error_auto` 记录 API 失败后系统自动跟注/过牌/弃牌的回合。",
         "- 工具使用统计来自 `tool_result` 事件，`call_ev` 在无跟注时返回 `applicable=false`，仍计入调用次数。",
+        "- 费用按输入 ¥/1M 与输出 ¥/1M 的配置单价估算，不含缓存；Provider 未返回 usage 时会偏保守。",
     ]
     if "call_ev" in tools:
         lines.append(
@@ -1117,9 +1298,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0
 
-    registry = ProviderRegistry()
+    provider_config = args.provider_config
+    if provider_config is not None:
+        provider_config = Path(provider_config)
+        if not provider_config.is_absolute():
+            provider_config = (PROJECT_ROOT / provider_config).resolve()
+        args.provider_config = provider_config
+    registry = (
+        ProviderRegistry(provider_config)
+        if provider_config is not None
+        else ProviderRegistry()
+    )
     spec = registry.resolve(args.provider, args.model)
     args.llm_name = args.llm_name or spec.name
+    args.opponent_name = OPPONENT_LABELS.get(args.opponent_kind, args.opponent_kind)
     args.system_prompt = build_eval_prompt(
         args.tool_names, args.recommend_tools, args.agent_locale
     )
@@ -1134,7 +1326,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if not bot_model.is_file():
+    if args.opponent_kind == "project" and not bot_model.is_file():
         print(f"error: bot model not found: {bot_model}", file=sys.stderr)
         return 2
 
@@ -1158,8 +1350,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"effort={params.get('reasoning_effort') or '-'}, "
         f"max_tokens={params.get('max_tokens')}"
     )
+    if args.opponent_kind == "project":
+        opponent_text = f"{args.bot_algorithm} / {bot_model.name}"
+    else:
+        opponent_text = f"scripted / {args.opponent_kind}"
     print(
-        f"bot: {args.bot_algorithm} / {bot_model.name}, "
+        f"opponent: {opponent_text}, "
         f"hands={args.hands}, workers={args.workers}, duplicate={args.duplicate}"
     )
     print(
@@ -1169,68 +1365,85 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     started = time.perf_counter()
     rows: List[dict] = []
     cumulative = 0
+    cost_cumulative = 0.0
+    stopped_for_budget = False
+    pending = list(tasks)
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {
-            pool.submit(run_task, task, spec, registry, runtime, args): task
-            for task in tasks
-        }
-        for future in as_completed(futures):
-            task = futures[future]
-            try:
-                row = future.result()
-            except Exception as exc:  # noqa: BLE001
-                row = {
-                    "hand_index": task.index,
-                    "group": args.group,
-                    "deal_index": task.deal_index,
-                    "assignment": task.assignment,
-                    "llm_seat": task.llm_seat,
-                    "fatal_error": f"{type(exc).__name__}: {exc}",
-                    "infra_error": 0,
-                    "api_errors": 0,
-                    "api_error_auto": 0,
-                    "net_llm": 0,
-                    "net_bot": 0,
-                    "pot": 0,
-                    "llm_turns": 0,
-                    "aux_tool_calls": 0,
-                    "tool_turns": 0,
-                    "aux_tool_errors": 0,
-                    "distribution_calls": 0,
-                    "equity_calls": 0,
-                    "random_calls": 0,
-                    "call_ev_calls": 0,
-                    "call_ev_not_applicable": 0,
-                    "duration_sec": 0.0,
-                    "attempts": 0,
-                    "events": [],
-                    "actions": [],
-                }
-            rows.append(row)
-            if not row.get("fatal_error"):
-                cumulative += int(row.get("net_llm", 0))
-            if not args.quiet:
-                if row.get("fatal_error"):
-                    print(
-                        f"[{len(rows):02d}/{len(tasks):02d}] {task.label}: "
-                        f"FATAL {row['fatal_error']}",
-                        flush=True,
-                    )
-                else:
-                    seat = "BTN" if int(row["llm_seat"]) == 0 else "BB"
-                    print(
-                        f"[{len(rows):02d}/{len(tasks):02d}] {task.label} "
-                        f"LLM={seat}: {int(row['net_llm']):+5d} chips, "
-                        f"pot={int(row['pot']):4d}, turns={int(row['llm_turns']):2d}, "
-                        f"tools={int(row.get('aux_tool_calls', 0)):2d}, "
-                        f"{float(row['duration_sec']):5.1f}s, cum={cumulative:+d}"
-                        + (
-                            f", attempts={row['attempts']}"
-                            if int(row.get("attempts", 1)) > 1
-                            else ""
-                        ),
-                        flush=True,
-                    )
+        while pending:
+            batch = pending[: args.batch_size]
+            pending = pending[args.batch_size :]
+            futures = {
+                pool.submit(run_task, task, spec, registry, runtime, args): task
+                for task in batch
+            }
+            for future in as_completed(futures):
+                task = futures[future]
+                try:
+                    row = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    row = {
+                        "hand_index": task.index,
+                        "group": args.group,
+                        "deal_index": task.deal_index,
+                        "assignment": task.assignment,
+                        "llm_seat": task.llm_seat,
+                        "fatal_error": f"{type(exc).__name__}: {exc}",
+                        "infra_error": 0,
+                        "api_errors": 0,
+                        "api_error_auto": 0,
+                        "net_llm": 0,
+                        "net_bot": 0,
+                        "pot": 0,
+                        "llm_turns": 0,
+                        "aux_tool_calls": 0,
+                        "tool_turns": 0,
+                        "aux_tool_errors": 0,
+                        "distribution_calls": 0,
+                        "equity_calls": 0,
+                        "random_calls": 0,
+                        "call_ev_calls": 0,
+                        "call_ev_not_applicable": 0,
+                        "est_cost_cny": 0.0,
+                        "duration_sec": 0.0,
+                        "attempts": 0,
+                        "events": [],
+                        "actions": [],
+                    }
+                rows.append(row)
+                if not row.get("fatal_error"):
+                    cumulative += int(row.get("net_llm", 0))
+                cost_cumulative += float(row.get("est_cost_cny", 0.0) or 0.0)
+                if not args.quiet:
+                    if row.get("fatal_error"):
+                        print(
+                            f"[{len(rows):04d}/{len(tasks):04d}] {task.label}: "
+                            f"FATAL {row['fatal_error']}",
+                            flush=True,
+                        )
+                    else:
+                        seat = "BTN" if int(row["llm_seat"]) == 0 else "BB"
+                        print(
+                            f"[{len(rows):04d}/{len(tasks):04d}] {task.label} "
+                            f"LLM={seat}: {int(row['net_llm']):+5d} chips, "
+                            f"pot={int(row['pot']):4d}, turns={int(row['llm_turns']):2d}, "
+                            f"tools={int(row.get('aux_tool_calls', 0)):2d}, "
+                            f"{float(row['duration_sec']):5.1f}s, cum={cumulative:+d}, "
+                            f"cost=Y{cost_cumulative:.4f}"
+                            + (
+                                f", attempts={row['attempts']}"
+                                if int(row.get("attempts", 1)) > 1
+                                else ""
+                            ),
+                            flush=True,
+                        )
+            if args.budget_cny > 0 and cost_cumulative >= args.budget_cny:
+                stopped_for_budget = True
+                print(
+                    f"budget reached: Y{cost_cumulative:.4f} >= Y{args.budget_cny:.2f}; "
+                    f"stopping after {len(rows)}/{len(tasks)} hands",
+                    flush=True,
+                )
+                break
 
     elapsed = time.perf_counter() - started
     rows.sort(key=lambda item: int(item.get("hand_index", 0)))
@@ -1240,6 +1453,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary["llm_name"] = args.llm_name
     summary["provider"] = args.provider
     summary["model"] = args.model
+    summary["provider_config"] = (
+        str(args.provider_config) if args.provider_config is not None else ""
+    )
     summary["tools"] = list(args.tool_names)
     summary["recommend_tools"] = bool(args.recommend_tools)
     summary["system_prompt_sha256"] = hashlib.sha256(
@@ -1247,15 +1463,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ).hexdigest()
     summary["system_prompt_chars"] = len(args.system_prompt)
     summary["prompt_path"] = str(output / "prompt.txt")
-    summary["bot_model"] = str(bot_model)
-    summary["bot_algorithm"] = args.bot_algorithm
+    summary["bot_model"] = str(bot_model) if args.opponent_kind == "project" else ""
+    summary["bot_algorithm"] = (
+        args.bot_algorithm if args.opponent_kind == "project" else "scripted"
+    )
     summary["chips"] = args.chips
     summary["small_blind"] = args.sb
     summary["big_blind"] = args.bb
     summary["seed"] = args.seed
+    summary["deal_offset"] = int(args.deal_offset)
     summary["duplicate"] = bool(args.duplicate)
     summary["workers"] = args.workers
     summary["llm_params"] = params
+    summary["opponent_kind"] = args.opponent_kind
+    summary["opponent_name"] = args.opponent_name
+    summary["price_input_per_m"] = args.price_input
+    summary["price_output_per_m"] = args.price_output
+    summary["budget_cny"] = args.budget_cny
+    summary["stopped_for_budget"] = stopped_for_budget
+    summary["requested_hands"] = len(tasks)
+    summary["completed_hands"] = len(rows)
 
     write_csv(output / "hands.csv", rows)
     write_jsonl(output / "hands.jsonl", rows)
@@ -1267,9 +1494,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print("")
     print(
-        f"result: {args.llm_name} [{args.group}] {summary['total_net']:+d} chips over "
-        f"{summary['hands']} hands, {summary['mean_bb100']:+.1f} bb/100, "
-        f"win {summary['win_pct']:.1f}%"
+        f"result: {args.llm_name} vs {args.opponent_name} [{args.group}] "
+        f"{summary['total_net']:+d} chips over {summary['hands']} hands, "
+        f"{summary['mean_bb100']:+.1f} bb/100, win {summary['win_pct']:.1f}%"
     )
     print(
         f"paired: {summary.get('paired_mean_bb100', 0.0):+.1f} bb/100 "
@@ -1285,10 +1512,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         f"api: {summary.get('api_calls', 0)} calls, "
         f"{summary.get('input_tokens', 0)} input / {summary.get('output_tokens', 0)} output tokens, "
+        f"est cost Y{summary.get('est_cost_cny', 0.0):.4f}, "
         f"{summary.get('hands_with_api_error', 0)} hands with errors, "
         f"{summary.get('invalid_action_auto', 0)} invalid-action auto turns, "
         f"{summary.get('api_error_auto', 0)} API-error auto turns"
     )
+    if stopped_for_budget:
+        print(
+            f"budget stop: {len(rows)}/{len(tasks)} hands completed; "
+            f"partial summary written"
+        )
     print(f"elapsed: {elapsed:.1f}s")
     print(f"summary: {output / 'summary.json'}")
     print(f"report:  {output / 'report.md'}")

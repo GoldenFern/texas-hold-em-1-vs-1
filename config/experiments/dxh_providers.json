@@ -1,0 +1,77 @@
+{
+  "providers": [
+    {
+      "id": "dxh",
+      "name": "DXH Relay",
+      "name_en": "DXH Relay",
+      "icon": "openai.svg",
+      "accent": "#6EA8FE",
+      "base_url": "https://api.430123.xyz/v1",
+      "api_key_env": "DXH_API_KEY",
+      "docs_url": "https://api.430123.xyz",
+      "request": {
+        "thinking_style": "none",
+        "reasoning_effort_style": "openai",
+        "reasoning_echo": false,
+        "stream_usage": true
+      },
+      "models": [
+        {
+          "id": "gpt-6-luna",
+          "name": "GPT-6 Luna (DXH)",
+          "icon": "openai.svg",
+          "tagline": "实验用 DXH 中转 · GPT-6 Luna",
+          "tagline_en": "Experiment-only DXH relay · GPT-6 Luna",
+          "context_window": 1050000,
+          "max_output": 128000,
+          "defaults": {
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_tokens": 32768,
+            "thinking": true,
+            "reasoning_effort": "low"
+          },
+          "controls": {
+            "temperature": {
+              "show": true,
+              "min": 0,
+              "max": 2,
+              "step": 0.1,
+              "hint": "推理模型通常忽略采样参数，建议保持 1.0",
+              "hint_en": "Reasoning models usually ignore sampling parameters; keep 1.0"
+            },
+            "top_p": {
+              "show": true,
+              "min": 0,
+              "max": 1,
+              "step": 0.05,
+              "hint": "建议保持 1.0",
+              "hint_en": "Recommended 1.0"
+            },
+            "max_tokens": {
+              "show": true,
+              "min": 1024,
+              "max": 128000,
+              "step": 1024,
+              "hint": "输出上限 128K",
+              "hint_en": "Output cap 128K"
+            },
+            "thinking": {
+              "mode": "always",
+              "label": "推理模式",
+              "hint": "实验用 DXH 中转；当前不回传思考正文",
+              "hint_en": "Experiment-only DXH relay; reasoning text is not returned",
+              "label_en": "Reasoning mode"
+            },
+            "reasoning_effort": {
+              "show": true,
+              "options": ["none", "low", "medium", "high", "xhigh", "max"],
+              "hint": "推理深度，默认 low",
+              "hint_en": "Reasoning depth; default low"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

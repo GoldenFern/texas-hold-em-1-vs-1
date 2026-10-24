@@ -57,6 +57,21 @@ EVAL_SCRIPT = PROJECT_ROOT / "scripts" / "eval_llm_vs_bot.py"
 DEFAULT_BOT_MODEL = PROJECT_ROOT / "models" / "rlcard" / "nlh_dqn_project.pth"
 DEFAULT_MODEL_NAME = "LongCat 2.5 Preview"
 
+OPPONENT_KINDS = (
+    "project",
+    "always_all_in",
+    "always_raise",
+    "call_check",
+    "random",
+)
+OPPONENT_LABELS = {
+    "project": "Project DQN",
+    "always_all_in": "All-in Bot",
+    "always_raise": "Min-Raise Bot",
+    "call_check": "Call/Check Bot",
+    "random": "Random Bot",
+}
+
 GROUP_ORDER = ("none", "random", "distribution", "equity", "ev")
 
 
@@ -133,9 +148,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=10, help="Concurrent hands.")
     parser.add_argument("--provider", default="longcat")
     parser.add_argument("--model", default="LongCat-2.5-Preview")
+    parser.add_argument(
+        "--provider-config",
+        type=Path,
+        default=None,
+        help="Optional alternate providers.json for experiment-only relays.",
+    )
     parser.add_argument("--llm-name", default=None)
     parser.add_argument("--bot-model", type=Path, default=DEFAULT_BOT_MODEL)
     parser.add_argument("--bot-algorithm", default="dqn", choices=("dqn", "nfsp"))
+    parser.add_argument(
+        "--opponent-kind",
+        default="project",
+        choices=OPPONENT_KINDS,
+        help="Opponent used for every group.",
+    )
     parser.add_argument("--chips", type=int, default=1000)
     parser.add_argument("--sb", type=int, default=5)
     parser.add_argument("--bb", type=int, default=10)
@@ -263,6 +290,11 @@ def build_eval_command(
         args.provider,
         "--model",
         args.model,
+        *(
+            ["--provider-config", str(args.provider_config)]
+            if args.provider_config is not None
+            else []
+        ),
         "--group",
         group.key,
         "--tools",
@@ -276,6 +308,8 @@ def build_eval_command(
         str(args.bot_model),
         "--bot-algorithm",
         args.bot_algorithm,
+        "--opponent-kind",
+        args.opponent_kind,
         "--chips",
         str(args.chips),
         "--sb",
@@ -331,6 +365,7 @@ def summary_complete(summary_path: Path, args: argparse.Namespace, group: GroupS
         and int(summary.get("seed", 0)) == int(args.seed)
         and int(summary.get("big_blind", 0)) == int(args.bb)
         and str(summary.get("agent_locale") or "zh-CN") == str(args.agent_locale)
+        and str(summary.get("opponent_kind") or "project") == str(args.opponent_kind)
         and list(summary.get("tools") or []) == list(group.tools)
         and bool(summary.get("recommend_tools"))
     )
@@ -467,6 +502,9 @@ def build_combined(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "provider": args.provider,
         "model": args.model,
+        "provider_config": (
+            str(args.provider_config) if args.provider_config is not None else ""
+        ),
         "hands_per_group": args.hands,
         "workers": args.workers,
         "seed": args.seed,
@@ -474,8 +512,12 @@ def build_combined(
         "chips": args.chips,
         "small_blind": args.sb,
         "big_blind": args.bb,
-        "bot_model": str(args.bot_model),
-        "bot_algorithm": args.bot_algorithm,
+        "opponent_kind": args.opponent_kind,
+        "opponent_name": OPPONENT_LABELS.get(args.opponent_kind, args.opponent_kind),
+        "bot_model": str(args.bot_model) if args.opponent_kind == "project" else "",
+        "bot_algorithm": (
+            args.bot_algorithm if args.opponent_kind == "project" else "scripted"
+        ),
         "groups": {
             group.key: {
                 "label": group.label,
@@ -507,13 +549,18 @@ def write_combined_report(
     args: argparse.Namespace,
     summaries: Dict[str, dict],
 ) -> None:
+    opponent_name = OPPONENT_LABELS.get(args.opponent_kind, args.opponent_kind)
+    if args.opponent_kind == "project":
+        opponent_line = f"- Bot: `{args.bot_algorithm}` / `{args.bot_model}`"
+    else:
+        opponent_line = f"- Bot: `{args.opponent_kind}`（内置脚本策略）"
     lines = [
-        f"# {args.model} 工具消融实验：{len(args.group_specs)} 组 vs Project DQN",
+        f"# {args.model} 工具对照实验：{len(args.group_specs)} 组 vs {opponent_name}",
         "",
         f"- 生成时间: {combined['generated_at']}",
         f"- 模型: `{args.provider}/{args.model}`",
         f"- Agent 语言: `{args.agent_locale}`",
-        f"- Bot: `{args.bot_algorithm}` / `{args.bot_model}`",
+        opponent_line,
         f"- 每组手数: {args.hands}（{args.hands // 2} 副牌 × 2 个座位）",
         f"- 并发: {args.workers}；{len(args.group_specs)} 组顺序执行",
         f"- 规则: {args.chips} 筹码，盲注 {args.sb}/{args.bb}，每手重置筹码",
@@ -552,19 +599,20 @@ def write_combined_report(
             "",
             "## 资源消耗",
             "",
-            "| 组 | API 调用 | 输入 token | 输出 token | 推理 token | 耗时 |",
-            "|---|---:|---:|---:|---:|---:|",
+            "| 组 | API 调用 | 输入 token | 输出 token | 推理 token | 估算费用 | 耗时 |",
+            "|---|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for group in args.group_specs:
         summary = summaries.get(group.key) or {}
         lines.append(
-            "| {label} | {api} | {input} | {output} | {reasoning} | {elapsed} |".format(
+            "| {label} | {api} | {input} | {output} | {reasoning} | ¥{cost:.4f} | {elapsed} |".format(
                 label=group.label,
                 api=summary.get("api_calls", 0),
                 input=summary.get("input_tokens", 0),
                 output=summary.get("output_tokens", 0),
                 reasoning=summary.get("reasoning_tokens", 0),
+                cost=float(summary.get("est_cost_cny", 0.0)),
                 elapsed=f"{float(summary.get('elapsed_sec', 0.0)) / 3600.0:.2f}h",
             )
         )
@@ -674,6 +722,11 @@ def write_combined_report(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     args.bot_model = resolve_bot_model(args.bot_model)
+    if args.provider_config is not None:
+        provider_config = Path(args.provider_config)
+        if not provider_config.is_absolute():
+            provider_config = (PROJECT_ROOT / provider_config).resolve()
+        args.provider_config = provider_config
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     output = args.output or (PROJECT_ROOT / "tmp" / "llm_tool_matrix" / timestamp)
@@ -703,14 +756,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
         if not args.report_only:
-            registry = ProviderRegistry()
+            registry = (
+                ProviderRegistry(args.provider_config)
+                if args.provider_config is not None
+                else ProviderRegistry()
+            )
             spec = registry.resolve(args.provider, args.model)
             if not args.dry_run and not ProviderRegistry.key_present(spec):
                 reporter.line(
                     f"error: missing environment variable {spec.api_key_env} in .env"
                 )
                 return 2
-            if not args.bot_model.is_file():
+            if args.opponent_kind == "project" and not args.bot_model.is_file():
                 reporter.line(f"error: bot model not found: {args.bot_model}")
                 return 2
             if not args.llm_name:
@@ -724,10 +781,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "created_at": started_at.isoformat(),
                 "provider": args.provider,
                 "model": args.model,
+                "provider_config": (
+                    str(args.provider_config)
+                    if args.provider_config is not None
+                    else ""
+                ),
                 "model_name": args.llm_name,
-                "bot_model": str(args.bot_model),
-                "bot_sha256": sha256_file(args.bot_model),
-                "bot_algorithm": args.bot_algorithm,
+                "opponent_kind": args.opponent_kind,
+                "opponent_name": OPPONENT_LABELS.get(
+                    args.opponent_kind, args.opponent_kind
+                ),
+                "bot_model": (
+                    str(args.bot_model) if args.opponent_kind == "project" else ""
+                ),
+                "bot_sha256": (
+                    sha256_file(args.bot_model)
+                    if args.opponent_kind == "project"
+                    else ""
+                ),
+                "bot_algorithm": (
+                    args.bot_algorithm
+                    if args.opponent_kind == "project"
+                    else "scripted"
+                ),
                 "hands_per_group": args.hands,
                 "workers": args.workers,
                 "seed": args.seed,
@@ -754,7 +830,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reporter.line(
                 f"model: {args.llm_name} ({spec.provider_name}/{spec.id})"
             )
-            reporter.line(f"bot: {args.bot_model.name} sha256={manifest['bot_sha256'][:12]}")
+            if args.opponent_kind == "project":
+                reporter.line(
+                    f"bot: {args.bot_model.name} sha256={manifest['bot_sha256'][:12]}"
+                )
+            else:
+                reporter.line(
+                    f"opponent: {args.opponent_kind} "
+                    f"({OPPONENT_LABELS.get(args.opponent_kind, args.opponent_kind)})"
+                )
 
             if args.dry_run:
                 for group in args.group_specs:

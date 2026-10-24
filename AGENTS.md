@@ -34,6 +34,11 @@ python scripts/eval_bots.py --hands 2000 --allow-untrained   # 离线 Bot 评测
 python scripts/eval_llm_vs_bot.py --hands 25 --workers 25   # LLM vs Project DQN，25 手并发
 python scripts/eval_llm_vs_llm.py --hands 100 --workers 5  # LLM vs LLM 工具使用对照，100 手 5 并发
 python scripts/eval_llm_tool_matrix.py --hands 300 --workers 10  # 五组工具消融，每组 300 手
+python scripts/run_llm_experiments.py --stage pilot --pilot-hands 10 --workers 2 --reasoning-effort low  # 固定策略 Bot 与工具组的小样本校准
+python scripts/run_llm_experiments.py --stage full --full-hands 400 --workers 2 --reasoning-effort low  # 8 组 × 400 手，自动记预算
+python scripts/eval_llm_vs_bot.py --opponent-kind always_all_in --tools none --hands 400 --workers 2  # 单一脚本 Bot 对照
+python scripts/preview_context.py --policy compact_slim --hands 10 --seed 2026 --high-water 20000 --low-water 8000 --keep-hands 2 --stream-usage  # 上下文策略短程预实验
+python scripts/preview_final_talk.py --history tmp/context_preview/<run>/messages.json --mode both --repeats 5  # 赛后喊话 full vs fresh
 ```
 
 `.env` 从 `.env.example` 复制；**不要读取或打印真实 Key**，只检查环境变量是否存在。
@@ -99,6 +104,13 @@ python scripts/eval_llm_tool_matrix.py --hands 300 --workers 10  # 五组工具�
 - `LLMAgent` 支持按座位传入 `tools`、`system_prompt` 与 `locale`；`select_tools(names, locale)` 只暴露指定工具，未暴露的工具调用会按未知工具拒绝。`require_estimate_each_turn` 要求每次行动前估算一次，`skip_estimate_on_complete_board` 让河牌圈免于该要求。
 - `scripts/eval_llm_vs_llm.py` 做 LLM 对 LLM 的工具使用对照：对照组只有 `apply_action`，工具组按 `ALL_TOOL_NAMES` 提供牌型分布/胜率/随机/跟注 EV/行动，并要求河牌前逐回合估算；输出在 `tmp/llm_vs_llm/`。
 - `scripts/eval_llm_tool_matrix.py` 做 LLM 对 Project DQN 的五组工具消融：无工具、随机数、牌型分布、胜率、跟注 EV；每组 300 手（150 deal × 2 座位），10 并发，输出在 `tmp/llm_tool_matrix/`。
+- `src/agents/scripted_bot.py` 提供四种离线对手：`always_all_in`、`always_raise`（最小加注）、`call_check`、`random`；只使用 `AgentView` 的合法动作和 raise 范围，随机策略按手牌种子可复现。
+- `scripts/eval_llm_vs_bot.py --opponent-kind ...` 可在 Project DQN 和四种脚本 Bot 之间切换；脚本 Bot 不检查 checkpoint。`--price-input`、`--price-output`、`--budget-cny` 记录每手估算费用并在达到预算后停止启动新批次。
+- `scripts/run_llm_experiments.py` 顺序跑三组脚本 Bot 和五组工具对照，支持小样本校准、断点续跑、单条件重试和总预算硬停；结果合并到 `tmp/llm_experiments/`。
+- 4Router `gpt-6-luna` 的实测并发上限很低：2 个并发、`reasoning_effort=low`、读超时 45 秒、单次请求 5 次指数退避比较稳定；3 个以上并发容易出现连接超时或 429，导致自动行动污染结果。网络中断时先等 10 分钟再重试，不要靠提高并发硬顶。
+- `config/experiments/dxh_providers.json` 是实验专用配置，不接入前端和服务端 Provider 列表；用 `--provider dxh --provider-config config/experiments/dxh_providers.json --model gpt-6-luna` 使用。DXH 中转（`https://api.430123.xyz/v1`，`DXH_API_KEY`）的流式、工具调用和 usage 正常，16 并发小样本无 429；它的 prompt token 统计明显高于 4Router。DXH 实验单价按 4Router 标准档的 44% 计：输入 ¥0.0198/M、输出 ¥0.099/M。
+- `scripts/run_llm_experiments.py --experiment b` 只跑五组工具对照，不跑三个固定策略 Bot；`--price-input`/`--price-output` 用于不同中转站的单价，`--relay-host` 用于切换健康检查域名。
+- 补跑牌局用 `--deal-offset` 指定新的 deal 区间，避免和已有牌局重叠；`scripts/merge_llm_runs.py` 按 `(deal_index, assignment)` 合并多次运行，重算 1000 手级别的汇总和配对比较。
 - `build_system_prompt(..., extra_instructions=...)` 只给实验附加“强烈推荐但非强制”的工具建议；默认不传，UI 提示词仍由模型自行判断是否调用工具。
 - 上下文预算会计入 `reasoning_content`、工具名、参数和 tool id；每轮模型调用前都会重新检查并裁剪。
 - `LLMAgent.cancel()` 会设置取消标记，客户端在每次流式读取前检查，旧比赛不会继续烧模型调用。
@@ -109,6 +121,22 @@ python scripts/eval_llm_tool_matrix.py --hands 300 --workers 10  # 五组工具�
 - 厂商要求（DeepSeek/Qwen/MiniMax/Kimi/GLM）需要把 `reasoning_content` 原样回传；不要在历史里把它拼进 `content`。
 - 客户端在 400 时会自动去掉可选厂商字段（`thinking`、`reasoning_effort`、`tool_stream`、`stream_options`、`preserve_thinking`、`reasoning_content`）重试一次。
 - `LLMAgent` 不拥有引擎；通过 `validate_action` 回调让 session 用 `game.preview()` 在副本上校验。
+
+## 上下文策略（预实验）
+
+- `LLMAgent` 的 `runtime.context_policy` 支持 `legacy` / `full` / `compact` / `compact_slim`；默认 `legacy`，不要在没有对照结果前改默认。
+- `legacy` 保持原有行为：超过 `max_context_tokens_estimate` 后从最早的 turn 开始删。它会改变 system prompt 之后的前缀，长对局缓存命中会明显下降。
+- `compact` 每手结束写一条 `【手牌摘要 · 第 N 手】` 用户消息，只保留最近 `context_keep_recent_hands` 手的详情，超过 `context_high_water_tokens` 时整段丢弃旧手消息。当前手永不裁。
+- 压缩只删除完整消息，不修改保留的 assistant 消息；DeepSeek 工具模式要求回传的 `reasoning_content` 必须原样保留。
+- `compact_slim` 额外使用精简回合状态（`build_compact_turn_message`）和精简工具结果（去掉重复 `note`、`lose`、`ev_fold` 等字段）。
+- `ChatResult.usage` 现在包含 `cached_input_tokens`、`cache_miss_input_tokens`；`message_end` 事件会透传，评测脚本可直接统计。DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 会解析，前端暂未展示。
+- `LLMClient` 支持可选 `user_id`；DeepSeek 用它做 KV cache 隔离。实验脚本用 `--cache-scope` 给每个 run 独立缓存域，避免跨 run 共享缓存污染命中率。
+- `runtime.final_talk_context` 支持 `full` / `fresh`；`fresh` 使用短 system prompt + 比赛摘要 + 最后一手结果，不改动比赛历史。默认 `full` 保持旧行为。
+- `scripts/preview_context.py` 是短程连续对局预实验，输出到 `tmp/context_preview/`，并保存 `messages.json` 供赛后喊话对照使用；结果和注意事项见 `docs/context_preview.md`。
+- `scripts/preview_final_talk.py` 读取 `messages.json`，用同一终局对比 `full` 和 `fresh` 赛后喊话的 token、缓存、延迟和文本；结果见 `docs/final_talk_preview.md`。
+- 2026-10-24 赛后喊话预实验（20 手历史，5 次重复）：`fresh` 输入 615 token，`full` 108,500；热缓存费用约 `$0.00009` vs `$0.00044`，冷缓存约 `$0.000145` vs `$0.0162`。`fresh` 可读但更模板化，默认切换前先确认这个取舍。
+- 2026-10-24 预实验（20 手，20k 上限，独立 `user_id`）：`legacy` 缓存命中 44.9%，`compact_slim` 96.9%；费用/turn `$0.00236` vs `$0.00025`。
+- 2026-10-24 B 组（50 手，seed 2027）：`legacy` 缓存命中 31.1%，76 次裁剪，费用/turn `$0.00265`；`compact_slim` 96.7%，6 次压缩，费用/turn `$0.00035`。净筹码 `-848` vs `+2524`，但 50 手 CI 很宽、行动不同，不能据此判断胜率。
 
 ## 桌边喊话（LLM vs LLM）
 

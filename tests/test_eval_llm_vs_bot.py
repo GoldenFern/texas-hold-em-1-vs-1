@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from scripts.eval_llm_vs_bot import (
+    HandTask,
     build_tool_recommendation,
     count_auto_turns,
+    estimate_hand_cost,
     hand_tool_stats,
+    make_opponent,
     resolve_tool_names,
 )
+from src.agents.scripted_bot import ScriptedBot
 
 
 def test_resolve_tool_names_always_keeps_apply_action() -> None:
@@ -106,3 +112,18 @@ def test_count_auto_turns_separates_api_and_invalid_reasons() -> None:
     assert auto_turns == 2
     assert invalid_auto == 1
     assert api_error_auto == 1
+
+
+def test_estimate_hand_cost_uses_per_million_prices() -> None:
+    args = SimpleNamespace(price_input=0.045, price_output=0.225)
+    assert estimate_hand_cost(1_000_000, 1_000_000, args) == pytest.approx(0.27)
+    assert estimate_hand_cost(0, 0, args) == 0.0
+
+
+def test_make_opponent_selects_scripted_policy() -> None:
+    args = SimpleNamespace(opponent_kind="random")
+    task = HandTask(index=0, deal_index=0, assignment=0, seed=123)
+    opponent = make_opponent(args, task)
+    assert isinstance(opponent, ScriptedBot)
+    assert opponent.policy == "random"
+    assert opponent.seed == 123

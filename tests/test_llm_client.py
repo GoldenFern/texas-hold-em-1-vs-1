@@ -77,9 +77,16 @@ def sse(*events: dict) -> List[bytes]:
 def make_client(
     responses: List[FakeResponse],
     locale: str = "zh-CN",
+    user_id: Optional[str] = None,
 ) -> tuple[LLMClient, FakeSession]:
     registry = ProviderRegistry()
-    client = LLMClient(registry, connect_timeout=1, read_timeout=1, locale=locale)
+    client = LLMClient(
+        registry,
+        connect_timeout=1,
+        read_timeout=1,
+        locale=locale,
+        user_id=user_id,
+    )
     session = FakeSession(responses)
     client._get_session = lambda: session  # type: ignore[method-assign]
     return client, session
@@ -376,3 +383,83 @@ def test_duplicate_tool_ids_are_made_unique() -> None:
     )
     result = client.stream(spec(), [{"role": "user", "content": "hi"}], None, {}, lambda e: None)
     assert [call.id for call in result.tool_calls] == ["same", "same_2"]
+
+def test_stream_usage_parses_deepseek_cache_fields() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {"content": "ok"}}]},
+                    {
+                        "choices": [{"delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": 100,
+                            "completion_tokens": 10,
+                            "prompt_cache_hit_tokens": 80,
+                            "prompt_cache_miss_tokens": 20,
+                            "prompt_tokens_details": {"cached_tokens": 80},
+                            "completion_tokens_details": {"reasoning_tokens": 4},
+                        },
+                    },
+                )
+            )
+        ]
+    )
+    result = client.stream(spec(), [{"role": "user", "content": "hi"}], None, {}, lambda e: None)
+    assert result.usage["input_tokens"] == 100
+    assert result.usage["cached_input_tokens"] == 80
+    assert result.usage["cache_miss_input_tokens"] == 20
+    assert result.usage["reasoning_tokens"] == 4
+
+
+def test_stream_usage_computes_cache_miss_for_openai_shape() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {"content": "ok"}}]},
+                    {
+                        "choices": [{"delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": 50,
+                            "completion_tokens": 5,
+                            "prompt_tokens_details": {"cached_tokens": 12},
+                        },
+                    },
+                )
+            )
+        ]
+    )
+    result = client.stream(spec(), [{"role": "user", "content": "hi"}], None, {}, lambda e: None)
+    assert result.usage["cached_input_tokens"] == 12
+    assert result.usage["cache_miss_input_tokens"] == 38
+
+def test_user_id_is_sent_for_cache_isolation() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {"content": "ok"}}]},
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                )
+            )
+        ],
+        user_id="ctx-preview-legacy-2026",
+    )
+    client.stream(spec(), [{"role": "user", "content": "hi"}], None, {}, lambda e: None)
+    assert session.calls[0]["json"]["user_id"] == "ctx-preview-legacy-2026"
+
+
+def test_user_id_is_omitted_when_not_configured() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {"content": "ok"}}]},
+                    {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                )
+            )
+        ]
+    )
+    client.stream(spec(), [{"role": "user", "content": "hi"}], None, {}, lambda e: None)
+    assert "user_id" not in session.calls[0]["json"]
