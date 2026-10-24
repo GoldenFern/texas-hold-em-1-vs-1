@@ -9,6 +9,7 @@ from src.agents.base import AgentView
 from src.engine.actions import action_label
 from src.engine.evaluator import hand_category_name
 from src.i18n import normalize_locale, tr
+from src.llm.context import MatchStats
 from src.llm.prompt_texts import prompt_text
 
 ALL_TOOL_NAMES = (
@@ -431,47 +432,46 @@ def build_final_talk_system_prompt(name: str, locale: str = "zh-CN") -> str:
     return prompt_text(locale)["final_system"].format(name=name)
 
 
+def build_final_talk_summary_from_stats(
+    stats: MatchStats,
+    locale: str = "zh-CN",
+) -> str:
+    """Summarize the match from aggregate stats for the fresh context.
+
+    Args:
+        stats: Aggregated results for one seat.
+        locale: Agent locale.
+
+    Returns:
+        Localized summary sentence used before the final-talk prompt.
+    """
+    locale = _locale(locale)
+    text = prompt_text(locale)
+    if stats.net > 0:
+        result_label = text["final_result_profit"]
+    elif stats.net < 0:
+        result_label = text["final_result_loss"]
+    else:
+        result_label = text["final_result_even"]
+    return text["final_summary"].format(
+        hands=stats.hands,
+        wins=stats.wins,
+        losses=stats.losses,
+        net=stats.net,
+        result_label=result_label,
+        chips=stats.chips,
+        opponent=stats.opponent_chips,
+    )
+
+
 def build_final_talk_summary(
     hand_results: Sequence[dict],
     seat: int,
     locale: str = "zh-CN",
 ) -> str:
-    """Summarize the match for the fresh post-match context."""
-    locale = _locale(locale)
-    text = prompt_text(locale)
-    results = [item for item in hand_results if item]
-    hands = len(results)
-    wins = sum(1 for item in results if seat in (item.get("winner_seats") or []))
-    losses = hands - wins
-    net = 0
-    chips = 0
-    opponent_chips = 0
-    for item in results:
-        players = {entry.get("seat"): entry for entry in item.get("players", [])}
-        net += int(players.get(seat, {}).get("net", 0) or 0)
-    if results:
-        final_players = {
-            entry.get("seat"): entry for entry in results[-1].get("players", [])
-        }
-        chips = int(final_players.get(seat, {}).get("chips_after", 0) or 0)
-        opponent_chips = int(
-            final_players.get(1 - seat, {}).get("chips_after", 0) or 0
-        )
-    if net > 0:
-        result_label = text["final_result_profit"]
-    elif net < 0:
-        result_label = text["final_result_loss"]
-    else:
-        result_label = text["final_result_even"]
-    return text["final_summary"].format(
-        hands=hands,
-        wins=wins,
-        losses=losses,
-        net=net,
-        result_label=result_label,
-        chips=chips,
-        opponent=opponent_chips,
-    )
+    """Summarize raw hand results for the fresh post-match context."""
+    stats = MatchStats.from_results(hand_results, seat)
+    return build_final_talk_summary_from_stats(stats, locale)
 
 
 def build_final_talk_fresh_message(
@@ -479,9 +479,23 @@ def build_final_talk_fresh_message(
     seat: int,
     hand_results: Sequence[dict],
     locale: str = "zh-CN",
+    *,
+    stats: Optional[MatchStats] = None,
 ) -> str:
-    """Build a compact post-match user message with a match summary."""
-    summary = build_final_talk_summary(hand_results, seat, locale)
+    """Build a compact post-match user message with a match summary.
+
+    Args:
+        result: Final hand result.
+        seat: Seat whose perspective is being summarized.
+        hand_results: Raw history used when ``stats`` is omitted.
+        locale: Agent locale.
+        stats: Aggregate match stats; preferred over re-scanning history.
+    """
+    summary = (
+        build_final_talk_summary_from_stats(stats, locale)
+        if stats is not None
+        else build_final_talk_summary(hand_results, seat, locale)
+    )
     return f"{summary}\n\n{build_final_table_talk_message(result, seat, '', locale)}"
 
 
@@ -501,6 +515,7 @@ __all__ = [
     "build_final_table_talk_message",
     "build_final_talk_fresh_message",
     "build_final_talk_summary",
+    "build_final_talk_summary_from_stats",
     "build_final_talk_system_prompt",
     "build_hand_result_message",
     "build_hand_summary_message",

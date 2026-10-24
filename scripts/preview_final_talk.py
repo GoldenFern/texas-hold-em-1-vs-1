@@ -34,6 +34,7 @@ from scripts.eval_llm_vs_bot import RetryingClient
 from src.analysis.hand_distribution import HandDistributionAnalyzer
 from src.llm.agent import LLMAgent
 from src.llm.client import LLMClient
+from src.llm.context import MatchStats
 from src.llm.prompt import AGENT_TOOL_NAMES
 from src.llm.providers import ModelSpec, ProviderRegistry
 from src.llm.tools import select_tools
@@ -134,7 +135,7 @@ def run_once(
         submit_table_talk=lambda text: {"ok": True, "text": text},
         locale="zh-CN",
     )
-    agent.hand_results = hand_results
+    agent.match_stats = MatchStats.from_results(hand_results, 0)
     agent.messages = messages if mode == "full" else messages[:1]
 
     events: List[dict] = []

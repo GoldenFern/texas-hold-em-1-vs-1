@@ -12,14 +12,16 @@ _TOOL_TEXT: Dict[str, Dict[str, str]] = {
     "zh-CN": {
         "estimate": (
             "根据你的两张底牌和当前公共牌，估算你最终最佳五张牌分别成为"
-            "皇家同花顺/同花顺/四条/葫芦/同花/顺子/三条/两对/一对/高牌的概率。"
-            "这是牌型分布，不是胜率。是否调用由你自行判断。"
+            "皇家同花顺/同花顺/四条/葫芦/同花/顺子/三条/两对/一对/高牌的概率，"
+            "单位为百分比（0-100）。这是最终牌型分布，不是胜率；"
+            "组合少时精确枚举，否则蒙特卡洛。是否调用由你自行判断。"
         ),
         "iterations": "蒙特卡洛采样次数；翻牌前建议 20000-50000，翻牌后引擎会自动精确枚举。单回合总采样有上限。",
         "equity": (
-            "估算当前牌局的摊牌 equity。对手按剩余牌均匀随机；"
-            "河牌和转牌精确枚举，翻牌和翻前蒙特卡洛。"
-            "返回赢/平/输概率，equity = 胜率 + 平局率/2。不需要参数。"
+            "估算当前牌局的摊牌 equity。返回的概率是 0 到 1 的小数，不是百分数；"
+            "equity = 胜率 + 平局率/2。对手按剩余牌均匀随机；河牌和转牌精确枚举，"
+            "翻牌和翻前蒙特卡洛。精确枚举时 samples 是等概率组合数，不是蒙特卡洛次数。"
+            "不需要参数。"
         ),
         "random": (
             "返回一个 [0, 1) 区间的均匀随机数。"
@@ -30,8 +32,10 @@ _TOOL_TEXT: Dict[str, Dict[str, str]] = {
         "call_ev": (
             "计算当前跟注的静态期望收益。底池、跟注额和筹码自动取当前牌局；"
             "equity 可省略，省略时自动按当前牌局估算。"
-            "返回跟注 EV、盈亏平衡胜率和有效底池。"
-            "假设跟注后不再下注，翻牌和转牌还要考虑隐含赔率。"
+            "返回跟注 EV、临界胜率 breakeven_equity 和有效底池 effective_pot。"
+            "假设跟注后不再下注，翻牌和转牌还要考虑隐含赔率；"
+            "pot_to_call_ratio 是倍数（3.0=3:1），不是百分比；"
+            "短码全下按 effective_pot（扣 refund）算。"
         ),
         "equity_param": "可选。0 到 1 的小数；省略时自动估算。",
         "action": (
@@ -56,15 +60,17 @@ _TOOL_TEXT: Dict[str, Dict[str, str]] = {
         "estimate": (
             "Estimate the probability that your final best five-card hand becomes each "
             "of royal flush / straight flush / four of a kind / full house / flush / "
-            "straight / three of a kind / two pair / one pair / high card. This is a "
-            "hand-category distribution, not equity. Decide yourself whether to call it."
+            "straight / three of a kind / two pair / one pair / high card, in percent "
+            "(0-100). This is the final hand-category distribution, not equity; exact "
+            "enumeration when small, otherwise Monte Carlo. Decide whether to call it."
         ),
         "iterations": "Monte Carlo sample count; 20000-50000 is recommended preflop. The engine enumerates exactly postflop. Each turn has a total sample budget.",
         "equity": (
-            "Estimate your current showdown equity. The opponent is treated as a uniformly "
-            "random hand; river and turn are enumerated exactly, flop and preflop use Monte "
-            "Carlo. Returns win/tie/lose probabilities, where equity = win rate + tie rate / 2. "
-            "No parameters are needed."
+            "Estimate your current showdown equity. Probabilities are decimals 0-1, not "
+            "percentages; equity = win rate + tie rate / 2. Opponent and board are uniformly "
+            "random. River and turn are enumerated exactly, flop and preflop use Monte Carlo. "
+            "For exact enumeration, samples is the count of equally likely combinations, not "
+            "Monte Carlo draws. No parameters needed."
         ),
         "random": (
             "Return a uniformly random value in [0, 1). Only after you have completed your "
@@ -74,10 +80,12 @@ _TOOL_TEXT: Dict[str, Dict[str, str]] = {
             "chasing a number."
         ),
         "call_ev": (
-            "Compute the static expected value of calling with the current pot, call amount, "
+            "Compute the static EV of calling with the current pot, call amount, "
             "and stack. equity may be omitted and will then be estimated from the current "
-            "table. Returns call EV, breakeven equity, and effective pot. This assumes no "
-            "further betting; flop and turn still require implied odds."
+            "table. Returns call EV, breakeven_equity (threshold), effective_pot, and "
+            "pot_to_call_ratio. This assumes no further betting; flop and turn still "
+            "require implied odds. pot_to_call_ratio is a multiple (3.0 = 3:1), not a "
+            "percentage; short all-in calls use effective_pot after refund."
         ),
         "equity_param": "Optional decimal from 0 to 1; estimated automatically when omitted.",
         "action": (

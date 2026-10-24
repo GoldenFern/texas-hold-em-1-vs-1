@@ -25,7 +25,12 @@ from src.engine.evaluator import hand_category_name
 from src.i18n import normalize_locale, tr
 
 from .client import LLMClient, LLMError, ToolCall, estimate_tokens
-from .context import ContextSettings, compact_history, compact_tool_payload
+from .context import (
+    ContextSettings,
+    MatchStats,
+    compact_history,
+    compact_tool_payload,
+)
 from .prompt import (
     TABLE_TALK_TOOL_NAME,
     build_compact_turn_message,
@@ -49,6 +54,8 @@ from .tools import (
     build_tools,
     select_tools,
 )
+
+_MAX_RECENT_HAND_RESULTS = 200
 
 _ACTION_ALIASES = {
     "x": "check",
@@ -118,6 +125,7 @@ class LLMAgent(BaseAgent):
         if context_window > 0:
             runtime_budget = min(runtime_budget, context_window - reserved_output - 2048)
         self.max_context_tokens = max(8000, runtime_budget)
+        self.context = self.context.with_context_window(self.max_context_tokens)
         self.max_estimate_calls = int(runtime.get("max_estimate_calls_per_turn", 2))
         self.max_estimate_iterations = int(runtime.get("max_estimate_iterations", 50000))
         self.max_equity_calls = int(runtime.get("max_equity_calls_per_turn", 2))
@@ -142,6 +150,7 @@ class LLMAgent(BaseAgent):
                 locale=self.locale,
             )
         self.messages: List[dict] = [{"role": "system", "content": self.system_prompt}]
+        self.match_stats = MatchStats()
         self.hand_results: List[dict] = []
         self.turn_count = 0
         self._estimated_keys: set[tuple[int, str]] = set()
@@ -179,6 +188,7 @@ class LLMAgent(BaseAgent):
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt}]
+        self.match_stats = MatchStats()
         self.hand_results = []
         self.turn_count = 0
         self.total_usage = {
@@ -208,7 +218,10 @@ class LLMAgent(BaseAgent):
     def on_hand_finished(self, result: Optional[dict]) -> None:
         if not result:
             return
+        self.match_stats.update(result, self.seat)
         self.hand_results.append(result)
+        if len(self.hand_results) > _MAX_RECENT_HAND_RESULTS:
+            del self.hand_results[0]
         if self.context.compacts:
             text = build_hand_summary_message(result, self.seat, locale=self.locale)
         else:
@@ -223,11 +236,17 @@ class LLMAgent(BaseAgent):
         submit: Callable[[str], dict],
         emit,
     ) -> None:
-        """Ask the model for one optional post-match table-talk message."""
+        """Ask the model for one optional post-match table-talk message.
+
+        Emits ``final_talk_response`` after every model response and exactly
+        one ``final_talk_end`` once the call finishes.  The end event reports
+        usage from the final-talk requests only, not the whole match.
+        """
         if not self.table_talk_required or self._cancel_event.is_set():
             return
         self._sync_client_locale()
         mode = self.context.final_talk_context
+        talk_usage = {key: 0 for key in self.total_usage}
         if mode == "fresh":
             messages: List[dict] = [
                 {
@@ -241,6 +260,7 @@ class LLMAgent(BaseAgent):
                         self.seat,
                         self.hand_results,
                         locale=self.locale,
+                        stats=self.match_stats,
                     ),
                 },
             ]
@@ -260,8 +280,25 @@ class LLMAgent(BaseAgent):
                 "estimated_tokens": self._messages_tokens(messages),
             }
         )
+
+        def emit_end(ok: bool, reason: str = "", error: str = "") -> None:
+            """Emit one closing event; usage covers final-talk calls only."""
+            payload = {
+                "type": "final_talk_end",
+                "mode": mode,
+                "ok": ok,
+                "message_count": len(messages),
+                "usage": dict(talk_usage),
+            }
+            if reason:
+                payload["reason"] = reason
+            if error:
+                payload["error"] = error
+            emit(payload)
+
         for attempt in range(2):
             if self._cancel_event.is_set():
+                emit_end(False, reason="cancelled")
                 return
             try:
                 response = self.client.stream(
@@ -280,6 +317,7 @@ class LLMAgent(BaseAgent):
                         "text": self._t("agent.final.not_generated", kind=exc.kind),
                     }
                 )
+                emit_end(False, reason="llm_error", error=exc.kind)
                 return
             except Exception as exc:  # noqa: BLE001
                 emit(
@@ -292,14 +330,30 @@ class LLMAgent(BaseAgent):
                         ),
                     }
                 )
+                emit_end(
+                    False,
+                    reason="exception",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 return
             self.last_error = ""
-            for key in self.total_usage:
-                self.total_usage[key] += int(response.usage.get(key, 0))
+            for key in talk_usage:
+                amount = int(response.usage.get(key, 0))
+                talk_usage[key] += amount
+                self.total_usage[key] = self.total_usage.get(key, 0) + amount
             messages.append(
                 response.assistant_message(
                     bool(self.spec.request.get("reasoning_echo", False))
                 )
+            )
+            emit(
+                {
+                    "type": "final_talk_response",
+                    "mode": mode,
+                    "usage": dict(response.usage),
+                    "latency_ms": round(response.latency_ms, 1),
+                    "message_count": len(messages),
+                }
             )
             talk_call: Optional[ToolCall] = None
             for item in response.tool_calls:
@@ -346,6 +400,7 @@ class LLMAgent(BaseAgent):
                     if submitted.get("ok"):
                         if mode == "full":
                             self.messages = messages
+                        emit_end(True)
                         return
                     messages.append(
                         {
@@ -384,6 +439,7 @@ class LLMAgent(BaseAgent):
                 "text": self._t("agent.final.no_result"),
             }
         )
+        emit_end(False, reason="no_result")
 
     def describe(self) -> dict:
         return {

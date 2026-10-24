@@ -124,11 +124,13 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 
 ## 上下文策略（预实验）
 
-- `LLMAgent` 的 `runtime.context_policy` 支持 `legacy` / `full` / `compact` / `compact_slim`；默认 `legacy`，不要在没有对照结果前改默认。
+- `LLMAgent` 的 `runtime.context_policy` 支持 `legacy` / `full` / `compact` / `compact_slim`；默认 `legacy`，不要在没有对照结果前改默认。`config/game.json` 的 `llm_runtime` 已暴露 `context_policy`、高/低水位、保留手数和 `final_talk_context`，默认仍是 `legacy` / `full`。
 - `legacy` 保持原有行为：超过 `max_context_tokens_estimate` 后从最早的 turn 开始删。它会改变 system prompt 之后的前缀，长对局缓存命中会明显下降。
 - `compact` 每手结束写一条 `【手牌摘要 · 第 N 手】` 用户消息，只保留最近 `context_keep_recent_hands` 手的详情，超过 `context_high_water_tokens` 时整段丢弃旧手消息。当前手永不裁。
 - 压缩只删除完整消息，不修改保留的 assistant 消息；DeepSeek 工具模式要求回传的 `reasoning_content` 必须原样保留。
-- `compact_slim` 额外使用精简回合状态（`build_compact_turn_message`）和精简工具结果（去掉重复 `note`、`lose`、`ev_fold` 等字段）。
+- `compact_slim` 额外使用精简回合状态（`build_compact_turn_message`）和精简工具结果（去掉重复 `note`、`lose`、`ev_fold` 等字段）。被删掉字段的单位和假设已补到 `src/llm/tools.py` 的 tool description，不要重新塞回每次工具结果。
+- `ContextSettings.with_context_window()` 会按 `max_context_tokens - 4096` clamp 高/低水位；小上下文模型不会因为配置的 120k 高水位而绕过压缩。
+- `LLMAgent` 用 `MatchStats` 聚合赛后摘要；`hand_results` 只保留最近 200 手用于调试，不再无限增长。`final_talk_response` / `final_talk_end` 事件会带赛后喊话自己的 usage。
 - `ChatResult.usage` 现在包含 `cached_input_tokens`、`cache_miss_input_tokens`；`message_end` 事件会透传，评测脚本可直接统计。DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 会解析，前端暂未展示。
 - `LLMClient` 支持可选 `user_id`；DeepSeek 用它做 KV cache 隔离。实验脚本用 `--cache-scope` 给每个 run 独立缓存域，避免跨 run 共享缓存污染命中率。
 - `runtime.final_talk_context` 支持 `full` / `fresh`；`fresh` 使用短 system prompt + 比赛摘要 + 最后一手结果，不改动比赛历史。默认 `full` 保持旧行为。

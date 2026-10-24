@@ -14,7 +14,7 @@ removed as whole messages, so retained assistant messages keep their original
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence
 
 _ZH_HAND_RE = re.compile(r"第\s*(\d+)\s*手")
@@ -39,6 +39,32 @@ class ContextSettings:
     @property
     def compacts(self) -> bool:
         return self.policy in ("compact", "compact_slim")
+
+    def with_context_window(
+        self,
+        max_context_tokens: int,
+        margin: int = 4096,
+    ) -> "ContextSettings":
+        """Clamp both watermarks below the effective model context budget.
+
+        Args:
+            max_context_tokens: Prompt budget already reduced by the reserved
+                output tokens.
+            margin: Headroom kept free below the prompt budget.
+
+        Returns:
+            A copy with watermarks that cannot exceed the budget.  The high
+            watermark is at least 2000 tokens and the low watermark is at
+            least 1000 tokens; when the high watermark is tiny, the low
+            watermark is allowed to sit at 1000 instead of going negative.
+        """
+        high = max(2_000, min(self.high_water_tokens, max_context_tokens - margin))
+        low = max(1_000, min(self.low_water_tokens, high - margin))
+        return replace(
+            self,
+            high_water_tokens=high,
+            low_water_tokens=min(low, high),
+        )
 
     @classmethod
     def from_runtime(cls, runtime: dict) -> "ContextSettings":
@@ -82,6 +108,69 @@ class ContextSettings:
             tool_detail=tool_detail,
             final_talk_context=final_talk_context,
         )
+
+
+@dataclass
+class MatchStats:
+    """Aggregated match results for one seat.
+
+    Attributes:
+        hands: Number of completed hands.
+        wins: Hands won by the seat.
+        losses: Hands not won by the seat.
+        net: Sum of chip net changes across all hands.
+        chips: Chips after the most recent hand.
+        opponent_chips: Opponent chips after the most recent hand.
+    """
+
+    hands: int = 0
+    wins: int = 0
+    losses: int = 0
+    net: int = 0
+    chips: int = 0
+    opponent_chips: int = 0
+
+    def update(self, result: dict, seat: int) -> None:
+        """Accumulate one completed hand result.
+
+        Args:
+            result: Engine hand result with ``winner_seats`` and ``players``.
+            seat: Seat whose perspective is being summarized.
+        """
+        if not result:
+            return
+        self.hands += 1
+        if seat in (result.get("winner_seats") or []):
+            self.wins += 1
+        else:
+            self.losses += 1
+        players = {
+            entry.get("seat"): entry for entry in result.get("players") or []
+        }
+        mine = players.get(seat) or {}
+        theirs = players.get(1 - seat) or {}
+        self.net += int(mine.get("net", 0) or 0)
+        if "chips_after" in mine:
+            self.chips = int(mine.get("chips_after") or 0)
+        if "chips_after" in theirs:
+            self.opponent_chips = int(theirs.get("chips_after") or 0)
+
+    @classmethod
+    def from_results(cls, hand_results: Sequence[dict], seat: int) -> "MatchStats":
+        """Build aggregate stats from a sequence of hand results.
+
+        Args:
+            hand_results: Chronological hand results for one seat.
+            seat: Seat whose perspective is being summarized.
+
+        Returns:
+            Aggregate stats for the supplied results.
+        """
+        stats = cls()
+        for result in hand_results:
+            if result:
+                stats.update(result, seat)
+        return stats
 
 
 def parse_hand_number(
@@ -190,6 +279,7 @@ def compact_tool_payload(tool_name: str, payload: dict) -> dict:
 
 __all__ = [
     "ContextSettings",
+    "MatchStats",
     "compact_history",
     "compact_tool_payload",
     "is_summary_message",

@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import pytest
+
 from src.agents.base import AgentView
 from src.llm.context import (
     ContextSettings,
+    MatchStats,
     compact_history,
     compact_tool_payload,
     parse_hand_number,
 )
 from src.llm.prompt import (
     build_compact_turn_message,
+    build_final_talk_summary,
+    build_final_talk_summary_from_stats,
     build_hand_summary_message,
 )
 
@@ -138,6 +143,103 @@ def test_context_settings_compact_slim_forces_both_details() -> None:
 
     fresh = ContextSettings.from_runtime({"final_talk_context": "fresh"})
     assert fresh.final_talk_context == "fresh"
+
+
+def make_result(
+    hand_id: int,
+    winner: int,
+    net: int,
+    chips: int,
+    opponent_chips: int,
+) -> dict:
+    return {
+        "hand_id": hand_id,
+        "winner_seats": [winner],
+        "players": [
+            {"seat": 0, "net": net, "chips_after": chips},
+            {"seat": 1, "net": -net, "chips_after": opponent_chips},
+        ],
+    }
+
+
+@pytest.mark.parametrize("window", [64_000, 128_000, 1_000_000])
+def test_context_settings_watermarks_stay_below_window(window: int) -> None:
+    settings = ContextSettings.from_runtime(
+        {
+            "context_policy": "compact",
+            "context_high_water_tokens": 120_000,
+            "context_low_water_tokens": 40_000,
+        }
+    )
+    clamped = settings.with_context_window(window)
+    assert clamped.high_water_tokens <= window - 4096
+    assert clamped.high_water_tokens >= 2_000
+    assert clamped.low_water_tokens <= window - 4096
+    assert clamped.low_water_tokens <= clamped.high_water_tokens
+    assert clamped.low_water_tokens >= 1_000
+    assert clamped.policy == settings.policy
+
+
+def test_context_settings_allow_low_floor_on_tiny_window() -> None:
+    settings = ContextSettings(
+        high_water_tokens=120_000,
+        low_water_tokens=40_000,
+    )
+    clamped = settings.with_context_window(8_000)
+    assert clamped.high_water_tokens == 3_904
+    assert clamped.low_water_tokens == 1_000
+
+
+def test_match_stats_accumulates_results() -> None:
+    results = [
+        make_result(1, 0, 60, 1060, 940),
+        make_result(2, 1, -40, 1020, 980),
+    ]
+    stats = MatchStats()
+    for item in results:
+        stats.update(item, 0)
+
+    assert stats == MatchStats(
+        hands=2,
+        wins=1,
+        losses=1,
+        net=20,
+        chips=1020,
+        opponent_chips=980,
+    )
+    assert MatchStats.from_results(results, 0) == stats
+
+
+def test_final_talk_summary_from_stats_matches_history_summary() -> None:
+    results = [
+        make_result(1, 0, 60, 1060, 940),
+        make_result(2, 1, -40, 1020, 980),
+    ]
+    stats = MatchStats.from_results(results, 0)
+    history_text = build_final_talk_summary(results, 0, locale="zh-CN")
+    stats_text = build_final_talk_summary_from_stats(stats, locale="zh-CN")
+
+    assert stats_text == history_text
+    assert "共 2 手" in stats_text
+    assert "你赢 1 手，输 1 手" in stats_text
+    assert "整场净变化 +20" in stats_text
+    assert "盈利" in stats_text
+    assert "1020" in stats_text and "980" in stats_text
+
+    english = build_final_talk_summary_from_stats(stats, locale="en-US")
+    assert "2 hands" in english
+    assert "profit" in english
+
+    losing = MatchStats(
+        hands=2,
+        wins=1,
+        losses=1,
+        net=-20,
+        chips=980,
+        opponent_chips=1020,
+    )
+    assert "亏损" in build_final_talk_summary_from_stats(losing, locale="zh-CN")
+    assert "loss" in build_final_talk_summary_from_stats(losing, locale="en-US")
 
 
 def test_compact_tool_payload_removes_static_notes() -> None:

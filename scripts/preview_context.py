@@ -413,7 +413,7 @@ def play_session(args: argparse.Namespace) -> dict:
         "game": game,
         "usage": dict(agent.total_usage),
         "messages": list(agent.messages),
-        "hand_results": list(agent.hand_results),
+        "hand_results": list(history),
         "final_result": history[-1] if history else None,
         "system_prompt": agent.system_prompt,
         "cache_scope": cache_scope,

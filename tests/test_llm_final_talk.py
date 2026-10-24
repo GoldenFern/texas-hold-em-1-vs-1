@@ -6,7 +6,8 @@ from typing import List
 
 from src.analysis.hand_distribution import HandDistributionAnalyzer
 from src.llm.agent import LLMAgent
-from src.llm.client import ChatResult, ToolCall
+from src.llm.client import ChatResult, LLMError, ToolCall
+from src.llm.context import MatchStats
 from src.llm.prompt import AGENT_TOOL_NAMES
 from src.llm.providers import ProviderRegistry
 from src.llm.tools import select_tools
@@ -36,6 +37,21 @@ class CaptureClient:
                 "reasoning_tokens": 1,
             },
             latency_ms=1.0,
+        )
+
+
+class FailingClient:
+    def stream(self, spec, messages, tools, params, on_event, cancel=None):
+        raise LLMError("network", "connection reset")
+
+
+class NoToolClient:
+    def stream(self, spec, messages, tools, params, on_event, cancel=None):
+        return ChatResult(
+            content="no tool call",
+            finish_reason="stop",
+            usage={"input_tokens": 5, "output_tokens": 1},
+            latency_ms=2.0,
         )
 
 
@@ -88,14 +104,15 @@ def test_fresh_final_talk_uses_short_context() -> None:
         {"role": "user", "content": "old history one"},
         {"role": "assistant", "content": "old answer"},
     ]
-    agent.hand_results = [result()]
+    agent.match_stats = MatchStats.from_results([result()], 0)
     submitted: List[str] = []
+    events: List[dict] = []
 
     def submit(text: str) -> dict:
         submitted.append(text)
         return {"ok": True}
 
-    agent.final_table_talk(result(), submit, lambda event: None)
+    agent.final_table_talk(result(), submit, events.append)
 
     assert submitted == ["good game"]
     assert len(client.captured) == 1
@@ -108,6 +125,25 @@ def test_fresh_final_talk_uses_short_context() -> None:
     assert "盈利" in messages[1]["content"]
     assert "【赛后喊话】" in messages[1]["content"]
     assert "下一手即将开始" not in messages[1]["content"]
+    response_event = next(
+        event for event in events if event["type"] == "final_talk_response"
+    )
+    assert response_event["mode"] == "fresh"
+    assert response_event["usage"]["input_tokens"] == 10
+    assert response_event["latency_ms"] == 1.0
+    assert response_event["message_count"] >= 3
+    end_event = next(
+        event for event in events if event["type"] == "final_talk_end"
+    )
+    assert end_event["mode"] == "fresh"
+    assert end_event["ok"] is True
+    assert end_event["usage"] == {
+        "input_tokens": 10,
+        "cached_input_tokens": 6,
+        "cache_miss_input_tokens": 4,
+        "output_tokens": 2,
+        "reasoning_tokens": 1,
+    }
     # The fresh call must not replace the agent's long history.
     assert len(agent.messages) == 3
 
@@ -120,12 +156,63 @@ def test_full_final_talk_keeps_history() -> None:
         {"role": "user", "content": "old history one"},
         {"role": "assistant", "content": "old answer"},
     ]
-    agent.hand_results = [result()]
+    agent.match_stats = MatchStats.from_results([result()], 0)
+    events: List[dict] = []
 
-    agent.final_table_talk(result(), lambda text: {"ok": True}, lambda event: None)
+    agent.final_table_talk(result(), lambda text: {"ok": True}, events.append)
 
     assert len(client.captured) == 1
     messages = client.captured[0]
     assert len(messages) >= 4
     assert any(item.get("content") == "old history one" for item in messages)
     assert len(agent.messages) >= 4
+    response_event = next(
+        event for event in events if event["type"] == "final_talk_response"
+    )
+    assert response_event["mode"] == "full"
+    assert response_event["usage"]["input_tokens"] == 10
+    assert response_event["message_count"] >= 4
+    end_event = next(
+        event for event in events if event["type"] == "final_talk_end"
+    )
+    assert end_event["mode"] == "full"
+    assert end_event["ok"] is True
+    assert end_event["usage"]["input_tokens"] == 10
+    assert end_event["message_count"] >= 4
+
+
+def test_final_talk_emits_end_event_on_failure() -> None:
+    agent = make_agent(FailingClient(), "fresh")
+    agent.match_stats = MatchStats.from_results([result()], 0)
+    events: List[dict] = []
+
+    agent.final_table_talk(result(), lambda text: {"ok": True}, events.append)
+
+    assert not any(event["type"] == "final_talk_response" for event in events)
+    end_event = next(
+        event for event in events if event["type"] == "final_talk_end"
+    )
+    assert end_event["ok"] is False
+    assert end_event["reason"] == "llm_error"
+    assert end_event["error"] == "network"
+    assert end_event["usage"]["input_tokens"] == 0
+
+
+def test_final_talk_emits_end_event_when_no_result() -> None:
+    agent = make_agent(NoToolClient(), "fresh")
+    agent.match_stats = MatchStats.from_results([result()], 0)
+    events: List[dict] = []
+
+    agent.final_table_talk(result(), lambda text: {"ok": True}, events.append)
+
+    responses = [
+        event for event in events if event["type"] == "final_talk_response"
+    ]
+    assert len(responses) == 2
+    assert all(event["usage"]["input_tokens"] == 5 for event in responses)
+    end_event = next(
+        event for event in events if event["type"] == "final_talk_end"
+    )
+    assert end_event["ok"] is False
+    assert end_event["reason"] == "no_result"
+    assert end_event["usage"]["input_tokens"] == 10

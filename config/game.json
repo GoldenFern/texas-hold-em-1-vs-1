@@ -32,6 +32,11 @@
     "table_talk_history_limit": 6,
     "table_talk_snapshot_limit": 40,
     "max_context_tokens_estimate": 220000,
+    "context_policy": "legacy",
+    "context_high_water_tokens": 120000,
+    "context_low_water_tokens": 40000,
+    "context_keep_recent_hands": 2,
+    "final_talk_context": "full",
     "request_timeout_seconds": 300,
     "connect_timeout_seconds": 20
   }

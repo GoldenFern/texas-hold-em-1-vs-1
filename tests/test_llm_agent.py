@@ -1082,3 +1082,30 @@ def test_call_ev_is_not_applicable_without_a_bet() -> None:
     assert results[0]["ok"] is True
     assert results[0]["result"]["applicable"] is False
     assert "to_call=0" in results[0]["summary"]
+
+
+def test_context_watermarks_are_clamped_to_context_budget() -> None:
+    agent, _ = build_agent(
+        [],
+        runtime={
+            "context_policy": "compact",
+            "context_high_water_tokens": 120000,
+            "context_low_water_tokens": 40000,
+            "max_context_tokens_estimate": 64000,
+        },
+    )
+    assert agent.max_context_tokens == 64000
+    assert agent.context.high_water_tokens <= agent.max_context_tokens - 4096
+    assert agent.context.low_water_tokens <= agent.context.high_water_tokens
+
+    tiny, _ = build_agent(
+        [],
+        runtime={
+            "context_policy": "compact",
+            "context_high_water_tokens": 120000,
+            "context_low_water_tokens": 40000,
+            "max_context_tokens_estimate": 8000,
+        },
+    )
+    assert tiny.context.high_water_tokens == 3904
+    assert tiny.context.low_water_tokens == 1000
