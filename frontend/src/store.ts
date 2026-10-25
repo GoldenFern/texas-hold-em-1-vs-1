@@ -207,6 +207,8 @@ export function buildDefaultSetup(): MatchSetupPayload {
     auto_rebuy: false,
     rebuy_amount: 1000,
     max_hands: 0,
+    blind_increase_every_hands: 0,
+    blind_increase_factor: 2,
     seed: null,
     god_view: true,
     table_talk: true,
@@ -223,6 +225,8 @@ export function buildDefaultSetup(): MatchSetupPayload {
       auto_rebuy: defaults.auto_rebuy,
       rebuy_amount: defaults.rebuy_amount,
       max_hands: defaults.max_hands,
+      blind_increase_every_hands: defaults.blind_increase_every_hands ?? 0,
+      blind_increase_factor: defaults.blind_increase_factor ?? 2,
       seed: defaults.seed,
       god_view: defaults.god_view,
     },
@@ -248,6 +252,12 @@ function loadSavedSetup(): MatchSetupPayload | null {
     if (typeof parsed.table_talk !== "boolean") parsed.table_talk = true;
     if (!["auto", "zh-CN", "en-US"].includes(String(parsed.agent_locale || ""))) {
       parsed.agent_locale = "auto";
+    }
+    if (typeof parsed.rules.blind_increase_every_hands !== "number") {
+      parsed.rules.blind_increase_every_hands = 0;
+    }
+    if (typeof parsed.rules.blind_increase_factor !== "number") {
+      parsed.rules.blind_increase_factor = 2;
     }
     return parsed;
   } catch {

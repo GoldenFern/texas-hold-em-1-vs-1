@@ -6,6 +6,8 @@
     "auto_rebuy": false,
     "rebuy_amount": 1000,
     "max_hands": 0,
+    "blind_increase_every_hands": 0,
+    "blind_increase_factor": 2.0,
     "seed": null,
     "god_view": true,
     "table_talk": true
@@ -15,6 +17,8 @@
     "small_blind": {"min": 1, "max": 1000},
     "big_blind": {"min": 2, "max": 2000},
     "max_hands": {"min": 0, "max": 1000},
+    "blind_increase_every_hands": {"min": 0, "max": 1000},
+    "blind_increase_factor": {"min": 1.0, "max": 10.0},
     "rebuy_amount": {"min": 100, "max": 100000}
   },
   "llm_runtime": {

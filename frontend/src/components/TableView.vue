@@ -17,6 +17,12 @@ import type { ActionLog, CardInfo, PlayerState, TableTalkEntry } from "../types"
 const snapshot = computed(() => (
   (board.busy || board.holeHold) && board.baseSnapshot ? board.baseSnapshot : game.snapshot
 ));
+const blindText = computed(() => {
+  const small = snapshot.value?.small_blind;
+  const big = snapshot.value?.big_blind;
+  if (!small || !big) return "";
+  return `${small} / ${big}`;
+});
 const match = computed(() => snapshot.value?.match || null);
 const players = computed(() => snapshot.value?.players || []);
 const seats = computed(() => match.value?.seats || []);
@@ -353,6 +359,9 @@ onUnmounted(() => {
           ></span>
         </div>
       </div>
+      <span v-if="blindText" class="blind-level" :title="t('table.blinds')">
+        {{ t("table.blinds") }} <strong>{{ blindText }}</strong>
+      </span>
       <button
         v-if="talkTicker && !board.busy && !board.holeHold"
         class="talk-ticker"
@@ -494,8 +503,27 @@ onUnmounted(() => {
   min-width: 0;
 }
 
-.talk-ticker {
+.blind-level {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  font-size: calc(9px * var(--type-scale));
+  white-space: nowrap;
+}
+
+.blind-level strong {
+  color: var(--gold);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.talk-ticker {
+  margin-left: 8px;
   min-width: 0;
   max-width: min(58%, 560px);
   display: flex;

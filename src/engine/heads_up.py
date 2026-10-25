@@ -113,6 +113,8 @@ class HeadsUpGame:
         rebuy_amount: Optional[int] = None,
         seed: Optional[int] = None,
         max_hands: int = 0,
+        blind_increase_every_hands: int = 0,
+        blind_increase_factor: float = 2.0,
         locale: str = "zh-CN",
     ) -> None:
         self.locale = normalize_locale(locale, "zh-CN") or "zh-CN"
@@ -147,6 +149,27 @@ class HeadsUpGame:
             raise ValueError(tr(self.locale, "engine.rule.max_hands")) from exc
         if max_hands < 0:
             raise ValueError(tr(self.locale, "engine.rule.max_hands"))
+        if isinstance(blind_increase_every_hands, bool):
+            raise ValueError(tr(self.locale, "engine.rule.blind_increase"))
+        if (
+            isinstance(blind_increase_every_hands, float)
+            and not blind_increase_every_hands.is_integer()
+        ):
+            raise ValueError(tr(self.locale, "engine.rule.blind_increase"))
+        try:
+            blind_increase_every_hands = int(blind_increase_every_hands or 0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(tr(self.locale, "engine.rule.blind_increase")) from exc
+        if blind_increase_every_hands < 0:
+            raise ValueError(tr(self.locale, "engine.rule.blind_increase"))
+        if isinstance(blind_increase_factor, bool):
+            raise ValueError(tr(self.locale, "engine.rule.blind_factor"))
+        try:
+            blind_increase_factor = float(blind_increase_factor)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(tr(self.locale, "engine.rule.blind_factor")) from exc
+        if not 1.0 <= blind_increase_factor <= 10.0:
+            raise ValueError(tr(self.locale, "engine.rule.blind_factor"))
         rebuy_amount = positive_int(
             starting_chips if rebuy_amount is None else rebuy_amount,
             "rebuy_amount",
@@ -155,9 +178,14 @@ class HeadsUpGame:
         self.starting_chips = int(starting_chips)
         self.small_blind = int(small_blind)
         self.big_blind = int(big_blind)
+        self.starting_small_blind = int(small_blind)
+        self.starting_big_blind = int(big_blind)
         self.auto_rebuy = bool(auto_rebuy)
         self.rebuy_amount = int(rebuy_amount)
         self.max_hands = int(max_hands or 0)
+        self.blind_increase_every_hands = int(blind_increase_every_hands)
+        self.blind_increase_factor = float(blind_increase_factor)
+        self.blind_level = 0
         self.seed = seed
 
         self.players: List[HeadsUpPlayer] = [
@@ -202,6 +230,25 @@ class HeadsUpGame:
             return False
         return True
 
+    def _maybe_increase_blinds(self) -> None:
+        """Raise the blinds after a configured number of completed hands."""
+        every = self.blind_increase_every_hands
+        if every <= 0 or self.hands_played <= 0 or self.hands_played % every != 0:
+            return
+        if self.blind_increase_factor <= 1.0:
+            return
+        ratio = self.big_blind / self.small_blind
+        new_small = max(
+            self.small_blind + 1,
+            int(round(self.small_blind * self.blind_increase_factor)),
+        )
+        new_big = max(new_small + 1, int(round(new_small * ratio)))
+        if new_small == self.small_blind and new_big == self.big_blind:
+            return
+        self.small_blind = new_small
+        self.big_blind = new_big
+        self.blind_level += 1
+
     def start_hand(self) -> None:
         """Deal a new hand. Raises when the match is over or a hand is active."""
         if self.street not in (Street.WAITING, Street.FINISHED):
@@ -211,6 +258,8 @@ class HeadsUpGame:
         if self.max_hands and self.hands_played >= self.max_hands:
             self.match_over = True
             raise RuntimeError(tr(self.locale, "engine.rule.max_hands_reached"))
+
+        self._maybe_increase_blinds()
 
         # Auto rebuy happens before the new hand is dealt.
         for player in self.players:
@@ -431,6 +480,11 @@ class HeadsUpGame:
             "match_over": self.match_over,
             "small_blind": self.small_blind,
             "big_blind": self.big_blind,
+            "starting_small_blind": self.starting_small_blind,
+            "starting_big_blind": self.starting_big_blind,
+            "blind_level": self.blind_level,
+            "blind_increase_every_hands": self.blind_increase_every_hands,
+            "blind_increase_factor": self.blind_increase_factor,
             "starting_chips": self.starting_chips,
         }
 

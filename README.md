@@ -112,7 +112,7 @@ cd frontend && npm run dev     # terminal 2, :5173, proxied to :5050
 - Two seats, each choosing **Human / LLM / RLCard**
 - Two humans cannot play each other
 - Bot seats support an action delay (0 to 10 seconds, default 3) so each move is easy to follow
-- Configurable: starting stack, small/big blind, auto rebuy, rebuy amount, max hands, random seed, god view
+- Configurable: starting stack, small/big blind, automatic blind increase every N hands, auto rebuy, rebuy amount, max hands, random seed, god view
 - Quick presets: Human vs DeepSeek, DeepSeek vs GLM, Human vs RLCard
 
 ### God view
@@ -161,6 +161,14 @@ A 1,000-hand-per-group ablation against a uniform random opponent (GPT-6 Luna, D
 [![Tool ablation: 1,000 hands per group](docs/images/dxh_tool_ablation_1000.png)](docs/images/dxh_tool_ablation_1000.png)
 
 The opponent is a uniform random agent, so these numbers should not be read as a win rate against a strong bot. They mainly show which tools reduce obvious mistakes: equity and call EV make the agent call and reach showdown more often, while hand-type distribution does not change its decisions much.
+
+#### A complete live self-play match
+
+Two GPT-6 Luna seats also played a full 1,000-chip match through the real Flask + SocketIO backend. With blinds doubling every 10 hands, the match finished in **42 hands and 42.7 minutes**: Luna B won 2,000 to 0. The match cost **¥0.35**, used 17.5M input tokens, and held a **98.0% cache hit rate**. No optional analysis tool was called in 210 turns; the model only used the mandatory `send_table_message` and `apply_action`.
+
+[![Complete live self-play match](docs/images/live_match_blinds_stack.png)](docs/images/live_match_blinds_stack.png)
+
+A control match with fixed 5/10 blinds reached 63 hands and 4.2 hours without finishing, then was stopped after repeated relay write timeouts. See [`docs/live_llm_match.md`](docs/live_llm_match.md) for both runs, style statistics, tool use, cache, token and timing breakdowns.
 
 ### Offline LLM vs LLM evaluation
 

@@ -27,6 +27,8 @@ const FALLBACK_RULES: SetupDraft["rules"] = {
   auto_rebuy: false,
   rebuy_amount: 1000,
   max_hands: 0,
+  blind_increase_every_hands: 0,
+  blind_increase_factor: 2,
   seed: null,
   god_view: true,
 };
@@ -338,6 +340,24 @@ function setBlinds(small: number, big: number): void {
   setRule("big_blind", big);
 }
 
+const blindIncreaseEnabled = computed(
+  () => numericRule("blind_increase_every_hands") > 0,
+);
+
+function toggleBlindIncrease(): void {
+  if (blindIncreaseEnabled.value) {
+    setRule("blind_increase_every_hands", 0);
+    return;
+  }
+  setRule("blind_increase_every_hands", 10);
+  setRule("blind_increase_factor", 2);
+}
+
+function setBlindFactor(event: Event): void {
+  const value = Number((event.target as HTMLSelectElement).value);
+  setRule("blind_increase_factor", Number.isFinite(value) ? value : 2);
+}
+
 function limitError(key: string, label: string): string {
   const limit = limits.value[key];
   if (!limit) return "";
@@ -377,6 +397,7 @@ const validation = computed(() => {
     ["big_blind", t("setup.bigBlind")],
     ["rebuy_amount", t("setup.rebuyAmount")],
     ["max_hands", t("setup.maxHands")],
+    ["blind_increase_every_hands", t("setup.blindIncreaseEvery")],
   ] as const) {
     const error = limitError(key, label);
     if (error) return error;
@@ -391,6 +412,10 @@ const validation = computed(() => {
     return t("setup.validation.bigBlindGreater");
   }
   if (numericRule("max_hands") < 0) return t("setup.validation.maxHandsNegative");
+  if (blindIncreaseEnabled.value) {
+    const factor = numericRule("blind_increase_factor");
+    if (factor < 1 || factor > 10) return t("setup.validation.blindFactor");
+  }
   return "";
 });
 
@@ -799,6 +824,39 @@ function close(): void {
             <label class="field">
               <span class="field-label">{{ t("setup.seed") }} <span class="field-hint-inline">{{ t("setup.seedHint") }}</span></span>
               <input class="input" type="number" :placeholder="t('setup.seedPlaceholder')" :value="setup.rules.seed ?? ''" @input="setSeed" />
+            </label>
+          </div>
+
+          <div class="rules-row blind-rules">
+            <div class="rule-toggle">
+              <div class="rule-text">
+                <strong>{{ t("setup.blindIncrease") }}</strong>
+                <span>{{ t("setup.blindIncreaseHint") }}</span>
+              </div>
+              <button
+                class="toggle"
+                :class="{ on: blindIncreaseEnabled }"
+                @click="toggleBlindIncrease"
+              ></button>
+            </div>
+            <label v-if="blindIncreaseEnabled" class="field blind-every-field">
+              <span class="field-label">{{ t("setup.blindIncreaseEvery") }}</span>
+              <input
+                class="input"
+                type="number"
+                min="1"
+                :max="limits.blind_increase_every_hands?.max || 1000"
+                :value="numericRule('blind_increase_every_hands')"
+                @input="setNumericRule('blind_increase_every_hands', $event)"
+              />
+            </label>
+            <label v-if="blindIncreaseEnabled" class="field blind-factor-field">
+              <span class="field-label">{{ t("setup.blindIncreaseFactor") }}</span>
+              <select class="input" :value="numericRule('blind_increase_factor')" @change="setBlindFactor">
+                <option :value="1.5">1.5×</option>
+                <option :value="2">2×</option>
+                <option :value="3">3×</option>
+              </select>
             </label>
           </div>
 
@@ -1282,6 +1340,9 @@ function close(): void {
 .rule-text strong { font-size: calc(10.5px * var(--type-scale)); font-weight: 700; }
 .rule-text span { font-size: calc(8.5px * var(--type-scale)); color: var(--faint); line-height: 1.45; }
 .rebuy-field { width: 130px; flex: none; }
+.blind-rules { margin-top: 10px; }
+.blind-every-field { width: 132px; flex: none; }
+.blind-factor-field { width: 108px; flex: none; }
 
 .blind-presets { display: flex; align-items: center; gap: 5px; font-size: calc(9px * var(--type-scale)); }
 .blind-presets .chip { cursor: pointer; }

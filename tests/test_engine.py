@@ -264,6 +264,76 @@ def test_invalid_constructor_values_are_rejected() -> None:
         HeadsUpGame(starting_chips=100, rebuy_amount=0)
     with pytest.raises(ValueError):
         HeadsUpGame(starting_chips=100, max_hands=-1)
+    with pytest.raises(ValueError):
+        HeadsUpGame(blind_increase_every_hands=-1)
+    with pytest.raises(ValueError):
+        HeadsUpGame(blind_increase_factor=0.5)
+    with pytest.raises(ValueError):
+        HeadsUpGame(blind_increase_factor=11)
+
+
+def finish_hand_by_fold(game: HeadsUpGame) -> None:
+    actor = game.actor
+    assert actor is not None
+    act(game, actor, ActionType.FOLD)
+
+
+def test_blind_increase_is_off_by_default() -> None:
+    game = make_game()
+    for _ in range(3):
+        finish_hand_by_fold(game)
+        game.start_hand()
+    assert game.small_blind == 5
+    assert game.big_blind == 10
+    assert game.blind_level == 0
+
+
+def test_blind_increase_after_configured_hands() -> None:
+    game = HeadsUpGame(
+        starting_chips=1000,
+        small_blind=5,
+        big_blind=10,
+        auto_rebuy=False,
+        seed=42,
+        blind_increase_every_hands=2,
+        blind_increase_factor=2.0,
+    )
+    game.configure_players({"name": "A", "kind": "human"}, {"name": "B", "kind": "bot"})
+    game.start_hand()
+    assert (game.small_blind, game.big_blind) == (5, 10)
+
+    finish_hand_by_fold(game)
+    game.start_hand()
+    assert (game.small_blind, game.big_blind) == (5, 10)
+    assert game.blind_level == 0
+
+    finish_hand_by_fold(game)
+    game.start_hand()
+    assert (game.small_blind, game.big_blind) == (10, 20)
+    assert game.blind_level == 1
+    assert game.last_full_raise == 20
+    assert game.min_raise_to == 40
+    assert sum(player.chips for player in game.players) + sum(
+        player.total_bet for player in game.players
+    ) == game.starting_chips * 2
+
+
+def test_blind_increase_preserves_blind_ratio() -> None:
+    game = HeadsUpGame(
+        starting_chips=1000,
+        small_blind=5,
+        big_blind=10,
+        auto_rebuy=False,
+        seed=42,
+        blind_increase_every_hands=1,
+        blind_increase_factor=1.5,
+    )
+    game.configure_players({"name": "A", "kind": "human"}, {"name": "B", "kind": "bot"})
+    game.start_hand()
+    finish_hand_by_fold(game)
+    game.start_hand()
+    assert (game.small_blind, game.big_blind) == (8, 16)
+    assert game.blind_level == 1
 
 
 def test_action_history_records_added_chips() -> None:

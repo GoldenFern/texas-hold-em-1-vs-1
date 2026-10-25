@@ -90,12 +90,16 @@ Key 值永远不会返回；只有 `key_present`。
     "auto_rebuy": false,
     "rebuy_amount": 1000,
     "max_hands": 0,
+    "blind_increase_every_hands": 0,
+    "blind_increase_factor": 2.0,
     "seed": null,
     "god_view": true
   },
   "table_talk": true
 }
 ```
+
+`blind_increase_every_hands` 默认 0，表示关闭；大于 0 时，每完成 N 手，在下一手发牌前按 `blind_increase_factor` 提高大小盲，并保持原来的大小盲比例。`blind_level` 会在状态快照中递增。
 
 `kind` 只能是 `human` / `llm` / `bot`；两个 `human` 返回 400。`table_talk` 必须是布尔值；只有两个座位都是 `llm` 时才真正生效，其他组合会静默关闭并在 `match.table_talk` 返回 `false`。
 Bot 座位：
@@ -247,7 +251,7 @@ Bot 座位：
     "god_view": true,
     "table_talk": true,
     "can_next_hand": false,
-    "rules": {"starting_chips": 1000, "small_blind": 5, "big_blind": 10, "auto_rebuy": false, "rebuy_amount": 1000, "max_hands": 0, "seed": 123},
+    "rules": {"starting_chips": 1000, "small_blind": 10, "big_blind": 20, "starting_small_blind": 5, "starting_big_blind": 10, "blind_level": 1, "auto_rebuy": false, "rebuy_amount": 1000, "max_hands": 0, "blind_increase_every_hands": 10, "blind_increase_factor": 2.0, "seed": 123},
     "seats": [{"seat": 0, "name": "DeepSeek", "kind": "llm", "provider_id": "deepseek", "model_id": "deepseek-flash", "model_name": "DeepSeek V4.1 Flash", "icon": "deepseek.svg", "agent": {}}],
     "history": [],
     "last_result": null

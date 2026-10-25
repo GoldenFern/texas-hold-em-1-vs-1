@@ -162,6 +162,17 @@ def test_rule_normalization_is_strict_and_explicit() -> None:
         session._normalize_rules({"small_blind": 20, "big_blind": 10})
     with pytest.raises(ValueError):
         session._normalize_rules({"starting_chips": 1000.5})
+    rules = session._normalize_rules(
+        {"blind_increase_every_hands": 10, "blind_increase_factor": 1.5}
+    )
+    assert rules["blind_increase_every_hands"] == 10
+    assert rules["blind_increase_factor"] == 1.5
+    with pytest.raises(ValueError):
+        session._normalize_rules({"blind_increase_every_hands": -1})
+    with pytest.raises(ValueError):
+        session._normalize_rules({"blind_increase_factor": 0.5})
+    with pytest.raises(ValueError):
+        session._normalize_rules({"blind_increase_factor": 11})
 
 
 def test_next_hand_requires_live_thread() -> None:

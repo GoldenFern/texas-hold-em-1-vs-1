@@ -175,6 +175,40 @@ class GameSession:
             )
         rules["max_hands"] = max_hands
 
+        blind_limit = limits.get("blind_increase_every_hands", {})
+        blind_every = int_value("blind_increase_every_hands", 0)
+        if not int(blind_limit.get("min", 0)) <= blind_every <= int(
+            blind_limit.get("max", 1000)
+        ):
+            raise ValueError(
+                self._t(
+                    "session.rule.blind_increase_range",
+                    min=int(blind_limit.get("min", 0)),
+                    max=int(blind_limit.get("max", 1000)),
+                )
+            )
+        rules["blind_increase_every_hands"] = blind_every
+
+        factor_limit = limits.get("blind_increase_factor", {})
+        raw_factor = rules.get("blind_increase_factor", 2.0)
+        if isinstance(raw_factor, bool):
+            raise ValueError(self._t("session.rule.blind_factor"))
+        try:
+            blind_factor = float(raw_factor)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(self._t("session.rule.blind_factor")) from exc
+        if not float(factor_limit.get("min", 1.0)) <= blind_factor <= float(
+            factor_limit.get("max", 10.0)
+        ):
+            raise ValueError(
+                self._t(
+                    "session.rule.blind_factor_range",
+                    min=f"{float(factor_limit.get('min', 1.0)):g}",
+                    max=f"{float(factor_limit.get('max', 10.0)):g}",
+                )
+            )
+        rules["blind_increase_factor"] = blind_factor
+
         def bool_value(key: str, default: bool) -> bool:
             value = rules.get(key, default)
             if isinstance(value, bool):
@@ -362,6 +396,8 @@ class GameSession:
                 rebuy_amount=rules["rebuy_amount"],
                 seed=rules["seed"],
                 max_hands=rules["max_hands"],
+                blind_increase_every_hands=rules["blind_increase_every_hands"],
+                blind_increase_factor=rules["blind_increase_factor"],
                 locale=self.ui_locale,
             )
             new_game.configure_players(
@@ -859,7 +895,9 @@ class GameSession:
                 if not self._alive(generation):
                     return
                 self._next_hand_event.clear()
+                before_blinds = (self.game.small_blind, self.game.big_blind)
                 self.game.start_hand()
+                self._emit_blinds_up_locked(before_blinds)
                 self._broadcast_state()
                 if self.game.street == Street.FINISHED:
                     self._finish_hand_locked()
@@ -890,6 +928,7 @@ class GameSession:
                         if not self.game or self.game.street != Street.FINISHED:
                             continue
                         self._next_hand_event.clear()
+                        before_blinds = (self.game.small_blind, self.game.big_blind)
                         try:
                             self.game.start_hand()
                         except Exception as exc:  # noqa: BLE001
@@ -899,6 +938,7 @@ class GameSession:
                             self.game.match_over = True
                             self._broadcast_state()
                             return
+                        self._emit_blinds_up_locked(before_blinds)
                         self._broadcast_state()
                         if self.game.street == Street.FINISHED:
                             self._finish_hand_locked()
@@ -1072,9 +1112,14 @@ class GameSession:
                 "starting_chips": self.game.starting_chips,
                 "small_blind": self.game.small_blind,
                 "big_blind": self.game.big_blind,
+                "starting_small_blind": self.game.starting_small_blind,
+                "starting_big_blind": self.game.starting_big_blind,
+                "blind_level": self.game.blind_level,
                 "auto_rebuy": self.game.auto_rebuy,
                 "rebuy_amount": self.game.rebuy_amount,
                 "max_hands": self.game.max_hands,
+                "blind_increase_every_hands": self.game.blind_increase_every_hands,
+                "blind_increase_factor": self.game.blind_increase_factor,
                 "seed": self.game.seed,
             },
             "seats": [self._seat_public(seat) for seat in (0, 1)],
@@ -1281,6 +1326,23 @@ class GameSession:
     def _broadcast_state(self) -> None:
         with self.lock:
             self._emit_state_locked()
+
+    def _emit_blinds_up_locked(self, before: tuple[int, int]) -> None:
+        """Announce a blind increase after a hand starts."""
+        if not self.game:
+            return
+        after = (self.game.small_blind, self.game.big_blind)
+        if after == before:
+            return
+        self._emit(
+            {
+                "type": "note",
+                "level": "info",
+                "text": self._t(
+                    "session.event.blinds_up", small=after[0], big=after[1]
+                ),
+            }
+        )
 
     def _finish_hand_locked(self) -> None:
         if not self.game or not self.game.result:

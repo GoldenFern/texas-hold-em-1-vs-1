@@ -40,6 +40,9 @@ python scripts/eval_llm_vs_bot.py --opponent-kind always_all_in --tools none --h
 python scripts/preview_context.py --policy compact_slim --hands 10 --seed 2026 --high-water 20000 --low-water 8000 --keep-hands 2 --stream-usage  # 上下文策略短程预实验
 python scripts/preview_context.py --policy checkpoint --hands 10 --seed 2026 --high-water 0 --low-water 50000 --keep-hands 3 --keep-tokens 20000 --stream-usage  # checkpoint 压缩预实验
 python scripts/preview_final_talk.py --history tmp/context_preview/<run>/messages.json --mode both --repeats 5  # 赛后喊话 full vs fresh
+python scripts/run_live_llm_match.py --seed 20261026 --blind-increase-every-hands 10 --blind-increase-factor 2  # 真实后端自对弈，:5051
+python scripts/report_live_match.py --run tmp/live_match/<run>  # 统计、图表和报告
+python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中断后从事件日志恢复手牌
 ```
 
 `.env` 从 `.env.example` 复制；**不要读取或打印真实 Key**，只检查环境变量是否存在。
@@ -64,6 +67,7 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - 翻前按钮位先行动；翻后非按钮位（大盲）先行动。
 - `Action.amount` 对 BET/RAISE 是**本街总额（raise-to）**，不是增量。
 - `min_raise_to = current_bet + last_full_raise`；翻前初始 `last_full_raise = big_blind`。
+- 盲注递增由 `blind_increase_every_hands`（0 关闭）和 `blind_increase_factor`（1.0 到 10.0）控制；在 `start_hand` 里、发牌和贴盲注之前按已完成手数提升，保持大小盲比例，`blind_level` 写入快照。当前手不受影响。
 - 短码 all-in 加注不重开下注：`raise_allowed` 只在完整加注时对对手重置。
 - 两人局没有边池；`matched = min(total_bet)`，未匹配部分退回。
 - 对手已经全下时不能再加注，只能跟注或弃牌；`ALL_IN` 只在能覆盖跟注时作为全下跟注。
@@ -116,6 +120,7 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - 补跑牌局用 `--deal-offset` 指定新的 deal 区间，避免和已有牌局重叠；`scripts/merge_llm_runs.py` 按 `(deal_index, assignment)` 合并多次运行，重算 1000 手级别的汇总和配对比较。
 - 长实验跨时间补跑时必须固定上下文策略：`eval_llm_vs_bot.py --context-policy legacy --max-context-tokens 220000`（或统一用新的 `compact_slim`），否则默认值切换会让同一实验的前后条件不可比。`run_llm_experiments.py` 已透传这两个参数。
 - 2026-10-25 DXH `compact_slim` 1000 手/组：空白 +136.7 bb/100；随机数 +33.4（p=0.66），牌型分布 -5.1（p=0.94），胜率 +301.6（p=0.0011），跟注 EV +499.3（p=0.0001）。胜率和 EV 首次显著为正，且校正后仍显著；牌型分布无效。对手是随机 Agent，不能外推到强 Bot。
+- 2026-10-25 真实后端自对弈：`scripts/run_live_llm_match.py` 起真实 Flask + SocketIO + `GameSession`，`scripts/report_live_match.py` 生成统计和图表。5/10 起始、每 10 手盲注翻倍，42 手 / 42.7 分钟完整结束，费用 ¥0.35，缓存 98.0%，210 个 turn 没有一次可选工具调用。固定 5/10 的对照场 63 手 / 4.2 小时仍未结束，最后 5 手因中转写入超时自动弃牌后手动停止。详见 `docs/live_llm_match.md`；默认提示词不推荐工具时，不能把 1000 手工具消融的正向效果直接外推到真实对局。
 - `build_system_prompt(..., extra_instructions=...)` 只给实验附加“强烈推荐但非强制”的工具建议；默认不传，UI 提示词仍由模型自行判断是否调用工具。
 - 上下文预算会计入 `reasoning_content`、工具名、参数和 tool id；每轮模型调用前都会重新检查并裁剪。
 - `LLMAgent.cancel()` 会设置取消标记，客户端在每次流式读取前检查，旧比赛不会继续烧模型调用。
@@ -278,7 +283,8 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 
 ## 测试 / 质量
 
-- 引擎随机 60 手筹码守恒在 `tests/test_engine.py`。
+- 引擎随机 60 手筹码守恒在 `tests/test_engine.py`；盲注递增的默认关闭、按手数提升、比例保持和最小加注也在那里。
+- 服务端盲注递增规则校验在 `tests/test_server_session.py`；前端设置项和牌桌盲注显示由 `npm run typecheck` / `npm run build` 覆盖。
 - 牌型分布精确/蒙特卡洛在 `tests/test_analysis.py`；equity 与 `call_ev` 在 `tests/test_equity.py`、`tests/test_pot_odds.py`。
 - LLM vs Bot 离线评测：`scripts/eval_llm_vs_bot.py`，每手独立、可并发、同牌换座，输出到 `tmp/llm_eval/`。默认对手是 `nlh_dqn_project.pth`（20k 手矩阵里最强的项目 Bot）。`--tools` 只暴露指定工具，`--recommend-tools` 在提示词里强烈推荐但不强制。
 - 五组工具消融：`scripts/eval_llm_tool_matrix.py`，同牌同座位跨组对齐，输出到 `tmp/llm_tool_matrix/`；汇总报告包含每组 bb/100、95% CI、工具调用率和相对无工具组的配对不同。2026-10-22 首次实跑因 LongCat 配额中断，`none` 和 `random` 部分可用，详见 `docs/llm_tool_eval.md`。
@@ -309,6 +315,7 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 ## 当前取舍
 
 - 单桌、内存态；不做账号/持久化/多房间。历史研究只覆盖当前进程内的当前对局和已完成对局，重启后丢失；已完成对局最多保留 50 场聚合记录。
+- 盲注递增是可选规则，默认关闭；开启后有效筹码变浅、全下变多，适合让长局收尾，不等同于标准 100 BB 单挑。
 - checkpoint 摘要是模型生成的，可能漏细节或带错结论；用确定性兜底和 `compact_slim` 回退兜底，不保证摘要事实完全正确。压缩发生在手牌边界，第二版再考虑后台预计算。
 - 默认 checkpoint 触发按 OpenCode 的窗口减 buffer；1M 模型约 856k 才触发，费用明显高于 160k 上限。想控成本时把 `context_high_water_tokens` 设为 160k 或 300k，不要改公式本身。
 - 历史研究 tool 只使用公开行动和摊牌信息，不返回对手底牌；样本量小的指标必须标注低置信。`ALL_TOOL_NAMES` 仍是五工具基线，`research_history` 只进 `GAME_TOOL_NAMES` / `AGENT_TOOL_NAMES`。

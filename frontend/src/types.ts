@@ -86,9 +86,14 @@ export interface Rules {
   starting_chips: number;
   small_blind: number;
   big_blind: number;
+  starting_small_blind?: number;
+  starting_big_blind?: number;
+  blind_level?: number;
   auto_rebuy: boolean;
   rebuy_amount: number;
   max_hands: number;
+  blind_increase_every_hands: number;
+  blind_increase_factor: number;
   seed: number | null;
 }
 
@@ -189,6 +194,11 @@ export interface GameSnapshot {
   match_over?: boolean;
   small_blind?: number;
   big_blind?: number;
+  starting_small_blind?: number;
+  starting_big_blind?: number;
+  blind_level?: number;
+  blind_increase_every_hands?: number;
+  blind_increase_factor?: number;
   starting_chips?: number;
   transcript_counts?: Record<string, number>;
   table_talk?: TableTalkEntry[];
