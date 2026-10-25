@@ -270,9 +270,12 @@ class LLMClient:
         params: dict,
         on_event: Callable[[dict], None],
         cancel: Optional[Callable[[], bool]] = None,
+        tool_choice: Optional[str] = None,
     ) -> ChatResult:
         api_key = ProviderRegistry.get_api_key(spec, locale=self.locale)
-        payload = self.registry.build_payload(spec, messages, tools, params, stream=True)
+        payload = self.registry.build_payload(
+            spec, messages, tools, params, stream=True, tool_choice=tool_choice
+        )
         if self.user_id:
             payload["user_id"] = self.user_id
         dropped = self._degraded_fields(spec)

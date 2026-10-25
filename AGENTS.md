@@ -38,6 +38,7 @@ python scripts/run_llm_experiments.py --stage pilot --pilot-hands 10 --workers 2
 python scripts/run_llm_experiments.py --stage full --full-hands 400 --workers 2 --reasoning-effort low  # 8 组 × 400 手，自动记预算
 python scripts/eval_llm_vs_bot.py --opponent-kind always_all_in --tools none --hands 400 --workers 2  # 单一脚本 Bot 对照
 python scripts/preview_context.py --policy compact_slim --hands 10 --seed 2026 --high-water 20000 --low-water 8000 --keep-hands 2 --stream-usage  # 上下文策略短程预实验
+python scripts/preview_context.py --policy checkpoint --hands 10 --seed 2026 --high-water 0 --low-water 50000 --keep-hands 3 --keep-tokens 20000 --stream-usage  # checkpoint 压缩预实验
 python scripts/preview_final_talk.py --history tmp/context_preview/<run>/messages.json --mode both --repeats 5  # 赛后喊话 full vs fresh
 ```
 
@@ -96,8 +97,10 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
   2. `estimate_equity()`：返回当前摊牌 equity（`胜率 + 平局率/2`），默认对手随机手牌；河牌/转牌精确枚举，翻牌/翻前 20000 次蒙特卡洛
   3. `get_random_number()`：返回 `[0, 1)` 均匀随机数；只在分析后仍难以取舍时用于打破僵局，每次调用重新抽取，不能替代估算
   4. `call_ev(equity?)`：用当前底池、跟注额和筹码计算静态跟注 EV；`equity` 省略时自动估算；短码全下用有效底池 `P + 2C - T` 扣除退款
-  5. `send_table_message(text)`：仅 LLM vs LLM 且开局开启时可用，向对手喊话；不结束回合
-  6. `apply_action(action, amount?)`：`amount` 是 raise-to 总额
+  5. `research_history(scope?, last_hands?, focus?)`：返回当前对局和本次运行已完成对局的公开行动统计（VPIP、PFR、3-bet、c-bet、fold-to-c-bet、WTSD、W\$SD、位置拆分），每项带样本量；只使用公开行动和摊牌信息，不返回对手底牌
+  6. `send_table_message(text)`：仅 LLM vs LLM 且开局开启时可用，向对手喊话；不结束回合
+  7. `apply_action(action, amount?)`：`amount` 是 raise-to 总额
+- `ALL_TOOL_NAMES` 仍是原来的 5 个，是工具消融的基线；`GAME_TOOL_NAMES` 再包含 `research_history`，`AGENT_TOOL_NAMES` 再包含桌边喊话。不要把 `research_history` 加进 `ALL_TOOL_NAMES`，否则历史对照失效。
 - 每回合必须调用 `apply_action` 恰好一次；非法则把错误 + 约束 + 合法动作作为 tool 消息回传，让模型重试。
 - 估算工具是可选辅助，默认不强制（`require_estimate_first: false`）。系统提示词和工具描述只说明用途与可选性，不引导也不劝阻调用，由模型自行判断。打开开关后只会在每条街第一次 `apply_action` 前软提醒一次，不计入三次失败；`get_random_number` 不能满足这个开关。
 - 估算工具单回合默认最多 2 次、总采样 50000 次；equity 工具同样默认 2 次、50000 次（`config/game.json`），避免阻塞游戏线程。`call_ev` 内部估算也计入 equity 预算。
@@ -124,16 +127,27 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - 客户端在 400 时会自动去掉可选厂商字段（`thinking`、`reasoning_effort`、`tool_stream`、`stream_options`、`preserve_thinking`、`reasoning_content`）重试一次。
 - `LLMAgent` 不拥有引擎；通过 `validate_action` 回调让 session 用 `game.preview()` 在副本上校验。
 
-## 上下文策略（默认 compact_slim / fresh）
+## 上下文策略（默认 checkpoint / fresh）
 
-- `LLMAgent` 的 `runtime.context_policy` 支持 `legacy` / `full` / `compact` / `compact_slim`。当前默认已切到 `compact_slim`，`final_talk_context` 默认 `fresh`；`legacy` / `full` 只作为回退。`config/game.json` 暴露 `context_policy`、高/低水位、保留手数和 `final_talk_context`。
+- `LLMAgent` 的 `runtime.context_policy` 支持 `legacy` / `full` / `compact` / `compact_slim` / `checkpoint`。当前默认已切到 `checkpoint`，`final_talk_context` 默认 `fresh`；`compact_slim` 是 checkpoint 连续失败后的回退，`legacy` / `full` 只作为实验基线。
+- `checkpoint` 的触发参考 OpenCode：`prompt_budget = context_window - max_tokens - 2048`，`buffer = max(15% × window, 16k)`（窗口小于 32k 时只用 15%），`auto_ceiling = prompt_budget - buffer`。`context_high_water_tokens=0` 表示自动（1M 窗口约 856k），正数作为成本上限；`context_buffer_tokens=0` 表示自动 buffer，正数可覆盖。
+- `checkpoint` 只总结已完成手牌。手牌边界用软触发（`high_water`），手内接近硬上限时用 `hard_water = prompt_budget - 4096`。当前手永远保留，不进入摘要。
+- 保留区 = system prompt + 一条 checkpoint + 最近 `context_keep_recent_hands` 手原始消息；`context_keep_recent_tokens` 是初始保留上限。如果压缩后低于 `context_low_water_tokens`，会把已经总结过的更早手牌重新原样加回来，直到接近低水位；因此最终原始区可能超过 `context_keep_recent_tokens`，但不会超过低水位。
+- 摘要请求使用同一个模型、同一组 tools 和同一段 system prompt，在完整对话末尾追加摘要指令，复用正常请求的 prompt 缓存；`max_tokens` 默认 4096，`tool_choice="none"`。摘要只输出文本，不执行工具，不进入当前 turn 的 usage。
+- 压缩时由代码自动调用 `history_provider(checkpoint=True)`，把当前对局和本次运行已完成对局的公开统计注入摘要提示词。统计块只供摘要模型推理，**不要复制进 checkpoint**；下一个 agent 需要数字时调用 `research_history`。这和 OpenCode 不让摘要复述 AGENTS.md 是同一个原则。
+- checkpoint 的应用方式是 `[system, checkpoint, ...最近手牌]`，旧手牌和旧 checkpoint 被替换；原始消息仍保留在 transcript 和 session 数据里，只是不再发给模型。`_trim_context()` 会保护 checkpoint，不会像旧实现那样一次删掉全部摘要。
+- 摘要失败时先写确定性兜底 checkpoint（系统根据统计生成），连续失败 2 次后本局回退到 `compact_slim`。摘要请求被 `context_length` 拒绝时依次尝试完整前缀、保留尾巴之前的历史、扁平化文本，再按 `context_summary_retries`（默认 0.85/0.7/0.5/0.35）缩小；最新一手不整段丢弃。
+- `research_history` 是新的公开历史统计 tool，返回当前对局 + 本次运行已完成对局的 VPIP、PFR、3-bet、c-bet、fold-to-c-bet、WTSD、W\$SD、位置拆分、样本量，以及最近 5 场已完成对局的汇总。它只使用公开行动和摊牌信息，不返回对手底牌。生产工具集是 `GAME_TOOL_NAMES`（无桌边喊话）或 `AGENT_TOOL_NAMES`（含桌边喊话）；`ALL_TOOL_NAMES` 仍保持原来的 5 个，不要为了新 tool 改实验基线。
+- `checkpoint` 默认强制 `state_detail="compact"` 和 `tool_detail="compact"`；`build_compact_turn_message` 和 `compact_tool_payload` 仍然生效。历史 tool 的 compact payload 会去掉 `scope`、位置拆分和超过 5 条的 recent hands。
+- `config/game.json` 新增：`context_keep_recent_tokens`、`context_buffer_tokens`、`context_summary_max_tokens`、`context_summary_retries`、`max_history_calls_per_turn`。`context_high_water_tokens=0` 表示自动；想控制 1M 模型费用时把它设为 160k 或 300k。
 - 如果回退到 `legacy`，建议同时把 `max_context_tokens_estimate` 设为正数硬上限；`0` 自动预算在 1M 模型上会让 legacy 一直长到接近窗口上限。
 - `legacy` 保持原有行为：超过 `max_context_tokens_estimate` 后从最早的 turn 开始删。它会改变 system prompt 之后的前缀，长对局缓存命中会明显下降。
 - `compact` 每手结束写一条 `【手牌摘要 · 第 N 手】` 用户消息，只保留最近 `context_keep_recent_hands` 手的详情，超过 `context_high_water_tokens` 时整段丢弃旧手消息。当前手永不裁。
 - 压缩只删除完整消息，不修改保留的 assistant 消息；DeepSeek 工具模式要求回传的 `reasoning_content` 必须原样保留。
 - `compact_slim` 额外使用精简回合状态（`build_compact_turn_message`）和精简工具结果（去掉重复 `note`、`lose`、`ev_fold` 等字段）。被删掉字段的单位和假设已补到 `src/llm/tools.py` 的 tool description，不要重新塞回每次工具结果。
-- `ContextSettings.with_context_window()` 会按 `max_context_tokens - 4096` clamp 高/低水位；小上下文模型不会因为配置的高水位而绕过压缩。
-- `max_context_tokens_estimate=0` 表示自动预算：`context_window - max_tokens - 2048`；正数才作为硬上限。当前默认高水位 160k、低水位 50k，配合自动预算，避免所有模型都被 220k 一刀切。
+- `ContextSettings.with_context_window()` 会按 `max_context_tokens - 4096` clamp 高/低水位；小上下文模型不会因为配置的高水位而绕过压缩。`checkpoint` 走 `resolve_trigger_budget()`，对未知窗口关闭自动触发，只保留 overflow 恢复。
+- `max_context_tokens_estimate=0` 表示自动预算：`context_window - max_tokens - 2048`；正数才作为硬上限。非 checkpoint 策略仍默认 120k 高水位；checkpoint 默认自动，1M 窗口约 856k。
+- `LLMAgent` 用真实 usage 做 token 锚点：最近一次 `input_tokens + output_tokens + reasoning_tokens` 加上之后新增消息的估算；`estimated_usage=True` 或压缩后自动失效，退回全量估算。不要再把 `_tools_tokens` 重复加在锚点上。
 - `LLMAgent` 用 `MatchStats` 聚合赛后摘要；`hand_results` 只保留最近 200 手用于调试，不再无限增长。`final_talk_response` / `final_talk_end` 事件会带赛后喊话自己的 usage。
 - `ChatResult.usage` 现在包含 `cached_input_tokens`、`cache_miss_input_tokens`；`message_end` 事件会透传，评测脚本可直接统计。DeepSeek 的 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` 会解析，前端暂未展示。
 - `LLMClient` 支持可选 `user_id`；DeepSeek 用它做 KV cache 隔离。实验脚本用 `--cache-scope` 给每个 run 独立缓存域，避免跨 run 共享缓存污染命中率。
@@ -143,7 +157,7 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - 2026-10-24 赛后喊话预实验（20 手历史，5 次重复）：`fresh` 输入 615 token，`full` 108,500；热缓存费用约 `$0.00009` vs `$0.00044`，冷缓存约 `$0.000145` vs `$0.0162`。`fresh` 已作为默认，`full` 保留回退；如果觉得太模板化，下一步试 `fresh + 最近 3 手摘要`。
 - 2026-10-24 预实验（20 手，20k 上限，独立 `user_id`）：`legacy` 缓存命中 44.9%，`compact_slim` 96.9%；费用/turn `$0.00236` vs `$0.00025`。
 - 2026-10-24 B 组（50 手，seed 2027，20k 高水位）：`legacy` 缓存命中 31.1%，76 次裁剪，费用/turn `$0.00265`；`compact_slim` 96.7%，6 次压缩，费用/turn `$0.00035`。净筹码 `-848` vs `+2524`。
-- 2026-10-24 P1 验证（50 手，seed 2027，160k 高水位）：`compact_slim` 缓存命中 99.5%，0 次压缩，费用 `$0.1037`，费用/turn `$0.00065`，终局上下文约 118k。比 20k 高水位贵约 1.7 倍，但上下文空间大得多；这是当前默认。
+- 2026-10-24 P1 验证（50 手，seed 2027，160k 高水位）：`compact_slim` 缓存命中 99.5%，0 次压缩，费用 `$0.1037`，费用/turn `$0.00065`，终局上下文约 118k。比 20k 高水位贵约 1.7 倍，但上下文空间大得多；这是 compact_slim 的回退基线，checkpoint 还没有同等规模的实测数据。
 - 以上净筹码和 bb/100 的 CI 都很宽、行动不同，只能看方向，不能据此判断胜率。
 
 ## 桌边喊话（LLM vs LLM）
@@ -256,6 +270,11 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - LLM vs Bot 离线评测：`scripts/eval_llm_vs_bot.py`，每手独立、可并发、同牌换座，输出到 `tmp/llm_eval/`。默认对手是 `nlh_dqn_project.pth`（20k 手矩阵里最强的项目 Bot）。`--tools` 只暴露指定工具，`--recommend-tools` 在提示词里强烈推荐但不强制。
 - 五组工具消融：`scripts/eval_llm_tool_matrix.py`，同牌同座位跨组对齐，输出到 `tmp/llm_tool_matrix/`；汇总报告包含每组 bb/100、95% CI、工具调用率和相对无工具组的配对不同。2026-10-22 首次实跑因 LongCat 配额中断，`none` 和 `random` 部分可用，详见 `docs/llm_tool_eval.md`。
 - 实验提示词附加段在 `tests/test_llm_agent.py`；工具集合解析与推荐文案在 `tests/test_eval_llm_vs_bot.py`，不发起真实请求。
+- checkpoint 的触发公式、手牌切点、checkpoint 解析和扁平化重试在 `tests/test_llm_context.py`；摘要前缀、逐级重试、兜底、防统计复述、历史 tool 预算、真实 token 锚点和 checkpoint 保护在 `tests/test_llm_agent.py`。
+- 历史统计的 VPIP/PFR/3-bet/c-bet/摊牌/位置拆分、空历史、样本量、无底牌泄漏在 `tests/test_history_stats.py`。
+- session 的每手公开记录、已完成对局归档、history provider 和座位互换在 `tests/test_server_session.py`。
+- `ALL_TOOL_NAMES` 基线保持 5 个、`GAME_TOOL_NAMES` 增加 `research_history`、`AGENT_TOOL_NAMES` 增加桌边喊话在 `tests/test_llm_tools.py`；checkpoint 提示词和历史 tool 的中英文在 `tests/test_llm_i18n.py`。
+- `tool_choice="none"` 的 payload 和默认 `auto` 在 `tests/test_llm_client.py`。
 - 桌边喊话的规范化、额度在 `tests/test_table_talk.py`；工具循环、硬性前置喊话、赛后 final 和“失败不触发三次非法动作”在 `tests/test_llm_agent.py`；开关、记录、未读投递和快照在 `tests/test_server_session.py` 与 `tests/test_server_api.py`。
 - 前端喊话合并/去重在 `store.test.ts`；对话页、工具卡片和页签在 `TableTalkPanel.test.ts`、`ToolCard.test.ts`、`AgentConsole.test.ts`。
 - LLM 工具循环用 `FakeClient`，不要依赖真实 API Key。
@@ -276,7 +295,10 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 
 ## 当前取舍
 
-- 单桌、内存态；不做账号/持久化/多房间。
+- 单桌、内存态；不做账号/持久化/多房间。历史研究只覆盖当前进程内的当前对局和已完成对局，重启后丢失；已完成对局最多保留 50 场聚合记录。
+- checkpoint 摘要是模型生成的，可能漏细节或带错结论；用确定性兜底和 `compact_slim` 回退兜底，不保证摘要事实完全正确。压缩发生在手牌边界，第二版再考虑后台预计算。
+- 默认 checkpoint 触发按 OpenCode 的窗口减 buffer；1M 模型约 856k 才触发，费用明显高于 160k 上限。想控成本时把 `context_high_water_tokens` 设为 160k 或 300k，不要改公式本身。
+- 历史研究 tool 只使用公开行动和摊牌信息，不返回对手底牌；样本量小的指标必须标注低置信。`ALL_TOOL_NAMES` 仍是五工具基线，`research_history` 只进 `GAME_TOOL_NAMES` / `AGENT_TOOL_NAMES`。
 - 可视化保留牌型分布，加上胜率/跟注 EV 工具卡；对手范围推断留到后续。equity 默认对随机手牌，结果必须标明这个假设。
 - RLCard 默认 RandomAgent；模型需要用户训练。短训练 DQN 可能退化为全下，不要把它当作“强 Bot”。
 - 不做人类 vs 人类；UI 会阻止。

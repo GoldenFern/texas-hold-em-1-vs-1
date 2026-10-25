@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 from dataclasses import replace
 from typing import List
 
@@ -11,10 +13,12 @@ from src.agents.base import AgentView
 from src.analysis.hand_distribution import HandDistributionAnalyzer
 from src.engine.actions import Action, ActionType
 from src.llm.agent import LLMAgent, select_tools
-from src.llm.client import ChatResult, ToolCall
+from src.llm.client import ChatResult, LLMError, ToolCall
 from src.llm.prompt import (
     AGENT_TOOL_NAMES,
     ALL_TOOL_NAMES,
+    GAME_TOOL_NAMES,
+    HISTORY_TOOL_NAME,
     TABLE_TALK_TOOL_NAME,
     build_final_table_talk_message,
     build_system_prompt,
@@ -1187,3 +1191,603 @@ def test_tiny_context_window_keeps_minimum_budget() -> None:
         spec=replace(spec, context_window=0),
     )
     assert unknown.max_context_tokens == 220000
+
+# ---------------------------------------------------------------------------
+# Checkpoint compaction and history tool
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_SUMMARY = """## 当前战况
+- 比赛处于早期，双方筹码接近。
+
+## 对手读牌
+- 对手按钮位偏激进，样本 8 手，低置信。
+- 翻牌持续下注的样本还很少。
+
+## 我方调整
+- 暂时保持宽范围跟注，减少无计划诈唬。
+
+## 关键手牌
+- 第 2 手：Hero 按钮位 AKo，翻前加注，翻牌持续下注，对手弃牌。
+
+## 待验证
+- 对手 3-bet 范围还需要更多样本。
+
+## 下一步
+- 用 research_history 复核 3-bet 频率和翻后持续下注。
+"""
+
+
+def checkpoint_stats() -> dict:
+    return {
+        "current": {
+            "hands": 2,
+            "blinds": {"small": 5, "big": 10},
+            "stacks": {"you": 1000, "opponent": 1000},
+            "you": {
+                "result": {"net": 10, "bb_per_100": 50.0, "hands": 2},
+                "preflop": {
+                    "vpip": {"value": 0.5, "n": 2},
+                    "pfr": {"value": 0.5, "n": 2},
+                },
+            },
+            "opponent": {
+                "preflop": {
+                    "vpip": {"value": 0.8, "n": 2},
+                    "pfr": {"value": 0.5, "n": 2},
+                    "three_bet": {"value": 0.0, "n": 1},
+                },
+                "postflop": {"c_bet": {"value": 1.0, "n": 1}},
+            },
+            "opponent_by_position": {"button": {}, "bb": {}},
+            "recent_hands": [],
+        },
+        "completed_vs_current_opponent": {"matches": 0, "hands": 0},
+        "notes": ["reasoning only, do not copy"],
+    }
+
+
+class RecordingClient:
+    def __init__(self, responses: list[dict]) -> None:
+        self.responses = list(responses)
+        self.requests: list[dict] = []
+
+    def stream(
+        self,
+        spec,
+        messages,
+        tools,
+        params,
+        on_event,
+        cancel=None,
+        tool_choice=None,
+        **kwargs,
+    ):
+        self.requests.append(
+            {
+                "messages": copy.deepcopy(messages),
+                "tools": copy.deepcopy(tools),
+                "params": dict(params),
+                "tool_choice": tool_choice,
+            }
+        )
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        if response.get("error_kind"):
+            raise LLMError(response["error_kind"], response.get("detail", "error"))
+        calls = [
+            ToolCall(
+                id=item.get("id", f"call_{index}"),
+                name=item["name"],
+                arguments=item["arguments"],
+            )
+            for index, item in enumerate(response.get("tool_calls", []))
+        ]
+        return ChatResult(
+            content=response.get("content", ""),
+            reasoning=response.get("reasoning", ""),
+            tool_calls=calls,
+            finish_reason=response.get(
+                "finish_reason", "tool_calls" if calls else "stop"
+            ),
+            usage=response.get(
+                "usage",
+                {"input_tokens": 100, "output_tokens": 20, "reasoning_tokens": 5},
+            ),
+            latency_ms=1.0,
+            estimated_usage=bool(response.get("estimated_usage", False)),
+        )
+
+
+def checkpoint_history() -> list[dict]:
+    messages: list[dict] = []
+    for hand in (1, 2):
+        messages.extend(
+            [
+                {"role": "user", "content": f"【牌局更新 · 第 {hand} 手 · 翻牌】"},
+                {
+                    "role": "assistant",
+                    "content": "check",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{hand}",
+                            "type": "function",
+                            "function": {
+                                "name": "apply_action",
+                                "arguments": '{"action":"check"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{hand}",
+                    "name": "apply_action",
+                    "content": '{"ok":true}',
+                },
+                {
+                    "role": "user",
+                    "content": f"【手牌摘要 · 第 {hand} 手】你赢了；底池 30。",
+                },
+            ]
+        )
+    return messages
+
+
+def checkpoint_view() -> AgentView:
+    return replace(make_view(), hand_id=3, hand_number=3, street="flop")
+
+
+def make_checkpoint_agent(
+    responses: list[dict],
+    *,
+    runtime_extra: dict | None = None,
+    history_provider=None,
+    tool_names=None,
+    submit_table_talk=None,
+):
+    registry = ProviderRegistry()
+    spec = registry.resolve("deepseek", "deepseek-flash")
+    runtime = {
+        "context_policy": "checkpoint",
+        "context_high_water_tokens": 2000,
+        "context_low_water_tokens": 1500,
+        "context_keep_recent_hands": 1,
+        "context_keep_recent_tokens": 1000,
+        "context_summary_max_tokens": 4096,
+        "max_steps_per_turn": 4,
+        "max_history_calls_per_turn": 2,
+    }
+    if runtime_extra:
+        runtime.update(runtime_extra)
+    names = tool_names or GAME_TOOL_NAMES
+    client = RecordingClient(responses)
+    provider = history_provider or (lambda seat, **kwargs: checkpoint_stats())
+    agent = LLMAgent(
+        seat=0,
+        name="Hero",
+        spec=spec,
+        params={"max_tokens": 32768},
+        client=client,
+        analyzer=HandDistributionAnalyzer(),
+        validate_action=lambda action: None,
+        runtime=runtime,
+        tools=select_tools(names, locale="zh-CN"),
+        system_prompt=build_system_prompt(names, locale="zh-CN"),
+        history_provider=provider,
+        submit_table_talk=submit_table_talk,
+        locale="zh-CN",
+    )
+    agent.messages = [{"role": "system", "content": agent.system_prompt}]
+    agent.messages.extend(checkpoint_history())
+    return agent, client, []
+
+
+def test_checkpoint_summary_preserves_prefix_and_applies() -> None:
+    summary_usage = {
+        "input_tokens": 1000,
+        "cached_input_tokens": 800,
+        "cache_miss_input_tokens": 200,
+        "output_tokens": 100,
+        "reasoning_tokens": 10,
+    }
+    action_usage = {
+        "input_tokens": 200,
+        "output_tokens": 20,
+        "reasoning_tokens": 5,
+    }
+    agent, client, events = make_checkpoint_agent(
+        [
+            {"content": CHECKPOINT_SUMMARY, "usage": summary_usage},
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ],
+                "usage": action_usage,
+            },
+        ]
+    )
+    before = copy.deepcopy(agent.messages)
+    action = agent.decide(checkpoint_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert client.requests[0]["messages"][:-1] == before
+    assert client.requests[0]["tool_choice"] == "none"
+    assert client.requests[0]["tools"] == agent.tools
+    assert client.requests[0]["params"]["max_tokens"] == 4096
+    prompt = str(client.requests[0]["messages"][-1].get("content") or "")
+    assert "vpip" in prompt
+    assert "不要复制" in prompt
+
+    assert agent.messages[0]["role"] == "system"
+    assert str(agent.messages[1].get("content") or "").startswith("【比赛 checkpoint")
+    assert agent._checkpoint_through == 1
+    assert agent._checkpoint_retain_from == 2
+    assert not any(
+        "【牌局更新 · 第 1 手" in str(message.get("content") or "")
+        for message in agent.messages
+    )
+    assert any(
+        "【牌局更新 · 第 2 手" in str(message.get("content") or "")
+        for message in agent.messages
+    )
+    assert any(
+        "【牌局更新 · 第 3 手" in str(message.get("content") or "")
+        for message in agent.messages
+    )
+
+    summary_end = next(
+        event for event in events if event.get("type") == "context_summary_end"
+    )
+    assert summary_end["fallback"] is False
+    assert summary_end["usage"]["input_tokens"] == 1000
+    turn_end = next(event for event in events if event.get("type") == "turn_end")
+    assert turn_end["usage"]["input_tokens"] == 200
+    assert agent.context_usage["input_tokens"] == 1000
+    assert agent.total_usage["input_tokens"] == 1200
+    compacted = next(
+        event for event in events if event.get("type") == "context_compacted"
+    )
+    assert compacted["policy"] == "checkpoint"
+    assert compacted["through_hand"] == 1
+    assert compacted["retained_from"] == 2
+
+
+def test_checkpoint_summary_failure_uses_fallback() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [
+            {"error_kind": "auth", "detail": "boom"},
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    action = agent.decide(checkpoint_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert agent._summary_failures == 1
+    assert agent._checkpoint_disabled is False
+    assert str(agent.messages[1].get("content") or "").startswith("【比赛 checkpoint")
+    assert "模型摘要不可用" in str(agent.messages[1].get("content") or "")
+    assert any(
+        event.get("type") == "context_summary_failed" for event in events
+    )
+    compacted = next(
+        event for event in events if event.get("type") == "context_compacted"
+    )
+    assert compacted["fallback"] is True
+
+
+def test_checkpoint_disables_after_two_failures() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [{"error_kind": "auth", "detail": "boom"}]
+    )
+    agent._summary_failures = 1
+    agent._current_hand = 3
+    agent._current_street = "flop"
+    agent._maybe_checkpoint(events.append, mid_hand=False, force=True)
+    assert agent._summary_failures == 2
+    assert agent._checkpoint_disabled is True
+    assert str(agent.messages[1].get("content") or "").startswith("【比赛 checkpoint")
+
+
+def test_checkpoint_does_not_copy_statistics_block() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [
+            {"content": CHECKPOINT_SUMMARY},
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    agent.decide(checkpoint_view(), events.append)
+    checkpoint = str(agent.messages[1].get("content") or "")
+    assert "vpip" not in checkpoint.lower()
+    assert "```json" not in checkpoint
+
+
+def test_checkpoint_rejects_statistics_dump_with_nudge() -> None:
+    dump = CHECKPOINT_SUMMARY + '\n```json\n{"vpip": 0.8, "pfr": 0.5}\n```'
+    agent, client, events = make_checkpoint_agent(
+        [
+            {"content": dump},
+            {"content": CHECKPOINT_SUMMARY},
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    agent.decide(checkpoint_view(), events.append)
+    assert agent._summary_calls == 2
+    assert "vpip" not in str(agent.messages[1].get("content") or "").lower()
+
+
+def test_history_tool_dispatch_and_same_turn_budget() -> None:
+    calls: list[dict] = []
+
+    def provider(seat, **kwargs):
+        calls.append({"seat": seat, **kwargs})
+        return {
+            "scope": "current_match",
+            "current_match": {
+                "hands": 42,
+                "you": {},
+                "opponent": {
+                    "preflop": {"vpip": {"value": 0.62, "n": 42}}
+                },
+                "recent_hands": [],
+            },
+            "completed_matches": {"count": 0},
+            "notes": ["public only"],
+        }
+
+    agent, client, events = make_checkpoint_agent(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "h1",
+                        "name": "research_history",
+                        "arguments": '{"scope":"current_match","last_hands":5,"focus":"preflop"}',
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "h2",
+                        "name": "research_history",
+                        "arguments": '{"scope":"current_match"}',
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "a1",
+                        "name": "apply_action",
+                        "arguments": '{"action":"check"}',
+                    }
+                ]
+            },
+        ],
+        runtime_extra={
+            "context_high_water_tokens": 1_000_000,
+            "max_history_calls_per_turn": 1,
+        },
+        history_provider=provider,
+    )
+    action = agent.decide(checkpoint_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert len(calls) == 1
+    assert calls[0]["scope"] == "current_match"
+    assert calls[0]["last_hands"] == 5
+    assert calls[0]["focus"] == "preflop"
+    assert agent._history_calls_this_turn == 1
+    results = [
+        event
+        for event in events
+        if event.get("type") == "tool_result"
+        and event.get("name") == HISTORY_TOOL_NAME
+    ]
+    assert len(results) == 2
+    assert results[0]["ok"] is True
+    assert results[0]["result"]["current_match"]["hands"] == 42
+    assert results[1]["ok"] is False
+    assert "最多调用 1 次" in results[1]["summary"]
+
+
+def test_measured_anchor_uses_total_prompt_tokens() -> None:
+    usage = {
+        "input_tokens": 1000,
+        "cached_input_tokens": 800,
+        "cache_miss_input_tokens": 200,
+        "output_tokens": 100,
+        "reasoning_tokens": 10,
+    }
+    registry = ProviderRegistry()
+    spec = registry.resolve("deepseek", "deepseek-flash")
+    client = RecordingClient(
+        [
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ],
+                "usage": usage,
+            }
+        ]
+    )
+    agent = LLMAgent(
+        seat=0,
+        name="Hero",
+        spec=spec,
+        params={},
+        client=client,
+        analyzer=HandDistributionAnalyzer(),
+        validate_action=lambda action: None,
+        runtime={"context_policy": "compact_slim"},
+        tools=select_tools(ALL_TOOL_NAMES, locale="zh-CN"),
+        locale="zh-CN",
+    )
+    events: list[dict] = []
+    agent.decide(make_view(), events.append)
+    assert agent._context_anchor is not None
+    index, measured = agent._context_anchor
+    assert measured == 1110
+    assert measured != 1910
+    assert agent._context_tokens() == 1110 + agent._estimate_messages_tokens(
+        agent.messages[index:], include_tools=False
+    )
+
+    estimated_client = RecordingClient(
+        [
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ],
+                "usage": usage,
+                "estimated_usage": True,
+            }
+        ]
+    )
+    estimated = LLMAgent(
+        seat=0,
+        name="Hero",
+        spec=spec,
+        params={},
+        client=estimated_client,
+        analyzer=HandDistributionAnalyzer(),
+        validate_action=lambda action: None,
+        runtime={"context_policy": "compact_slim"},
+        tools=select_tools(ALL_TOOL_NAMES, locale="zh-CN"),
+        locale="zh-CN",
+    )
+    estimated_events: list[dict] = []
+    estimated.decide(make_view(), estimated_events.append)
+    assert estimated._context_anchor is None
+
+
+def test_trim_context_keeps_checkpoint() -> None:
+    agent, client, events = make_checkpoint_agent([])
+    agent.messages = [
+        {"role": "system", "content": "rules"},
+        {
+            "role": "user",
+            "content": "【比赛 checkpoint · 第 1 手至第 10 手】summary",
+        },
+        {"role": "user", "content": "【牌局更新 · 第 11 手 · 翻牌】"},
+        {"role": "assistant", "content": "check"},
+        {"role": "tool", "tool_call_id": "x", "content": "{}"},
+        {"role": "user", "content": "【牌局更新 · 第 12 手 · 翻牌】"},
+        {"role": "assistant", "content": "check"},
+    ]
+    agent.max_context_tokens = 3000
+    agent._trim_context(events.append, force=True)
+    assert agent.messages[0]["role"] == "system"
+    assert str(agent.messages[1].get("content") or "").startswith("【比赛 checkpoint")
+    assert any(
+        "【牌局更新 · 第 12 手" in str(message.get("content") or "")
+        for message in agent.messages
+    )
+
+
+def test_final_talk_does_not_trigger_checkpoint() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "name": "send_table_message",
+                        "arguments": '{"text":"gg"}',
+                    }
+                ]
+            }
+        ],
+        runtime_extra={"final_talk_context": "full"},
+        tool_names=AGENT_TOOL_NAMES,
+        submit_table_talk=lambda text, turn_id: {"ok": True},
+    )
+    agent.final_table_talk(
+        {"hand_id": 3, "winner_seats": [0], "pot": 30, "players": []},
+        lambda text: {"ok": True},
+        events.append,
+    )
+    assert len(client.requests) == 1
+    assert client.requests[0]["tools"][0]["function"]["name"] == TABLE_TALK_TOOL_NAME
+    assert not any(
+        event.get("type") == "context_summary_start" for event in events
+    )
+    assert agent._summary_calls == 0
+
+def test_history_tool_provider_error_is_reported_without_fallback() -> None:
+    def provider(seat, **kwargs):
+        raise RuntimeError("boom")
+
+    agent, client, events = make_checkpoint_agent(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "h1",
+                        "name": "research_history",
+                        "arguments": "{}",
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "a1",
+                        "name": "apply_action",
+                        "arguments": '{"action":"check"}',
+                    }
+                ]
+            },
+        ],
+        runtime_extra={
+            "context_high_water_tokens": 1_000_000,
+            "max_history_calls_per_turn": 2,
+        },
+        history_provider=provider,
+    )
+    action = agent.decide(checkpoint_view(), events.append)
+    assert action.type == ActionType.CHECK
+    results = [
+        event
+        for event in events
+        if event.get("type") == "tool_result"
+        and event.get("name") == HISTORY_TOOL_NAME
+    ]
+    assert len(results) == 1
+    assert results[0]["ok"] is False
+    assert "boom" in results[0]["summary"]
+    assert agent._history_calls_this_turn == 1
+
+def test_checkpoint_low_water_restores_older_raw_hands() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [{"content": CHECKPOINT_SUMMARY}],
+        runtime_extra={
+            "context_high_water_tokens": 30000,
+            "context_low_water_tokens": 30000,
+        },
+    )
+    agent._current_hand = 3
+    agent._current_street = "flop"
+    agent._maybe_checkpoint(events.append, mid_hand=False, force=True)
+    assert agent._checkpoint_through == 1
+    assert agent._checkpoint_retain_from == 1
+    assert any(
+        "【牌局更新 · 第 1 手" in str(message.get("content") or "")
+        for message in agent.messages
+    )
+    compacted = next(
+        event for event in events if event.get("type") == "context_compacted"
+    )
+    assert compacted["retained_from"] == 1

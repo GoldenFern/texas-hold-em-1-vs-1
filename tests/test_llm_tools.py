@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from src.llm.prompt import AGENT_TOOL_NAMES, ALL_TOOL_NAMES, TABLE_TALK_TOOL_NAME
+from src.llm.prompt import (
+    AGENT_TOOL_NAMES,
+    ALL_TOOL_NAMES,
+    GAME_TOOL_NAMES,
+    HISTORY_TOOL_NAME,
+    TABLE_TALK_TOOL_NAME,
+)
 from src.llm.tools import build_tools, select_tools
 
 EXPECTED_TOOL_NAMES = [
@@ -113,8 +119,11 @@ def test_select_tools_keeps_apply_action_last() -> None:
         assert TABLE_TALK_TOOL_NAME not in names
 
 
-def test_agent_tools_insert_table_talk_before_apply_action() -> None:
-    expected = EXPECTED_TOOL_NAMES[:-1] + [TABLE_TALK_TOOL_NAME, "apply_action"]
+def test_agent_tools_insert_history_and_table_talk_before_apply_action() -> None:
+    expected = (
+        EXPECTED_TOOL_NAMES[:-1]
+        + [HISTORY_TOOL_NAME, TABLE_TALK_TOOL_NAME, "apply_action"]
+    )
     for locale in ("zh-CN", "en-US"):
         names = [
             tool["function"]["name"]
@@ -122,3 +131,19 @@ def test_agent_tools_insert_table_talk_before_apply_action() -> None:
         ]
         assert names == expected
         assert names[-1] == "apply_action"
+
+
+def test_game_tools_add_history_without_changing_the_baseline() -> None:
+    assert list(ALL_TOOL_NAMES) == EXPECTED_TOOL_NAMES
+    assert HISTORY_TOOL_NAME in GAME_TOOL_NAMES
+    assert HISTORY_TOOL_NAME not in ALL_TOOL_NAMES
+    for locale in ("zh-CN", "en-US"):
+        names = [
+            tool["function"]["name"]
+            for tool in select_tools(GAME_TOOL_NAMES, locale)
+        ]
+        assert names == EXPECTED_TOOL_NAMES[:-1] + [
+            HISTORY_TOOL_NAME,
+            "apply_action",
+        ]
+        assert TABLE_TALK_TOOL_NAME not in names

@@ -50,18 +50,29 @@ from src.agents.base import AgentView
 from src.agents.project_bot import ProjectBot
 from src.agents.scripted_bot import ScriptedBot
 from src.analysis.hand_distribution import HandDistributionAnalyzer
+from src.analysis.history import build_checkpoint_snapshot, build_history_report
 from src.engine.actions import Action, ActionType
 from src.engine.heads_up import HeadsUpGame, Street
 from src.llm.agent import LLMAgent, select_tools
 from src.llm.client import LLMClient, LLMError
-from src.llm.prompt import ALL_TOOL_NAMES, build_system_prompt
+from src.llm.prompt import (
+    ALL_TOOL_NAMES,
+    GAME_TOOL_NAMES,
+    HISTORY_TOOL_NAME,
+    build_system_prompt,
+)
 from src.llm.providers import ModelSpec, ProviderRegistry
 
 DEFAULT_BOT_MODEL = PROJECT_ROOT / "models" / "rlcard" / "nlh_dqn_project.pth"
 GAME_CONFIG_PATH = PROJECT_ROOT / "config" / "game.json"
 MAX_ACTIONS_PER_HAND = 500
 
-AUX_TOOL_NAMES = tuple(name for name in ALL_TOOL_NAMES if name != "apply_action")
+AUX_TOOL_NAMES = tuple(
+    name for name in GAME_TOOL_NAMES if name != "apply_action"
+)
+_TOOL_ORDER = tuple(
+    name for name in ALL_TOOL_NAMES if name != "apply_action"
+) + (HISTORY_TOOL_NAME, "apply_action")
 
 OPPONENT_KINDS = (
     "project",
@@ -109,6 +120,12 @@ TOOL_RECOMMENDATIONS_EN = {
         "combine it with position, stack depth, and implied odds. It assumes no further "
         "betting after the call."
     ),
+    "research_history": (
+        "Before a close decision, call research_history to check public opponent statistics "
+        "for this match and completed matches. Every percentage includes its sample size; "
+        "small samples are noisy. Use it to form a read, not as a fact, and do not restate "
+        "the whole table in your reasoning."
+    ),
 }
 
 TOOL_RECOMMENDATIONS = {
@@ -131,6 +148,11 @@ TOOL_RECOMMENDATIONS = {
         "每次需要跟注时，先调用 call_ev 计算静态跟注 EV、盈亏平衡胜率和有效底池，"
         "再决定跟注、加注或弃牌。它假设跟注后不再下注，翻牌和转牌还要考虑隐含赔率。"
     ),
+    "research_history": (
+        "在接近的决策前调用 research_history 查看当前对局和已完成对局的公开对手统计。"
+        "每个百分比都带样本量，样本小时噪声很大；用它形成读牌，不要当成确定事实，"
+        "也不要把整张统计表复述到正文里。"
+    ),
 }
 
 
@@ -138,7 +160,7 @@ def resolve_tool_names(raw: str) -> tuple[str, ...]:
     """Resolve a CLI tool list into canonical tool names.
 
     Args:
-        raw: ``all``, ``none``, or a comma-separated list of tool names.
+        raw: ``all``, ``none``, ``history``, or a comma-separated list.
 
     Returns:
         Tool names in canonical order, always including ``apply_action``.
@@ -151,22 +173,26 @@ def resolve_tool_names(raw: str) -> tuple[str, ...]:
         return tuple(ALL_TOOL_NAMES)
     if text == "none":
         return ("apply_action",)
+    if text == "history":
+        return tuple(_TOOL_ORDER)
     requested = [part.strip() for part in text.split(",") if part.strip()]
     if not requested:
         raise ValueError("--tools 不能为空")
-    unknown = sorted(set(requested).difference(ALL_TOOL_NAMES))
+    unknown = sorted(set(requested).difference(GAME_TOOL_NAMES))
     if unknown:
         raise ValueError(f"未知工具：{', '.join(unknown)}")
     if "apply_action" not in requested:
         requested.append("apply_action")
     wanted = set(requested)
-    return tuple(name for name in ALL_TOOL_NAMES if name in wanted)
+    return tuple(name for name in _TOOL_ORDER if name in wanted)
 
 
 def build_tool_recommendation(tool_names: Sequence[str], locale: str = "zh-CN") -> str:
     """Build a strong, non-binding recommendation for the available tools."""
     auxiliaries = [
-        name for name in ALL_TOOL_NAMES if name != "apply_action" and name in set(tool_names)
+        name
+        for name in GAME_TOOL_NAMES
+        if name != "apply_action" and name in set(tool_names)
     ]
     if not auxiliaries:
         return ""
@@ -400,7 +426,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--tools",
         default="all",
-        help="'all', 'none', or a comma-separated list of tool names.",
+        help="'all', 'none', 'history', or a comma-separated list of tool names.",
     )
     parser.add_argument(
         "--recommend-tools",
@@ -476,8 +502,31 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--context-policy",
         default=None,
-        choices=("legacy", "full", "compact", "compact_slim"),
+        choices=("legacy", "full", "compact", "compact_slim", "checkpoint"),
         help="Override runtime.context_policy for this evaluation run.",
+    )
+    parser.add_argument(
+        "--keep-recent-tokens",
+        type=int,
+        default=None,
+        help="Override runtime.context_keep_recent_tokens.",
+    )
+    parser.add_argument(
+        "--buffer-tokens",
+        type=int,
+        default=None,
+        help="Override runtime.context_buffer_tokens; 0 uses the window-share default.",
+    )
+    parser.add_argument(
+        "--summary-max-tokens",
+        type=int,
+        default=None,
+        help="Override runtime.context_summary_max_tokens.",
+    )
+    parser.add_argument(
+        "--summary-retries",
+        default=None,
+        help="Comma-separated shrink steps for checkpoint summary retries.",
     )
     parser.add_argument(
         "--max-context-tokens",
@@ -606,6 +655,18 @@ def load_runtime(args: argparse.Namespace) -> dict:
         runtime["context_policy"] = str(args.context_policy)
     if args.max_context_tokens is not None:
         runtime["max_context_tokens_estimate"] = int(args.max_context_tokens)
+    if args.keep_recent_tokens is not None:
+        runtime["context_keep_recent_tokens"] = int(args.keep_recent_tokens)
+    if args.buffer_tokens is not None:
+        runtime["context_buffer_tokens"] = int(args.buffer_tokens)
+    if args.summary_max_tokens is not None:
+        runtime["context_summary_max_tokens"] = int(args.summary_max_tokens)
+    if args.summary_retries is not None:
+        runtime["context_summary_retries"] = [
+            float(item)
+            for item in str(args.summary_retries).split(",")
+            if item.strip()
+        ]
     return runtime
 
 
@@ -772,6 +833,30 @@ def make_llm_agent(
     system_prompt: str,
     locale: str = "zh-CN",
 ) -> LLMAgent:
+    def history_provider(
+        seat: int,
+        *,
+        scope: str = "both",
+        last_hands: int = 20,
+        focus: str = "all",
+        checkpoint: bool = False,
+    ) -> dict:
+        if checkpoint:
+            return build_checkpoint_snapshot(
+                [],
+                [],
+                seat,
+                last_hands=5,
+            )
+        return build_history_report(
+            [],
+            [],
+            seat,
+            scope=scope,
+            last_hands=last_hands,
+            focus=focus,
+        )
+
     return LLMAgent(
         seat=task.llm_seat,
         name=llm_name,
@@ -783,6 +868,9 @@ def make_llm_agent(
         runtime=runtime,
         tools=select_tools(tool_names, locale=locale),
         system_prompt=system_prompt,
+        history_provider=(
+            history_provider if HISTORY_TOOL_NAME in tool_names else None
+        ),
         locale=locale,
     )
 

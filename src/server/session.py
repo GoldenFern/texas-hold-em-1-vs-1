@@ -15,12 +15,21 @@ from src.agents.project_bot import ProjectBot
 from src.agents.rlcard_bot import RLCardBot
 from src.analysis.equity import EquityAnalyzer
 from src.analysis.hand_distribution import HandDistributionAnalyzer
+from src.analysis.history import (
+    HistoryStats,
+    build_match_record,
+    build_public_hand_record,
+)
 from src.engine.actions import Action, ActionType
 from src.engine.heads_up import HeadsUpGame, Street
 from src.i18n import normalize_locale, tr
 from src.llm.agent import LLMAgent, select_tools
 from src.llm.client import LLMClient
-from src.llm.prompt import AGENT_TOOL_NAMES, ALL_TOOL_NAMES, build_system_prompt
+from src.llm.prompt import (
+    AGENT_TOOL_NAMES,
+    GAME_TOOL_NAMES,
+    build_system_prompt,
+)
 from src.llm.providers import ProviderRegistry
 from src.llm.table_talk import TableTalkLimits, normalize_table_talk
 
@@ -76,6 +85,8 @@ class GameSession:
         self.god_view = True
         self.max_hands = 0
         self.hand_history: List[dict] = []
+        self.current_stats = HistoryStats()
+        self.completed_matches: List[dict] = []
         self.transcripts: Dict[int, List[dict]] = {0: [], 1: []}
         self.table_talk_enabled = False
         self.table_talk: List[dict] = []
@@ -362,7 +373,9 @@ class GameSession:
             generation_holder = {"value": 0}
             new_agents: Dict[int, object] = {}
             llm_runtime = self._game_config.get("llm_runtime", {})
-            llm_tool_names = AGENT_TOOL_NAMES if table_talk_enabled else ALL_TOOL_NAMES
+            llm_tool_names = (
+                AGENT_TOOL_NAMES if table_talk_enabled else GAME_TOOL_NAMES
+            )
             llm_tools = select_tools(llm_tool_names, locale=agent_locale)
             llm_system_prompt = build_system_prompt(
                 llm_tool_names,
@@ -399,6 +412,7 @@ class GameSession:
                             if table_talk_enabled
                             else None
                         ),
+                        history_provider=self._history_provider,
                         locale=agent_locale,
                     )
                 elif seat.kind == "bot":
@@ -443,6 +457,7 @@ class GameSession:
                 self._stop_current_thread()
                 generation = self._generation
                 generation_holder["value"] = generation
+                self._archive_current_match_locked()
                 self.match_id = new_match_id
                 self.god_view = rules["god_view"]
                 self.max_hands = rules["max_hands"]
@@ -450,6 +465,7 @@ class GameSession:
                 if hasattr(self.client, "locale"):
                     self.client.locale = agent_locale
                 self.hand_history = []
+                self.current_stats = HistoryStats()
                 self.transcripts = {0: [], 1: []}
                 self.table_talk_enabled = table_talk_enabled
                 self.table_talk = []
@@ -490,6 +506,105 @@ class GameSession:
             )
 
         return validate
+
+    def _identity_for_config(self, config: Optional[SeatConfig]) -> str:
+        """Return a stable public opponent identity for history grouping."""
+        if config is None:
+            return ""
+        if config.kind == "llm":
+            return f"llm:{config.provider_id}:{config.model_id}:{config.name}"
+        if config.kind == "bot":
+            return (
+                f"bot:{config.bot_agent_type}:"
+                f"{config.bot_model_path or ''}:{config.name}"
+            )
+        return f"human:{config.name}"
+
+    def _archive_current_match_locked(self) -> None:
+        """Archive the completed match before starting a new one."""
+        if not self.hand_history or not self.game:
+            return
+        identities = [
+            self._identity_for_config(self.seat_configs.get(0)),
+            self._identity_for_config(self.seat_configs.get(1)),
+        ]
+        rules = {
+            "starting_chips": self.game.starting_chips,
+            "small_blind": self.game.small_blind,
+            "big_blind": self.game.big_blind,
+            "auto_rebuy": self.game.auto_rebuy,
+        }
+        record = build_match_record(
+            self.match_id,
+            self.hand_history,
+            identities,
+            started_at=self.started_at,
+            ended_at=time.time(),
+            rules=rules,
+        )
+        self.completed_matches.append(record)
+        if len(self.completed_matches) > 50:
+            del self.completed_matches[:-50]
+
+    def _history_provider(
+        self,
+        seat: int,
+        *,
+        scope: str = "both",
+        last_hands: int = 20,
+        focus: str = "all",
+        checkpoint: bool = False,
+    ) -> dict:
+        """Return public history statistics for one LLM seat."""
+        seat = 0 if int(seat) == 0 else 1
+        with self.lock:
+            game = self.game
+            match_info = None
+            if game is not None:
+                match_info = {
+                    "small_blind": game.small_blind,
+                    "big_blind": game.big_blind,
+                    "your_chips": game.players[seat].chips,
+                    "opponent_chips": game.players[1 - seat].chips,
+                }
+            hero_identity = self._identity_for_config(
+                self.seat_configs.get(seat)
+            )
+            opponent_identity = self._identity_for_config(
+                self.seat_configs.get(1 - seat)
+            )
+            if checkpoint:
+                return self.current_stats.checkpoint_snapshot(
+                    self.completed_matches,
+                    seat,
+                    hero_identity=hero_identity,
+                    opponent_identity=opponent_identity,
+                    last_hands=5,
+                    match_info=match_info,
+                )
+            return self.current_stats.report(
+                self.completed_matches,
+                seat,
+                scope=scope,
+                last_hands=last_hands,
+                focus=focus,
+                hero_identity=hero_identity,
+                opponent_identity=opponent_identity,
+                match_info=match_info,
+            )
+
+    def _table_talk_counts_for_hand(self, hand_id: int) -> dict:
+        """Count turn table-talk messages per seat for one hand."""
+        counts = {0: 0, 1: 0}
+        for item in self.table_talk:
+            if item.get("hand_id") != hand_id:
+                continue
+            if item.get("kind") != "turn":
+                continue
+            seat = item.get("seat")
+            if seat in (0, 1):
+                counts[int(seat)] += 1
+        return counts
 
     def _table_talk_submitter(
         self,
@@ -1171,11 +1286,17 @@ class GameSession:
             return
         self._last_result_hand_id = self.game.hand_id
         result = self.game.result
-        self.hand_history.append(result)
+        record = build_public_hand_record(
+            self.game,
+            result,
+            self._table_talk_counts_for_hand(self.game.hand_id),
+        )
+        self.hand_history.append(record)
+        self.current_stats.add(record)
         for agent in self.agents.values():
             if isinstance(agent, LLMAgent):
                 try:
-                    agent.on_hand_finished(result)
+                    agent.on_hand_finished(record)
                 except Exception:
                     pass
         self._emit(

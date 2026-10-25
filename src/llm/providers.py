@@ -228,6 +228,7 @@ class ProviderRegistry:
         tools: Optional[List[dict]],
         params: dict,
         stream: bool,
+        tool_choice: Optional[str] = None,
     ) -> dict:
         payload: Dict[str, Any] = {
             "model": spec.id,
@@ -242,7 +243,7 @@ class ProviderRegistry:
 
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = tool_choice or "auto"
 
         thinking = bool(params.get("thinking", True))
         effort = str(params.get("reasoning_effort") or "")

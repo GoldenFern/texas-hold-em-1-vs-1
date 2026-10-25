@@ -81,7 +81,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--context-policy",
         default=None,
-        choices=("legacy", "full", "compact", "compact_slim"),
+        choices=("legacy", "full", "compact", "compact_slim", "checkpoint"),
     )
     parser.add_argument("--max-context-tokens", type=int, default=None)
     parser.add_argument("--pilot-hands", type=int, default=20)

@@ -21,7 +21,9 @@ ALL_TOOL_NAMES = (
 )
 
 TABLE_TALK_TOOL_NAME = "send_table_message"
-AGENT_TOOL_NAMES = ALL_TOOL_NAMES + (TABLE_TALK_TOOL_NAME,)
+HISTORY_TOOL_NAME = "research_history"
+GAME_TOOL_NAMES = ALL_TOOL_NAMES + (HISTORY_TOOL_NAME,)
+AGENT_TOOL_NAMES = GAME_TOOL_NAMES + (TABLE_TALK_TOOL_NAME,)
 
 
 def _locale(locale: Optional[str]) -> str:
@@ -85,6 +87,7 @@ def build_system_prompt(
     has_equity = "estimate_equity" in names
     has_random = "get_random_number" in names
     has_call_ev = "call_ev" in names
+    has_history = HISTORY_TOOL_NAME in names
     has_table_talk = TABLE_TALK_TOOL_NAME in names
 
     steps: List[str] = [text["step_state"]]
@@ -100,6 +103,8 @@ def build_system_prompt(
         steps.append(text["step_call_ev"])
     if has_random:
         steps.append(text["step_random"])
+    if has_history:
+        steps.append(text["step_history"])
     if has_table_talk:
         steps.append(
             text["step_table_talk"].format(
@@ -124,6 +129,8 @@ def build_system_prompt(
         auxiliaries.append("get_random_number")
     if has_call_ev:
         auxiliaries.append("call_ev")
+    if has_history:
+        auxiliaries.append(HISTORY_TOOL_NAME)
     if has_table_talk:
         auxiliaries.append(TABLE_TALK_TOOL_NAME)
     if auxiliaries:
@@ -499,6 +506,141 @@ def build_final_talk_fresh_message(
     return f"{summary}\n\n{build_final_table_talk_message(result, seat, '', locale)}"
 
 
+def _checkpoint_metric(metric: Optional[dict]) -> tuple[str, int]:
+    """Format one compact metric for the deterministic fallback."""
+    if not isinstance(metric, dict) or metric.get("value") is None:
+        return "n/a", 0
+    return f"{float(metric['value']) * 100:.1f}%", int(metric.get("n", 0) or 0)
+
+
+def build_checkpoint_prompt(
+    through_hand: int,
+    retain_from: int,
+    locale: str = "zh-CN",
+    *,
+    current_hand: Optional[int] = None,
+    stats: Optional[dict] = None,
+    has_previous: bool = False,
+) -> str:
+    """Build the user message that asks for a match checkpoint summary.
+
+    Args:
+        through_hand: Last completed hand covered by the summary.
+        retain_from: First hand kept verbatim beside the checkpoint.
+        locale: Agent locale.
+        current_hand: Hand currently in progress, if any.
+        stats: Compact statistics block for the summarizer's reasoning.
+        has_previous: Whether an older checkpoint is already in history.
+
+    Returns:
+        A localized summary prompt.  The statistics block is an input only;
+        the prompt explicitly tells the model not to copy it.
+    """
+    locale = _locale(locale)
+    text = prompt_text(locale)
+    through_hand = max(1, int(through_hand))
+    retain_from = max(through_hand + 1, int(retain_from))
+    parts = [
+        text["checkpoint_prompt"].format(
+            through=through_hand,
+            retain_from=retain_from,
+        )
+    ]
+    if has_previous:
+        parts.append(text["checkpoint_previous"])
+    if stats is not None:
+        parts.append(text["checkpoint_stats_header"])
+        parts.append(
+            "```json\n"
+            + json.dumps(stats, ensure_ascii=False, separators=(",", ":"))
+            + "\n```"
+        )
+    parts.append(text["checkpoint_template"])
+    if current_hand is not None and int(current_hand) > through_hand:
+        parts.append(text["checkpoint_current_hand"].format(hand=int(current_hand)))
+    return "\n\n".join(parts)
+
+
+def build_checkpoint_message(
+    summary: str,
+    through_hand: int,
+    locale: str = "zh-CN",
+) -> str:
+    """Wrap a model summary in the persistent checkpoint marker."""
+    locale = _locale(locale)
+    text = prompt_text(locale)
+    body = str(summary or "").strip()
+    header = text["checkpoint_header"].format(start=1, end=max(1, int(through_hand)))
+    if body.lstrip().startswith(text["checkpoint_marker"]):
+        return body
+    return f"{header}\n{text['checkpoint_note']}\n\n{body}".strip()
+
+
+def build_checkpoint_nudge(locale: str = "zh-CN", *, stats_dump: bool = False) -> str:
+    """Build the one-shot correction after an unusable summary."""
+    text = prompt_text(_locale(locale))
+    return text["checkpoint_stats_nudge"] if stats_dump else text["checkpoint_nudge"]
+
+
+def build_fallback_checkpoint(
+    stats: Optional[dict],
+    through_hand: int,
+    locale: str = "zh-CN",
+) -> str:
+    """Build a deterministic, short checkpoint when the model summary fails."""
+    locale = _locale(locale)
+    text = prompt_text(locale)
+    stats = stats if isinstance(stats, dict) else {}
+    current = stats.get("current") or stats.get("current_match") or {}
+    you = current.get("you") or {}
+    opponent = current.get("opponent") or {}
+    result = you.get("result") if isinstance(you, dict) else {}
+    result = result if isinstance(result, dict) else {}
+    preflop = opponent.get("preflop") if isinstance(opponent, dict) else {}
+    preflop = preflop if isinstance(preflop, dict) else {}
+    postflop = opponent.get("postflop") if isinstance(opponent, dict) else {}
+    postflop = postflop if isinstance(postflop, dict) else {}
+
+    hands = int(current.get("hands", result.get("hands", 0)) or 0)
+    net = int(result.get("net", 0) or 0)
+    bb = float(result.get("bb_per_100", 0.0) or 0.0)
+    vpip, vpip_n = _checkpoint_metric(preflop.get("vpip"))
+    pfr, pfr_n = _checkpoint_metric(preflop.get("pfr"))
+    three_bet, three_bet_n = _checkpoint_metric(preflop.get("three_bet"))
+    c_bet, c_bet_n = _checkpoint_metric(postflop.get("c_bet"))
+
+    recent_items = current.get("recent_hands") or []
+    recent: list[str] = []
+    for item in list(recent_items)[-3:]:
+        if not isinstance(item, dict):
+            continue
+        outcome = "W" if item.get("you_won") else "L"
+        recent.append(
+            f"#{int(item.get('hand_id', 0) or 0)} {outcome} "
+            f"{int(item.get('your_net', 0) or 0):+d}"
+        )
+    recent_text = ", ".join(recent) if recent else text["checkpoint_fallback_none"]
+
+    lines = [
+        text["checkpoint_fallback_header"].format(through=max(1, int(through_hand))),
+        text["checkpoint_fallback_note"],
+        text["checkpoint_fallback_line_state"].format(hands=hands, net=net, bb=bb),
+        text["checkpoint_fallback_line_opponent"].format(
+            vpip=vpip,
+            vpip_n=vpip_n,
+            pfr=pfr,
+            pfr_n=pfr_n,
+            three_bet=three_bet,
+            three_bet_n=three_bet_n,
+            c_bet=c_bet,
+            c_bet_n=c_bet_n,
+        ),
+        text["checkpoint_fallback_line_recent"].format(recent=recent_text),
+        text["checkpoint_fallback_line_note"],
+    ]
+    return "\n".join(lines)
+
+
 def _street_name(street: str, locale: str = "zh-CN") -> str:
     key = f"street.{street}"
     value = tr(locale, key)
@@ -508,10 +650,16 @@ def _street_name(street: str, locale: str = "zh-CN") -> str:
 __all__ = [
     "AGENT_TOOL_NAMES",
     "ALL_TOOL_NAMES",
+    "GAME_TOOL_NAMES",
+    "HISTORY_TOOL_NAME",
     "SYSTEM_PROMPT",
     "SYSTEM_PROMPT_EN",
     "TABLE_TALK_TOOL_NAME",
+    "build_checkpoint_message",
+    "build_checkpoint_nudge",
+    "build_checkpoint_prompt",
     "build_compact_turn_message",
+    "build_fallback_checkpoint",
     "build_final_table_talk_message",
     "build_final_talk_fresh_message",
     "build_final_talk_summary",

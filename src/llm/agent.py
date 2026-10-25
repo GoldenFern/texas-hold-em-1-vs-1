@@ -8,6 +8,7 @@ import random
 import threading
 import time
 import uuid
+from dataclasses import replace
 from typing import Callable, List, Optional, Sequence
 
 from src.agents.base import AgentView, BaseAgent
@@ -26,14 +27,27 @@ from src.i18n import normalize_locale, tr
 
 from .client import LLMClient, LLMError, ToolCall, estimate_tokens
 from .context import (
+    CheckpointCut,
     ContextSettings,
     MatchStats,
+    TriggerBudget,
+    checkpoint_message_indices,
+    choose_checkpoint_cut,
     compact_history,
     compact_tool_payload,
+    find_hand_starts,
+    flatten_checkpoint_transcript,
+    is_checkpoint_message,
+    resolve_trigger_budget,
 )
 from .prompt import (
+    HISTORY_TOOL_NAME,
     TABLE_TALK_TOOL_NAME,
+    build_checkpoint_message,
+    build_checkpoint_nudge,
+    build_checkpoint_prompt,
     build_compact_turn_message,
+    build_fallback_checkpoint,
     build_final_table_talk_message,
     build_final_talk_fresh_message,
     build_final_talk_system_prompt,
@@ -47,6 +61,7 @@ from .prompt_texts import prompt_text
 from .providers import ModelSpec
 from .table_talk import TableTalkLimits
 from .tools import (
+    HISTORY_TOOL,
     TABLE_TALK_TOOL,
     TOOLS,
     TOOL_SCHEMAS,
@@ -95,6 +110,7 @@ class LLMAgent(BaseAgent):
         system_prompt: Optional[str] = None,
         equity_analyzer: Optional[EquityAnalyzer] = None,
         submit_table_talk: Optional[Callable[[str, str], dict]] = None,
+        history_provider: Optional[Callable[..., dict]] = None,
         locale: str = "zh-CN",
     ) -> None:
         self.seat = seat
@@ -105,11 +121,13 @@ class LLMAgent(BaseAgent):
         self._prompt_text = prompt_text(self.locale)
         self._turn_marker = self._prompt_text["turn_marker"]
         self._summary_marker = self._prompt_text["summary_marker"]
+        self._checkpoint_marker = self._prompt_text["checkpoint_marker"]
         self.context = ContextSettings.from_runtime(runtime)
         self.client = client
         self.analyzer = analyzer
         self.equity_analyzer = equity_analyzer or EquityAnalyzer()
         self.validate_action = validate_action
+        self.history_provider = history_provider
         self.max_steps = int(runtime.get("max_steps_per_turn", 12))
         self.max_failures = int(runtime.get("max_consecutive_failures", 3))
         self.require_estimate_first = bool(runtime.get("require_estimate_first", False))
@@ -136,13 +154,38 @@ class LLMAgent(BaseAgent):
         else:
             prompt_budget = runtime_cap if runtime_cap > 0 else 220000
         self.max_context_tokens = max(8000, prompt_budget)
-        self.context = self.context.with_context_window(self.max_context_tokens)
+        if self.context.uses_checkpoint:
+            self.trigger_budget = resolve_trigger_budget(
+                self.context, self.max_context_tokens, context_window
+            )
+            self.context = replace(
+                self.context,
+                high_water_tokens=self.trigger_budget.high_water_tokens,
+                low_water_tokens=self.trigger_budget.low_water_tokens,
+            )
+        else:
+            self.context = self.context.with_context_window(self.max_context_tokens)
+            self.trigger_budget = TriggerBudget(
+                high_water_tokens=self.context.high_water_tokens,
+                hard_water_tokens=self.max_context_tokens,
+                low_water_tokens=self.context.low_water_tokens,
+                buffer_tokens=0,
+                auto_ceiling_tokens=self.max_context_tokens,
+                auto_enabled=True,
+            )
         self.max_estimate_calls = int(runtime.get("max_estimate_calls_per_turn", 2))
         self.max_estimate_iterations = int(runtime.get("max_estimate_iterations", 50000))
         self.max_equity_calls = int(runtime.get("max_equity_calls_per_turn", 2))
         self.max_equity_iterations = int(runtime.get("max_equity_iterations", 50000))
+        self.max_history_calls = int(runtime.get("max_history_calls_per_turn", 2))
         self.table_talk_limits = TableTalkLimits.from_runtime(runtime)
         self.tools = list(tools) if tools is not None else build_tools(self.locale)
+        if self.history_provider is None:
+            self.tools = [
+                tool
+                for tool in self.tools
+                if tool["function"]["name"] != HISTORY_TOOL_NAME
+            ]
         self.tool_names = {tool["function"]["name"] for tool in self.tools}
         self.table_talk_required = TABLE_TALK_TOOL_NAME in self.tool_names
         if self.require_estimate_each_turn and "estimate_hand_probabilities" not in self.tool_names:
@@ -180,6 +223,25 @@ class LLMAgent(BaseAgent):
             "output_tokens": 0,
             "reasoning_tokens": 0,
         }
+        self.context_usage = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_miss_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        self._context_anchor: Optional[tuple[int, int]] = None
+        self._checkpoint_through = 0
+        self._checkpoint_retain_from = 0
+        self._checkpoint_disabled = False
+        self._summary_calls = 0
+        self._summary_failures = 0
+        self._summary_last_hand = 0
+        self._summary_last_street = ""
+        self._current_hand = 0
+        self._current_street = ""
+        self._history_calls_this_turn = 0
+        self._last_checkpoint_error = ""
         self.last_error = ""
         self._trimmed = False
         self._compactions = 0
@@ -209,6 +271,25 @@ class LLMAgent(BaseAgent):
             "output_tokens": 0,
             "reasoning_tokens": 0,
         }
+        self.context_usage = {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_miss_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        self._context_anchor = None
+        self._checkpoint_through = 0
+        self._checkpoint_retain_from = 0
+        self._checkpoint_disabled = False
+        self._summary_calls = 0
+        self._summary_failures = 0
+        self._summary_last_hand = 0
+        self._summary_last_street = ""
+        self._current_hand = 0
+        self._current_street = ""
+        self._history_calls_this_turn = 0
+        self._last_checkpoint_error = ""
         self.last_error = ""
         self._trimmed = False
         self._compactions = 0
@@ -280,7 +361,7 @@ class LLMAgent(BaseAgent):
                 result, self.seat, self.name, locale=self.locale
             )
             self.messages.append({"role": "user", "content": prompt})
-            self._prepare_context(emit)
+            self._prepare_context(emit, final=True)
             messages = self.messages
         tools = [build_table_talk_tool(self.locale)]
         emit(
@@ -463,16 +544,30 @@ class LLMAgent(BaseAgent):
             "params": dict(self.params),
             "turns": self.turn_count,
             "usage": dict(self.total_usage),
+            "context_usage": dict(self.context_usage),
             "last_error": self.last_error,
             "table_talk": TABLE_TALK_TOOL_NAME in self.tool_names,
+            "history_tool": HISTORY_TOOL_NAME in self.tool_names,
             "context": {
                 "policy": self.context.policy,
                 "high_water_tokens": self.context.high_water_tokens,
                 "low_water_tokens": self.context.low_water_tokens,
                 "keep_recent_hands": self.context.keep_recent_hands,
+                "keep_recent_tokens": self.context.keep_recent_tokens,
+                "buffer_tokens": self.trigger_budget.buffer_tokens,
+                "auto_ceiling_tokens": self.trigger_budget.auto_ceiling_tokens,
+                "hard_water_tokens": self.trigger_budget.hard_water_tokens,
+                "auto_trigger": self.trigger_budget.auto_enabled,
                 "state_detail": self.context.state_detail,
                 "tool_detail": self.context.tool_detail,
                 "final_talk_context": self.context.final_talk_context,
+                "compactions": self._compactions,
+                "summary_calls": self._summary_calls,
+                "summary_failures": self._summary_failures,
+                "checkpoint_disabled": self._checkpoint_disabled,
+                "checkpoint_through": self._checkpoint_through,
+                "retained_from": self._checkpoint_retain_from,
+                "last_checkpoint_error": self._last_checkpoint_error,
             },
         }
 
@@ -494,6 +589,9 @@ class LLMAgent(BaseAgent):
         self._equity_calls_this_turn = 0
         self._equity_iterations_this_turn = 0
         self._talk_count_this_turn = 0
+        self._history_calls_this_turn = 0
+        self._current_hand = view.hand_id
+        self._current_street = view.street
         if self._cancel_event.is_set():
             return Action(view.seat, ActionType.FOLD, source="llm", auto=True)
 
@@ -513,6 +611,8 @@ class LLMAgent(BaseAgent):
                 "table_talk_received": len(view.table_talk),
             }
         )
+        if self.context.uses_checkpoint and not self._checkpoint_disabled:
+            self._maybe_checkpoint(emit, mid_hand=False)
         if self.context.state_detail == "compact":
             turn_message = build_compact_turn_message(
                 view,
@@ -574,7 +674,10 @@ class LLMAgent(BaseAgent):
                     return Action(view.seat, ActionType.FOLD, source="llm", auto=True)
                 if exc.kind == "context_length":
                     before = len(self.messages)
-                    self._trim_context(emit, force=True)
+                    if self.context.uses_checkpoint and not self._checkpoint_disabled:
+                        self._maybe_checkpoint(emit, mid_hand=True, force=True)
+                    if len(self.messages) == before:
+                        self._trim_context(emit, force=True)
                     if len(self.messages) < before and steps < self.max_steps:
                         self.last_error = str(exc)
                         emit(
@@ -685,6 +788,7 @@ class LLMAgent(BaseAgent):
             self.messages.append(
                 result.assistant_message(bool(self.spec.request.get("reasoning_echo", False)))
             )
+            self._update_context_anchor(result)
 
             if not result.tool_calls:
                 failures += 1
@@ -833,6 +937,17 @@ class LLMAgent(BaseAgent):
                                 usage_total,
                                 reason=self._t("agent.reason.invalid_action"),
                             )
+                    continue
+
+                if call.name == HISTORY_TOOL_NAME:
+                    self._handle_history(
+                        call,
+                        parsed,
+                        emit,
+                        turn_id,
+                        index,
+                        tool_started,
+                    )
                     continue
 
                 if call.name == TABLE_TALK_TOOL_NAME:
@@ -1378,6 +1493,113 @@ class LLMAgent(BaseAgent):
         )
         return True
 
+    def _handle_history(
+        self,
+        call: ToolCall,
+        parsed: Optional[dict],
+        emit,
+        turn_id: str,
+        index: int,
+        started: float,
+    ) -> None:
+        """Handle a public history-research request.
+
+        The tool is read-only and optional.  Budget errors and malformed
+        arguments are returned to the model without counting toward the
+        three-failure action fallback.
+        """
+        if self.history_provider is None:
+            self._append_tool_error(
+                call,
+                self._t("agent.error.history_disabled"),
+                emit,
+                turn_id,
+                index,
+            )
+            return
+        if parsed is None or not isinstance(parsed, dict):
+            self._append_tool_error(
+                call,
+                self._t("agent.error.invalid_json", args=call.arguments[:300]),
+                emit,
+                turn_id,
+                index,
+            )
+            return
+        if self._history_calls_this_turn >= self.max_history_calls:
+            self._append_tool_error(
+                call,
+                self._t(
+                    "agent.error.history_budget",
+                    max=self.max_history_calls,
+                ),
+                emit,
+                turn_id,
+                index,
+            )
+            return
+        scope = str(parsed.get("scope", "both") or "both").strip().lower()
+        if scope not in ("current_match", "completed_matches", "both"):
+            scope = "both"
+        try:
+            last_hands = int(parsed.get("last_hands", 20))
+        except (TypeError, ValueError):
+            last_hands = 20
+        last_hands = max(0, min(50, last_hands))
+        focus = str(parsed.get("focus", "all") or "all").strip().lower()
+        if focus not in (
+            "all",
+            "preflop",
+            "postflop",
+            "showdown",
+            "result",
+            "table_talk",
+        ):
+            focus = "all"
+        self._history_calls_this_turn += 1
+        try:
+            report = self.history_provider(
+                self.seat,
+                scope=scope,
+                last_hands=last_hands,
+                focus=focus,
+            )
+            if not isinstance(report, dict):
+                raise ValueError("history provider returned no report")
+            payload = {"ok": True, **report}
+        except Exception as exc:  # noqa: BLE001
+            payload = {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        current = payload.get("current_match") if isinstance(payload, dict) else {}
+        hands = int((current or {}).get("hands", 0) or 0)
+        opponent = (current or {}).get("opponent") or {}
+        preflop = opponent.get("preflop") if isinstance(opponent, dict) else {}
+        vpip = preflop.get("vpip") if isinstance(preflop, dict) else {}
+        if not payload.get("ok", True):
+            summary = str(
+                payload.get("error") or self._t("agent.error.history_disabled")
+            )
+        elif isinstance(vpip, dict) and vpip.get("value") is not None:
+            summary = self._t(
+                "agent.summary.history",
+                hands=hands,
+                value=round(float(vpip["value"]) * 100, 1),
+                n=int(vpip.get("n", 0) or 0),
+            )
+        else:
+            summary = self._t("agent.summary.history_empty", hands=hands)
+        self._append_tool_result(
+            call,
+            payload,
+            emit,
+            turn_id,
+            index,
+            started,
+            summary=summary,
+        )
+
     def _handle_table_talk(
         self,
         call: ToolCall,
@@ -1545,7 +1767,7 @@ class LLMAgent(BaseAgent):
                 "index": index,
                 "call_id": call.id,
                 "name": call.name,
-                "ok": True,
+                "ok": bool(payload.get("ok", True)),
                 "result": ui_result if ui_result is not None else payload,
                 "summary": summary,
                 "duration_ms": round((time.perf_counter() - started) * 1000, 1),
@@ -1652,10 +1874,21 @@ class LLMAgent(BaseAgent):
         return action
 
     def _context_tokens(self) -> int:
-        return self._messages_tokens(self.messages)
+        if self._context_anchor is not None:
+            index, measured = self._context_anchor
+            if 0 <= index <= len(self.messages):
+                return int(measured) + self._estimate_messages_tokens(
+                    self.messages[index:], include_tools=False
+                )
+        return self._estimate_messages_tokens(self.messages, include_tools=True)
 
-    def _messages_tokens(self, messages: Sequence[dict]) -> int:
-        total = self._tools_tokens
+    def _estimate_messages_tokens(
+        self,
+        messages: Sequence[dict],
+        *,
+        include_tools: bool = True,
+    ) -> int:
+        total = self._tools_tokens if include_tools else 0
         for message in messages:
             total += 6
             content = message.get("content")
@@ -1674,14 +1907,500 @@ class LLMAgent(BaseAgent):
                 total += estimate_tokens(str(function.get("arguments") or ""))
         return total
 
-    def _prepare_context(self, emit, force: bool = False) -> None:
+    def _messages_tokens(self, messages: Sequence[dict]) -> int:
+        return self._estimate_messages_tokens(messages, include_tools=True)
+
+    def _update_context_anchor(self, result) -> None:
+        """Anchor the next estimate on the provider's real prompt usage."""
+        usage = result.usage or {}
+        if result.estimated_usage or int(usage.get("input_tokens", 0) or 0) <= 0:
+            self._context_anchor = None
+            return
+        measured = (
+            int(usage.get("input_tokens", 0) or 0)
+            + int(usage.get("output_tokens", 0) or 0)
+            + int(usage.get("reasoning_tokens", 0) or 0)
+        )
+        self._context_anchor = (len(self.messages), measured)
+
+    def _invalidate_context_anchor(self) -> None:
+        self._context_anchor = None
+
+    def _add_context_usage(self, usage: dict) -> None:
+        """Bill a compaction call separately from the game turn's usage."""
+        for key in self.context_usage:
+            amount = int((usage or {}).get(key, 0) or 0)
+            self.context_usage[key] += amount
+            self.total_usage[key] = int(self.total_usage.get(key, 0)) + amount
+
+    def _prepare_context(
+        self,
+        emit,
+        force: bool = False,
+        *,
+        mid_hand: bool = True,
+        final: bool = False,
+    ) -> None:
         """Apply the configured context policy before a model request."""
+        if self.context.uses_checkpoint:
+            if final:
+                return
+            if self._checkpoint_disabled:
+                self._compact_context(emit, force=force)
+                return
+            self._maybe_checkpoint(emit, mid_hand=mid_hand, force=force)
+            return
         if self.context.policy == "full":
             return
         if self.context.policy == "legacy":
             self._trim_context(emit, force=force)
             return
         self._compact_context(emit, force=force)
+
+    def _checkpoint_stats(self) -> Optional[dict]:
+        """Fetch the compact statistics block used by the summarizer."""
+        if self.history_provider is None:
+            return None
+        try:
+            return self.history_provider(
+                self.seat,
+                scope="both",
+                last_hands=5,
+                focus="all",
+                checkpoint=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._last_checkpoint_error = f"{type(exc).__name__}: {exc}"
+            return None
+
+    def _maybe_checkpoint(
+        self,
+        emit,
+        *,
+        mid_hand: bool,
+        force: bool = False,
+    ) -> None:
+        """Summarize completed hands into a checkpoint when the budget is due."""
+        if self._checkpoint_disabled or not self.context.uses_checkpoint:
+            return
+        if self._cancel_event.is_set():
+            return
+        budget = self.trigger_budget
+        if not budget.auto_enabled and not force:
+            return
+        current_hand = int(self._current_hand or 0)
+        if current_hand <= 0:
+            return
+        before_tokens = self._context_tokens()
+        threshold = (
+            budget.hard_water_tokens if mid_hand else budget.high_water_tokens
+        )
+        if not force and before_tokens < threshold:
+            return
+        if (
+            not force
+            and self._summary_last_hand == current_hand
+            and self._summary_last_street == self._current_street
+        ):
+            return
+        cut = choose_checkpoint_cut(
+            self.messages,
+            current_hand,
+            self.context.keep_recent_hands,
+            self.context.keep_recent_tokens,
+            self._turn_marker,
+            self._summary_marker,
+            lambda items: self._estimate_messages_tokens(
+                items, include_tools=False
+            ),
+        )
+        if cut is None:
+            if force:
+                self._trim_context(emit, force=True)
+            return
+        self._summary_last_hand = current_hand
+        self._summary_last_street = self._current_street
+        stats = self._checkpoint_stats()
+        has_previous = any(
+            is_checkpoint_message(str(message.get("content") or ""), self._checkpoint_marker)
+            for message in self.messages
+        )
+        prompt = build_checkpoint_prompt(
+            cut.through,
+            cut.retain_from,
+            self.locale,
+            current_hand=current_hand,
+            stats=stats,
+            has_previous=has_previous,
+        )
+        emit(
+            {
+                "type": "context_summary_start",
+                "policy": "checkpoint",
+                "reason": (
+                    "force"
+                    if force
+                    else ("mid_hand" if mid_hand else "hand_boundary")
+                ),
+                "before_tokens": before_tokens,
+                "through_hand": cut.through,
+                "retained_from": cut.retain_from,
+                "current_hand": current_hand,
+                "stats": bool(stats),
+            }
+        )
+        calls_before = self._summary_calls
+        result = self._run_checkpoint_summary(cut, prompt, emit)
+        if self._cancel_event.is_set():
+            return
+        if result is None:
+            if self._last_checkpoint_error == "cancelled":
+                return
+            self._summary_failures += 1
+            self._last_checkpoint_error = (
+                self._last_checkpoint_error or "summary_failed"
+            )
+            emit(
+                {
+                    "type": "context_summary_failed",
+                    "kind": self._last_checkpoint_error,
+                    "attempts": max(0, self._summary_calls - calls_before),
+                    "fallback": True,
+                }
+            )
+            emit(
+                {
+                    "type": "note",
+                    "level": "warn",
+                    "text": self._t(
+                        "agent.note.context_checkpoint_failed",
+                        kind=self._last_checkpoint_error,
+                    ),
+                }
+            )
+            fallback = build_fallback_checkpoint(stats, cut.through, self.locale)
+            self._apply_checkpoint(
+                cut,
+                fallback,
+                emit,
+                fallback=True,
+                usage={},
+                attempts=0,
+                latency_ms=0.0,
+            )
+            if self._summary_failures >= 2:
+                self._checkpoint_disabled = True
+            return
+        summary, usage, attempts, latency_ms = result
+        self._summary_failures = 0
+        self._apply_checkpoint(
+            cut,
+            summary,
+            emit,
+            fallback=False,
+            usage=usage,
+            attempts=attempts,
+            latency_ms=latency_ms,
+        )
+
+    def _summary_headings(self) -> list[str]:
+        template = str(self._prompt_text.get("checkpoint_template", ""))
+        return [
+            line.strip()
+            for line in template.splitlines()
+            if line.strip().startswith("## ")
+        ]
+
+    def _summary_valid(self, text: str) -> tuple[bool, bool]:
+        """Return ``(valid, looks_like_stats_dump)`` for a summary reply."""
+        body = str(text or "").strip()
+        if len(body) < 80:
+            return False, False
+        lowered = body.lower()
+        stats_dump = (
+            "vpip" in lowered
+            and "pfr" in lowered
+            and ("{" in body or "```" in body)
+        )
+        headings = self._summary_headings()
+        filled = sum(1 for heading in headings if heading in body)
+        return (filled >= 4 and not stats_dump), stats_dump
+
+    def _summary_call(
+        self,
+        messages: Sequence[dict],
+        params: dict,
+        *,
+        tool_choice: Optional[str] = "none",
+    ):
+        """Call the model for a summary and bill usage separately."""
+        self._summary_calls += 1
+
+        def run(choice: Optional[str]):
+            try:
+                return self.client.stream(
+                    self.spec,
+                    list(messages),
+                    self.tools,
+                    params,
+                    lambda _event: None,
+                    cancel=self._cancel_event.is_set,
+                    tool_choice=choice,
+                )
+            except TypeError:
+                # Older/fake clients may not accept the optional keyword.
+                return self.client.stream(
+                    self.spec,
+                    list(messages),
+                    self.tools,
+                    params,
+                    lambda _event: None,
+                    cancel=self._cancel_event.is_set,
+                )
+
+        try:
+            return run(tool_choice), None
+        except LLMError as exc:
+            if exc.kind == "param" and tool_choice is not None:
+                try:
+                    return run(None), None
+                except LLMError as retry_exc:
+                    return None, retry_exc
+            return None, exc
+
+    def _run_checkpoint_summary(
+        self,
+        cut: CheckpointCut,
+        prompt: str,
+        emit,
+    ) -> Optional[tuple[str, dict, int, float]]:
+        """Run the cache-friendly summary request with graded shrinking.
+
+        The first attempt sends the unchanged conversation plus the summary
+        prompt so the provider can reuse the normal request's prompt cache.
+        On a context-length rejection it drops the retained tail from the
+        summary request, then flattens older hands to text and shrinks through
+        ``context_summary_retries``.  The newest hand is never removed.
+        """
+        started = time.perf_counter()
+        params = dict(self.params)
+        max_tokens = max(
+            512,
+            min(
+                int(params.get("max_tokens", 32768) or 32768),
+                int(self.context.summary_max_tokens),
+            ),
+        )
+        params["max_tokens"] = max_tokens
+        usage_total = {key: 0 for key in self.context_usage}
+        attempts = 0
+        last_error_kind = ""
+        prompt_tokens = estimate_tokens(prompt)
+        available = max(
+            2_000,
+            self.max_context_tokens - self._tools_tokens - prompt_tokens - 1_024,
+        )
+        full_messages = self.messages + [{"role": "user", "content": prompt}]
+        before_tail = self.messages[: cut.index] + [
+            {"role": "user", "content": prompt}
+        ]
+        candidates: list[list[dict]] = []
+        if self._estimate_messages_tokens(self.messages, include_tools=False) <= available:
+            candidates.append(full_messages)
+        if self._estimate_messages_tokens(
+            self.messages[: cut.index], include_tools=False
+        ) <= available:
+            candidates.append(before_tail)
+        for step in (1.0,) + tuple(self.context.summary_retry_steps):
+            target = max(2_000, int(available * float(step)))
+            transcript = flatten_checkpoint_transcript(
+                self.messages,
+                cut.index,
+                target,
+                estimate_tokens,
+                self._checkpoint_marker,
+                self._turn_marker,
+                self._summary_marker,
+            )
+            if not transcript:
+                continue
+            candidates.append(
+                [
+                    self.messages[0],
+                    {"role": "user", "content": f"{transcript}\n\n{prompt}"},
+                ]
+            )
+        if not candidates:
+            self._last_checkpoint_error = "no_summary_candidate"
+            return None
+        max_attempts = len(self.context.summary_retry_steps) + 3
+        for messages in candidates:
+            if attempts >= max_attempts or self._cancel_event.is_set():
+                break
+            result, error = self._summary_call(
+                messages, params, tool_choice="none"
+            )
+            attempts += 1
+            if error is not None:
+                last_error_kind = error.kind
+                if error.kind == "cancelled":
+                    break
+                if error.kind in ("context_length", "payload_too_large"):
+                    continue
+                break
+            if result is None:
+                continue
+            for key in usage_total:
+                usage_total[key] += int(result.usage.get(key, 0) or 0)
+            self._add_context_usage(result.usage)
+            valid, stats_dump = self._summary_valid(result.content)
+            if valid:
+                return (
+                    str(result.content).strip(),
+                    usage_total,
+                    attempts,
+                    (time.perf_counter() - started) * 1000.0,
+                )
+            if result.finish_reason == "length":
+                max_output = max(
+                    1_024,
+                    int(getattr(self.spec, "max_output", 8_192) or 8_192),
+                )
+                params["max_tokens"] = min(
+                    max_output,
+                    8_192,
+                    max(1_024, max_tokens * 2),
+                )
+                max_tokens = int(params["max_tokens"])
+                continue
+            if attempts >= max_attempts:
+                break
+            nudge = build_checkpoint_nudge(self.locale, stats_dump=stats_dump)
+            nudged = list(messages) + [{"role": "user", "content": nudge}]
+            retry, retry_error = self._summary_call(
+                nudged, params, tool_choice="none"
+            )
+            attempts += 1
+            if retry_error is not None:
+                last_error_kind = retry_error.kind
+                if retry_error.kind in ("context_length", "payload_too_large"):
+                    continue
+                break
+            if retry is None:
+                continue
+            for key in usage_total:
+                usage_total[key] += int(retry.usage.get(key, 0) or 0)
+            self._add_context_usage(retry.usage)
+            valid, stats_dump = self._summary_valid(retry.content)
+            if valid:
+                return (
+                    str(retry.content).strip(),
+                    usage_total,
+                    attempts,
+                    (time.perf_counter() - started) * 1000.0,
+                )
+            break
+        self._last_checkpoint_error = last_error_kind or "summary_invalid"
+        return None
+
+    def _apply_checkpoint(
+        self,
+        cut: CheckpointCut,
+        summary: str,
+        emit,
+        *,
+        fallback: bool,
+        usage: dict,
+        attempts: int,
+        latency_ms: float,
+    ) -> None:
+        """Replace old hands with a checkpoint and retain the recent tail."""
+        before_tokens = self._context_tokens()
+        before_messages = len(self.messages)
+        old_messages = list(self.messages)
+        checkpoint_text = build_checkpoint_message(
+            summary, cut.through, self.locale
+        )
+        checkpoint_message = {"role": "user", "content": checkpoint_text}
+        tail = list(old_messages[cut.index:])
+        self.messages = [old_messages[0], checkpoint_message, *tail]
+        self._invalidate_context_anchor()
+        self._checkpoint_through = cut.through
+        retained_from = cut.retain_from
+        after_tokens = self._context_tokens()
+        # Use the low-water target to keep more recent hands verbatim.  The
+        # checkpoint already covers them, so this only adds detail, not risk.
+        low = self.trigger_budget.low_water_tokens
+        if after_tokens < low and retained_from > 1:
+            starts = find_hand_starts(
+                old_messages, self._turn_marker, self._summary_marker
+            )
+            previous = sorted(hand for hand in starts if hand < retained_from)
+            for hand in reversed(previous):
+                candidate = [
+                    old_messages[0],
+                    checkpoint_message,
+                    *old_messages[starts[hand] :],
+                ]
+                candidate_tokens = self._estimate_messages_tokens(
+                    candidate, include_tools=True
+                )
+                if candidate_tokens > low:
+                    break
+                self.messages = candidate
+                retained_from = hand
+                after_tokens = candidate_tokens
+        self._checkpoint_retain_from = retained_from
+        self._compactions += 1
+        summary_tokens = estimate_tokens(checkpoint_text)
+        emit(
+            {
+                "type": "context_summary_end",
+                "ok": True,
+                "fallback": fallback,
+                "usage": dict(usage),
+                "attempts": attempts,
+                "latency_ms": round(latency_ms, 1),
+                "summary_tokens": summary_tokens,
+                "after_tokens": after_tokens,
+                "through_hand": cut.through,
+                "text": summary,
+            }
+        )
+        emit(
+            {
+                "type": "context_compacted",
+                "policy": "checkpoint",
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
+                "before_messages": before_messages,
+                "after_messages": len(self.messages),
+                "dropped_messages": max(0, before_messages - len(self.messages)),
+                "keep_recent_hands": self.context.keep_recent_hands,
+                "through_hand": cut.through,
+                "retained_from": retained_from,
+                "summary_tokens": summary_tokens,
+                "fallback": fallback,
+            }
+        )
+        kept = max(
+            0,
+            int(self._current_hand or retained_from) - retained_from,
+        )
+        emit(
+            {
+                "type": "note",
+                "level": "warn",
+                "text": self._t(
+                    "agent.note.context_checkpoint",
+                    through=cut.through,
+                    kept=kept,
+                    tokens=after_tokens,
+                ),
+            }
+        )
+        if self._context_tokens() > self.trigger_budget.hard_water_tokens:
+            self._compact_context(emit, force=True)
 
     def _compact_context(self, emit, force: bool = False) -> None:
         """Drop old hand detail blocks, keeping compact summaries and recent hands."""
@@ -1762,14 +2481,21 @@ class LLMAgent(BaseAgent):
                 break
             # Drop the oldest complete turn, always cutting at a turn boundary.
             cut = turn_starts[1]
-            removed += cut - 1
-            self.messages = [self.messages[0]] + self.messages[cut:]
+            protected = [
+                self.messages[index]
+                for index in checkpoint_message_indices(
+                    self.messages, self._checkpoint_marker
+                )
+            ]
+            old_len = len(self.messages)
+            self.messages = [self.messages[0]] + protected + self.messages[cut:]
+            removed += max(0, old_len - len(self.messages))
             force = False
         if removed:
             emit(
                 {
                     "type": "context_trimmed",
-                    "policy": "legacy",
+                    "policy": self.context.policy,
                     "before_tokens": before_tokens,
                     "after_tokens": self._context_tokens(),
                     "before_messages": before_count,
@@ -1789,6 +2515,7 @@ class LLMAgent(BaseAgent):
 
 
 __all__ = [
+    "HISTORY_TOOL",
     "LLMAgent",
     "TABLE_TALK_TOOL",
     "TOOLS",

@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from src.agents.base import AgentView
 from src.llm.context import (
     ContextSettings,
     MatchStats,
+    choose_checkpoint_cut,
     compact_history,
     compact_tool_payload,
+    flatten_checkpoint_transcript,
+    parse_checkpoint_range,
     parse_hand_number,
+    resolve_trigger_budget,
 )
 from src.llm.prompt import (
     build_compact_turn_message,
@@ -316,3 +322,180 @@ def test_hand_summary_is_compact_and_localized() -> None:
     assert "一对" in text
     assert "高牌" in text
     assert "1060" in text
+
+
+def test_checkpoint_settings_parse_and_force_compact_details() -> None:
+    settings = ContextSettings.from_runtime(
+        {
+            "context_policy": "checkpoint",
+            "context_high_water_tokens": 0,
+            "context_low_water_tokens": 50_000,
+            "context_keep_recent_hands": 3,
+            "context_keep_recent_tokens": 20_000,
+            "context_buffer_tokens": 0,
+            "context_summary_max_tokens": 4_096,
+            "context_summary_retries": [0.5, 0.9, 1.2, -0.1],
+        }
+    )
+    assert settings.policy == "checkpoint"
+    assert settings.high_water_tokens == 0
+    assert settings.low_water_tokens == 50_000
+    assert settings.keep_recent_tokens == 20_000
+    assert settings.summary_max_tokens == 4_096
+    assert settings.summary_retry_steps == (0.9, 0.5)
+    assert settings.state_detail == "compact"
+    assert settings.tool_detail == "compact"
+    assert settings.uses_checkpoint is True
+
+
+def test_trigger_budget_matches_opencode_window_minus_buffer() -> None:
+    settings = ContextSettings.from_runtime(
+        {
+            "context_policy": "checkpoint",
+            "context_high_water_tokens": 0,
+            "context_low_water_tokens": 50_000,
+        }
+    )
+    million = resolve_trigger_budget(settings, 1_013_760, 1_048_576)
+    assert million.buffer_tokens == 157_286
+    assert million.auto_ceiling_tokens == 856_474
+    assert million.high_water_tokens == 856_474
+    assert million.hard_water_tokens == 1_009_664
+    assert million.auto_enabled is True
+
+    capped = replace(settings, high_water_tokens=160_000)
+    assert resolve_trigger_budget(capped, 1_013_760, 1_048_576).high_water_tokens == 160_000
+
+    kimi = resolve_trigger_budget(settings, 221_184, 262_144)
+    assert kimi.buffer_tokens == 39_321
+    assert kimi.auto_ceiling_tokens == 181_863
+
+
+def test_trigger_budget_handles_unknown_and_tiny_windows() -> None:
+    settings = ContextSettings.from_runtime(
+        {"context_policy": "checkpoint", "context_high_water_tokens": 0}
+    )
+    unknown = resolve_trigger_budget(settings, 220_000, 0)
+    assert unknown.auto_enabled is False
+    assert unknown.high_water_tokens == 220_000
+
+    tiny = resolve_trigger_budget(settings, 3_000, 4_096)
+    assert tiny.high_water_tokens >= 2_000
+    assert tiny.hard_water_tokens >= tiny.high_water_tokens
+    assert tiny.low_water_tokens >= 1_000
+
+
+def test_choose_checkpoint_cut_keeps_recent_and_current_hands() -> None:
+    messages = [{"role": "system", "content": "rules"}]
+    for hand in range(1, 7):
+        messages.extend(hand_messages(hand, f"reason {hand}"))
+    messages.append({"role": "user", "content": TURN.format(hand=7)})
+
+    cut = choose_checkpoint_cut(
+        messages,
+        current_hand=7,
+        keep_recent_hands=3,
+        keep_recent_tokens=10_000,
+        turn_marker="【牌局更新",
+        summary_marker="【手牌摘要",
+        estimate_messages=lambda items: len(items) * 100,
+    )
+    assert cut is not None
+    assert cut.through == 3
+    assert cut.retain_from == 4
+    assert TURN.format(hand=4) in str(messages[cut.index]["content"])
+    assert TURN.format(hand=7) in str(messages[-1]["content"])
+
+
+def test_choose_checkpoint_cut_shrinks_by_token_budget() -> None:
+    messages = [{"role": "system", "content": "rules"}]
+    for hand in range(1, 7):
+        messages.extend(hand_messages(hand, f"reason {hand}"))
+    messages.append({"role": "user", "content": TURN.format(hand=7)})
+
+    cut = choose_checkpoint_cut(
+        messages,
+        current_hand=7,
+        keep_recent_hands=3,
+        keep_recent_tokens=900,
+        turn_marker="【牌局更新",
+        summary_marker="【手牌摘要",
+        estimate_messages=lambda items: len(items) * 100,
+    )
+    assert cut is not None
+    assert cut.through >= 3
+    assert cut.retain_from >= 4
+    # The current hand is never dropped, even when the tail is over budget.
+    assert TURN.format(hand=7) in str(messages[-1]["content"])
+
+
+def test_choose_checkpoint_cut_skips_the_first_hand() -> None:
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": TURN.format(hand=1)},
+    ]
+    cut = choose_checkpoint_cut(
+        messages,
+        current_hand=1,
+        keep_recent_hands=3,
+        keep_recent_tokens=10_000,
+        turn_marker="【牌局更新",
+        summary_marker="【手牌摘要",
+        estimate_messages=lambda items: len(items) * 100,
+    )
+    assert cut is None
+
+
+def test_parse_checkpoint_range_zh_and_en() -> None:
+    assert parse_checkpoint_range(
+        "【比赛 checkpoint · 第 1 手至第 42 手】",
+        "【比赛 checkpoint",
+    ) == (1, 42)
+    assert parse_checkpoint_range(
+        "[Match checkpoint · Hands 1-42]",
+        "[Match checkpoint",
+    ) == (1, 42)
+    assert parse_checkpoint_range("not a checkpoint", "【比赛 checkpoint") is None
+    assert parse_checkpoint_range(
+        "【比赛 checkpoint · 第 9 手至第 3 手】",
+        "【比赛 checkpoint",
+    ) is None
+
+
+def test_flatten_checkpoint_transcript_drops_oldest_and_skips_reasoning() -> None:
+    messages = [{"role": "system", "content": "rules"}]
+    for hand in range(1, 5):
+        messages.extend(hand_messages(hand, f"SECRET_REASON_{hand}"))
+    cut_index = next(
+        index
+        for index, message in enumerate(messages)
+        if TURN.format(hand=4) in str(message.get("content") or "")
+    )
+    text = flatten_checkpoint_transcript(
+        messages,
+        cut_index,
+        target_tokens=80,
+        estimate_text=len,
+        checkpoint_marker="【比赛 checkpoint",
+    )
+    assert "SECRET_REASON_4" not in text
+    assert "older hands omitted" in text
+    assert "第 3 手" in text or "第 2 手" in text
+
+
+def test_compact_history_tool_payload_keeps_metrics_and_five_results() -> None:
+    payload = {
+        "ok": True,
+        "scope": "both",
+        "current_match": {
+            "hands": 10,
+            "positions": {"you": {}, "opponent": {}},
+            "recent_hands": [{"hand_id": index} for index in range(10)],
+        },
+        "notes": ["public only"],
+    }
+    compact = compact_tool_payload("research_history", payload)
+    assert "scope" not in compact
+    assert "positions" not in compact["current_match"]
+    assert len(compact["current_match"]["recent_hands"]) == 5
+    assert compact["notes"] == ["public only"]

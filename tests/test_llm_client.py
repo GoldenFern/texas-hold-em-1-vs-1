@@ -470,3 +470,61 @@ def test_user_id_is_omitted_when_not_configured() -> None:
     )
     client.stream(spec(), [{"role": "user", "content": "hi"}], None, {}, lambda e: None)
     assert "user_id" not in session.calls[0]["json"]
+
+def test_stream_sends_tool_choice_and_defaults_to_auto() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_action",
+                "description": "action",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    client, session = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {
+                        "choices": [
+                            {"delta": {"content": "ok"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+                    }
+                )
+            )
+        ]
+    )
+    client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        tools,
+        {},
+        lambda _event: None,
+        tool_choice="none",
+    )
+    assert session.calls[0]["json"]["tool_choice"] == "none"
+
+    client, session = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {
+                        "choices": [
+                            {"delta": {"content": "ok"}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+                    }
+                )
+            )
+        ]
+    )
+    client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        tools,
+        {},
+        lambda _event: None,
+    )
+    assert session.calls[0]["json"]["tool_choice"] == "auto"

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import time
 
 from src.analysis.hand_distribution import HandDistributionAnalyzer
+from src.analysis.history import HistoryStats
+from src.engine.actions import Action, ActionType
 from src.engine.heads_up import HeadsUpGame
 from src.llm.client import LLMClient
 from src.llm.providers import ProviderRegistry
@@ -285,3 +289,97 @@ def test_table_talk_normalizes_but_does_not_inspect_card_content() -> None:
         assert result["entry"]["text"] == "我拿着 A♥，你信吗？"
     finally:
         session.shutdown()
+
+def finished_fold_game() -> HeadsUpGame:
+    game = HeadsUpGame(
+        starting_chips=1000,
+        small_blind=5,
+        big_blind=10,
+        seed=42,
+        locale="zh-CN",
+    )
+    game.configure_players(
+        {"name": "You", "kind": "human"},
+        {"name": "Bot", "kind": "bot"},
+    )
+    game.start_hand()
+    actor = game.actor
+    assert actor is not None
+    game.apply(Action(actor, ActionType.FOLD, source="human"))
+    assert game.result is not None
+    return game
+
+
+def prepared_session() -> GameSession:
+    session = make_session()
+    session.game = finished_fold_game()
+    session.match_id = "match-history-1"
+    session.started_at = time.time()
+    session.seat_configs = {
+        0: SeatConfig(kind="human", name="You"),
+        1: SeatConfig(kind="bot", name="Bot", bot_agent_type="random"),
+    }
+    session.hand_history = []
+    session.current_stats = HistoryStats()
+    session._last_result_hand_id = -1
+    return session
+
+
+def test_finish_hand_records_public_actions_and_stats() -> None:
+    session = prepared_session()
+    session._finish_hand_locked()
+
+    assert len(session.hand_history) == 1
+    record = session.hand_history[0]
+    assert record["actions"]
+    assert record["button"] == 0
+    assert record["small_blind"] == 5
+    assert record["big_blind"] == 10
+    assert "hole_cards" not in json.dumps(record, ensure_ascii=False)
+    assert len(session.current_stats.records) == 1
+    assert session.current_stats.metrics(0)["result"]["hands"] == 1
+
+    payloads = [
+        args[1]
+        for args, _ in session.socketio.events
+        if len(args) > 1 and isinstance(args[1], dict)
+    ]
+    assert any(item.get("type") == "hand_result" for item in payloads)
+
+
+def test_archive_current_match_and_history_provider() -> None:
+    session = prepared_session()
+    session._finish_hand_locked()
+    session._archive_current_match_locked()
+
+    assert len(session.completed_matches) == 1
+    match = session.completed_matches[0]
+    assert match["hands"] == 1
+    assert match["identities"][0].startswith("human:")
+    assert match["identities"][1].startswith("bot:")
+
+    report = session._history_provider(0, scope="both", last_hands=5)
+    assert report["current_match"]["hands"] == 1
+    assert report["completed_matches"]["count"] == 1
+    assert report["completed_matches"]["vs_current_opponent"]["matches"] == 1
+    assert "vpip" in report["current_match"]["opponent"]["preflop"]
+    assert "positions" in report["current_match"]
+
+    checkpoint = session._history_provider(0, checkpoint=True)
+    assert "current" in checkpoint
+    assert "completed_vs_current_opponent" in checkpoint
+    assert checkpoint["current"]["hands"] == 1
+    assert "notes" in checkpoint
+
+
+def test_history_provider_swaps_you_and_opponent_by_seat() -> None:
+    session = prepared_session()
+    session._finish_hand_locked()
+
+    seat_zero = session._history_provider(0, scope="current_match", last_hands=1)
+    seat_one = session._history_provider(1, scope="current_match", last_hands=1)
+    assert seat_zero["current_match"]["hands"] == 1
+    assert seat_one["current_match"]["hands"] == 1
+    assert seat_zero["current_match"]["you"]["result"]["hands"] == 1
+    assert seat_one["current_match"]["you"]["result"]["hands"] == 1
+    assert seat_zero["current_match"]["positions"]["you"] != seat_one["current_match"]["positions"]["you"]

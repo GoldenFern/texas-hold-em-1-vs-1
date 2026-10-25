@@ -188,3 +188,32 @@ python scripts/preview_context.py --policy compact_slim --hands 50 --seed 2027 -
 ```
 
 输出目录在 `tmp/context_preview/`，每组包含 `hands.csv`、`requests.csv`、`hands.jsonl`、`summary.json` 和 `report.md`。
+
+## checkpoint 压缩（2026-10-25）
+
+这一版新增了 `checkpoint` 策略，默认配置已切换过去。它和 `compact_slim` 的区别：
+
+- 触发参考 OpenCode：`prompt_budget - max(15% × window, 16k)`；`context_high_water_tokens=0` 表示自动，1M 窗口约 856k；正数是成本上限。
+- 压缩时由同一个模型在完整对话末尾写一份比赛 checkpoint，复用正常请求的 prompt 缓存。
+- 摘要请求使用 `tool_choice="none"`，不执行动作工具；摘要 usage 单独记录，不混进当前 turn。
+- 系统提示词、一条 checkpoint 和最近 `context_keep_recent_hands` 手原始消息保留；`context_keep_recent_tokens` 是初始保留上限。压缩后如果低于低水位，会把已经总结过的更早手牌原样加回来，直到接近 `context_low_water_tokens`，所以最终原始区可能超过 `keep_recent_tokens`，但不会超过低水位。
+- 压缩时由代码自动调用历史统计并注入摘要提示词，但 checkpoint 只写结论、关键手牌和调整；统计数字留给 `research_history`，不要复制统计表或 JSON。
+- 摘要失败先写确定性兜底 checkpoint；连续失败 2 次回退 `compact_slim`。
+- 摘要请求被 `context_length` 拒绝时，先试完整前缀，再试保留尾巴之前的历史，最后扁平化并按 85/70/50/35% 缩小。
+
+复现：
+
+```bash
+python scripts/preview_context.py --policy checkpoint --hands 10 --seed 2026 \
+  --high-water 0 --low-water 50000 --keep-hands 3 --keep-tokens 20000 --stream-usage
+```
+
+输出仍在 `tmp/context_preview/`。重点看：
+
+- `context_summary_end` 的摘要调用 input/output/cache token；
+- `compactions` 和 `summary_calls`；
+- 压缩后第一条请求的缓存命中；
+- fallback 次数；
+- 平均每手费用和终局上下文。
+
+目前还没有 checkpoint 的长样本实测数据，不要把默认值和费用当成已验证结论。

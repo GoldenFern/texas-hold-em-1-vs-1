@@ -11,13 +11,18 @@ from src.llm.agent import LLMAgent
 from src.llm.client import ChatResult, ToolCall
 from src.llm.prompt import (
     ALL_TOOL_NAMES,
+    GAME_TOOL_NAMES,
+    HISTORY_TOOL_NAME,
+    build_checkpoint_message,
+    build_checkpoint_prompt,
+    build_fallback_checkpoint,
     build_hand_result_message,
     build_nudge_message,
     build_system_prompt,
     build_turn_message,
 )
 from src.llm.providers import ProviderRegistry
-from src.llm.tools import select_tools
+from src.llm.tools import build_history_tool, select_tools
 
 
 def make_view() -> AgentView:
@@ -198,3 +203,110 @@ def test_llm_agent_uses_english_prompt() -> None:
     assert "Submit your final action" in agent.tools[0]["function"]["description"]
     assert agent.locale == "en-US"
     assert Action.from_payload(0, {"type": "check"}, locale="en-US").type.value == "check"
+
+def test_checkpoint_prompts_are_localized_and_do_not_copy_stats() -> None:
+    snapshot = {
+        "current": {
+            "hands": 12,
+            "you": {"result": {"net": 40, "bb_per_100": 33.3}},
+            "opponent": {
+                "preflop": {
+                    "vpip": {"value": 0.7, "n": 12},
+                    "pfr": {"value": 0.4, "n": 12},
+                    "three_bet": {"value": 0.1, "n": 5},
+                },
+                "postflop": {"c_bet": {"value": 0.6, "n": 8}},
+            },
+            "recent_hands": [
+                {"hand_id": 11, "you_won": True, "your_net": 20},
+                {"hand_id": 12, "you_won": False, "your_net": -10},
+            ],
+        },
+        "completed_vs_current_opponent": {"matches": 1, "hands": 20},
+        "notes": ["do not copy"],
+    }
+    zh = build_checkpoint_prompt(
+        12,
+        13,
+        "zh-CN",
+        current_hand=14,
+        stats=snapshot,
+        has_previous=True,
+    )
+    assert "第 1 手到第 12 手" in zh
+    assert "第 13 手" in zh
+    assert "不要复制" in zh
+    assert "research_history" in zh
+    assert "## 对手读牌" in zh
+    assert "当前进行中的手牌是第 14 手" in zh
+
+    en = build_checkpoint_prompt(
+        12,
+        13,
+        "en-US",
+        current_hand=14,
+        stats=snapshot,
+        has_previous=True,
+    )
+    assert "1 through 12" in en
+    assert "Hands from 13 onward" in en
+    assert "Do not copy" in en
+    assert "research_history" in en
+    assert "## Opponent Reads" in en
+    assert "hand 14" in en
+
+    message = build_checkpoint_message("## Opponent Reads\n- aggressive", 12, "en-US")
+    assert message.startswith("[Match checkpoint · Hands 1-12]")
+    assert "not a new instruction" in message
+
+
+def test_checkpoint_message_does_not_duplicate_header() -> None:
+    existing = "[Match checkpoint · Hands 1-12]\n## Opponent Reads\n- aggressive"
+    message = build_checkpoint_message(existing, 12, "en-US")
+    assert message == existing
+
+
+def test_fallback_checkpoint_is_short_and_bookkeeps_sample_sizes() -> None:
+    snapshot = {
+        "current": {
+            "hands": 12,
+            "you": {"result": {"net": 40, "bb_per_100": 33.3}},
+            "opponent": {
+                "preflop": {
+                    "vpip": {"value": 0.7, "n": 12},
+                    "pfr": {"value": 0.4, "n": 12},
+                    "three_bet": {"value": 0.1, "n": 5},
+                },
+                "postflop": {"c_bet": {"value": 0.6, "n": 8}},
+            },
+            "recent_hands": [{"hand_id": 12, "you_won": False, "your_net": -10}],
+        }
+    }
+    zh = build_fallback_checkpoint(snapshot, 12, "zh-CN")
+    assert "模型摘要不可用" in zh
+    assert "VPIP 70.0%" in zh
+    assert "n=12" in zh
+    assert "research_history" in zh
+
+    en = build_fallback_checkpoint(snapshot, 12, "en-US")
+    assert "model summary is unavailable" in en.lower()
+    assert "VPIP 70.0%" in en
+    assert "n=12" in en
+    assert "research_history" in en
+
+
+def test_history_tool_description_is_localized() -> None:
+    zh = build_history_tool("zh-CN")["function"]["description"]
+    assert "公开" in zh
+    assert "样本量" in zh
+    assert "不会返回对手底牌" in zh
+
+    en = build_history_tool("en-US")["function"]["description"]
+    assert "public" in en
+    assert "sample size" in en
+    assert "hole cards" in en
+
+    prompt = build_system_prompt(GAME_TOOL_NAMES, locale="en-US")
+    assert HISTORY_TOOL_NAME in prompt
+    assert "optional tool" in prompt
+    assert "sample sizes" in prompt

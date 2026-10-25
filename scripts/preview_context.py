@@ -44,22 +44,27 @@ from scripts.eval_llm_vs_bot import DEFAULT_BOT_MODEL, RetryingClient
 from src.agents.base import AgentView
 from src.agents.project_bot import ProjectBot
 from src.analysis.hand_distribution import HandDistributionAnalyzer
+from src.analysis.history import HistoryStats, build_public_hand_record
 from src.engine.actions import Action, ActionType
 from src.engine.heads_up import HeadsUpGame, Street
 from src.i18n import tr
 from src.llm.agent import LLMAgent
 from src.llm.client import LLMClient
-from src.llm.prompt import ALL_TOOL_NAMES, build_system_prompt
+from src.llm.prompt import GAME_TOOL_NAMES, build_system_prompt
 from src.llm.providers import ProviderRegistry
 from src.llm.tools import select_tools
 
-AUX_TOOL_NAMES = tuple(name for name in ALL_TOOL_NAMES if name != "apply_action")
+AUX_TOOL_NAMES = tuple(name for name in GAME_TOOL_NAMES if name != "apply_action")
 MAX_ACTIONS_PER_HAND = 500
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Preview context policies in a short match.")
-    parser.add_argument("--policy", default="compact_slim", choices=("legacy", "full", "compact", "compact_slim"))
+    parser.add_argument(
+        "--policy",
+        default="compact_slim",
+        choices=("legacy", "full", "compact", "compact_slim", "checkpoint"),
+    )
     parser.add_argument("--hands", type=int, default=10)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--provider", default="deepseek")
@@ -77,6 +82,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--high-water", type=int, default=30000)
     parser.add_argument("--low-water", type=int, default=12000)
     parser.add_argument("--keep-hands", type=int, default=2)
+    parser.add_argument("--keep-tokens", type=int, default=20000)
+    parser.add_argument("--buffer", type=int, default=0)
+    parser.add_argument("--summary-max-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--summary-retries",
+        default="0.85,0.7,0.5,0.35",
+        help="Comma-separated shrink steps for checkpoint summary retries.",
+    )
     parser.add_argument(
         "--max-context",
         type=int,
@@ -205,8 +218,14 @@ def play_session(args: argparse.Namespace) -> dict:
             "context_high_water_tokens": args.high_water,
             "context_low_water_tokens": args.low_water,
             "context_keep_recent_hands": args.keep_hands,
-            "state_detail": "compact" if args.policy == "compact_slim" else "full",
-            "tool_detail": "compact" if args.policy == "compact_slim" else "full",
+            "context_keep_recent_tokens": args.keep_tokens,
+            "context_buffer_tokens": args.buffer,
+            "context_summary_max_tokens": args.summary_max_tokens,
+            "context_summary_retries": [
+                float(item)
+                for item in str(args.summary_retries).split(",")
+                if item.strip()
+            ],
             "max_context_tokens_estimate": args.max_context,
         }
     )
@@ -256,6 +275,42 @@ def play_session(args: argparse.Namespace) -> dict:
         attempts=args.llm_retries,
         backoff=args.retry_backoff,
     )
+    history_stats = HistoryStats()
+
+    def history_provider(
+        seat: int,
+        *,
+        scope: str = "both",
+        last_hands: int = 20,
+        focus: str = "all",
+        checkpoint: bool = False,
+    ) -> dict:
+        match_info = {
+            "small_blind": game.small_blind,
+            "big_blind": game.big_blind,
+            "your_chips": game.players[seat].chips,
+            "opponent_chips": game.players[1 - seat].chips,
+        }
+        if checkpoint:
+            return history_stats.checkpoint_snapshot(
+                [],
+                seat,
+                hero_identity="llm:deepseek:deepseek-flash:DeepSeek",
+                opponent_identity="bot:project_dqn:Project DQN",
+                last_hands=5,
+                match_info=match_info,
+            )
+        return history_stats.report(
+            [],
+            seat,
+            scope=scope,
+            last_hands=last_hands,
+            focus=focus,
+            hero_identity="llm:deepseek:deepseek-flash:DeepSeek",
+            opponent_identity="bot:project_dqn:Project DQN",
+            match_info=match_info,
+        )
+
     agent = LLMAgent(
         seat=0,
         name="DeepSeek",
@@ -265,8 +320,9 @@ def play_session(args: argparse.Namespace) -> dict:
         analyzer=HandDistributionAnalyzer(),
         validate_action=lambda action: game.preview(action, locale="zh-CN"),
         runtime=runtime,
-        tools=select_tools(ALL_TOOL_NAMES, locale="zh-CN"),
-        system_prompt=build_system_prompt(ALL_TOOL_NAMES, locale="zh-CN"),
+        tools=select_tools(GAME_TOOL_NAMES, locale="zh-CN"),
+        system_prompt=build_system_prompt(GAME_TOOL_NAMES, locale="zh-CN"),
+        history_provider=history_provider,
         locale="zh-CN",
     )
 
@@ -309,8 +365,10 @@ def play_session(args: argparse.Namespace) -> dict:
         result = game.result
         if result is None:
             raise RuntimeError("hand finished without a result")
-        history.append(result)
-        agent.on_hand_finished(result)
+        record = build_public_hand_record(game, result, {})
+        history.append(record)
+        history_stats.add(record)
+        agent.on_hand_finished(record)
         hand_events = events[event_start:]
         usage = {
             key: 0
@@ -323,16 +381,25 @@ def play_session(args: argparse.Namespace) -> dict:
             )
         }
         estimated = 0
+        summary_calls = 0
         for event in hand_events:
-            if event.get("type") != "message_end" or not event.get("usage"):
+            if event.get("type") not in ("message_end", "context_summary_end"):
+                continue
+            if not event.get("usage"):
                 continue
             for key in usage:
                 usage[key] += int(event["usage"].get(key, 0))
-            estimated += int(bool(event.get("estimated_usage")))
+            if event.get("type") == "message_end":
+                estimated += int(bool(event.get("estimated_usage")))
+            else:
+                summary_calls += int(event.get("attempts", 0) or 0)
         players = {item["seat"]: item for item in result.get("players", [])}
         net = int(players.get(0, {}).get("net", 0))
         turns = sum(1 for event in hand_events if event.get("type") == "turn_start")
-        api_calls = sum(1 for event in hand_events if event.get("type") == "llm_request")
+        api_calls = (
+            sum(1 for event in hand_events if event.get("type") == "llm_request")
+            + summary_calls
+        )
         auto_turns = sum(
             1
             for event in hand_events
@@ -374,6 +441,7 @@ def play_session(args: argparse.Namespace) -> dict:
             "net_llm": net,
             "turns": turns,
             "api_calls": api_calls,
+            "summary_calls": summary_calls,
             "aux_tool_calls": tool_calls,
             "auto_turns": auto_turns,
             "fallbacks": fallbacks,
@@ -531,6 +599,7 @@ def summarize(session: dict, requests: Sequence[dict]) -> dict:
         "output_tokens_per_hand": round(total_output / len(hands), 1) if hands else 0.0,
         "cost_usd": round(total_cost, 6),
         "api_calls": sum(int(row["api_calls"]) for row in hands),
+        "summary_calls": sum(int(row.get("summary_calls", 0)) for row in hands),
         "turns": sum(int(row["turns"]) for row in hands),
         "aux_tool_calls": sum(int(row["aux_tool_calls"]) for row in hands),
         "auto_turns": sum(int(row["auto_turns"]) for row in hands),
@@ -553,7 +622,7 @@ def write_outputs(session: dict, output: Path) -> dict:
     hand_fields = [
         "policy", "hand_index", "hand_id", "seed", "button", "hole_llm", "board",
         "reason", "winner_seats", "pot", "net_llm", "turns", "api_calls",
-        "aux_tool_calls", "auto_turns", "fallbacks", "compactions", "trims", "context_start",
+        "summary_calls", "aux_tool_calls", "auto_turns", "fallbacks", "compactions", "trims", "context_start",
         "context_end", "messages_end", "rebuy_llm", "rebuy_bot", "duration_sec",
         "estimated_usage_messages", "input_tokens", "cached_input_tokens",
         "cache_miss_input_tokens", "output_tokens", "reasoning_tokens",
@@ -637,6 +706,7 @@ def write_outputs(session: dict, output: Path) -> dict:
         f"| reasoning tokens | {summary['total_reasoning_tokens']} |",
         f"| cost USD | ${summary['cost_usd']:.4f} |",
         f"| API calls | {summary['api_calls']} |",
+        f"| summary calls | {summary['summary_calls']} |",
         f"| turns | {summary['turns']} |",
         f"| auxiliary tools | {summary['aux_tool_calls']} |",
         f"| auto turns | {summary['auto_turns']} |",

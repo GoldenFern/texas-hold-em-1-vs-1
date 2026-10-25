@@ -40,6 +40,21 @@ def test_resolve_tool_names_rejects_unknown_tools() -> None:
         resolve_tool_names("estimate_equity,not_a_tool")
 
 
+def test_resolve_tool_names_history_group() -> None:
+    assert resolve_tool_names("history") == (
+        "estimate_hand_probabilities",
+        "estimate_equity",
+        "get_random_number",
+        "call_ev",
+        "research_history",
+        "apply_action",
+    )
+    assert resolve_tool_names("research_history") == (
+        "research_history",
+        "apply_action",
+    )
+
+
 def test_tool_recommendation_only_mentions_available_tools() -> None:
     text = build_tool_recommendation(("estimate_equity", "apply_action"))
     assert "estimate_equity" in text
