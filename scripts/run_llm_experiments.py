@@ -74,8 +74,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--reasoning-effort", default="low")
     parser.add_argument("--experiment", choices=("all", "a", "b"), default="all")
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--llm-retries", type=int, default=5)
-    parser.add_argument("--retry-backoff", type=float, default=1.0)
+    parser.add_argument("--llm-retries", type=int, default=10)
+    parser.add_argument("--retry-backoff", type=float, default=2.0)
     parser.add_argument("--timeout", type=float, default=45.0)
     parser.add_argument("--connect-timeout", type=float, default=8.0)
     parser.add_argument(

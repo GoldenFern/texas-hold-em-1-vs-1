@@ -2,6 +2,7 @@
 import { computed, onUnmounted, ref, watch } from "vue";
 import AppIcon from "./AppIcon.vue";
 import ReasoningBlock from "./ReasoningBlock.vue";
+import RetryNotice from "./RetryNotice.vue";
 import ToolCard from "./ToolCard.vue";
 import { actionLabel, chips, duration, secondsSince, streetLabel, tokenText } from "../format";
 import { t } from "../i18n";
@@ -49,6 +50,7 @@ const elapsed = computed(() => {
 });
 const statusText = computed(() => {
   if (props.turn.status === "running") {
+    if (props.turn.retry) return t("console.statusRetrying");
     return props.live ? t("console.statusThinking") : t("console.statusRunning");
   }
   if (props.turn.auto) return t("console.statusAuto");
@@ -117,6 +119,8 @@ const streetClass = computed(() => props.turn.header.street || "preflop");
             <span></span><span></span><span></span>
           </div>
 
+          <div v-if="message.incomplete" class="incomplete-chip">{{ t("turn.incomplete") }}</div>
+
           <ToolCard v-for="tool in message.tools" :key="`${tool.index}-${tool.callId}`" :tool="tool" />
 
           <div v-if="message.error" class="message-error">
@@ -134,6 +138,8 @@ const streetClass = computed(() => props.turn.header.street || "preflop");
           </div>
         </div>
       </div>
+
+      <RetryNotice v-if="turn.retry" :retry="turn.retry" />
 
       <div v-if="turn.notes.length" class="notes">
         <div v-for="(note, index) in turn.notes" :key="index" class="note" :class="note.level">
@@ -393,6 +399,20 @@ const streetClass = computed(() => props.turn.header.street || "preflop");
   padding: 8px 0 10px;
   font-size: calc(10.5px * var(--type-scale));
   color: var(--faint);
+}
+
+.incomplete-chip {
+  display: inline-flex;
+  align-items: center;
+  margin: 2px 0 5px;
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid rgba(231, 179, 94, 0.3);
+  background: rgba(231, 179, 94, 0.08);
+  color: var(--amber);
+  font-size: calc(7.5px * var(--type-scale));
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
 .message-error {

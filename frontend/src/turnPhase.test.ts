@@ -109,4 +109,21 @@ describe("turnPendingLabel", () => {
       ),
     ).toBe("等待模型继续…");
   });
+
+  it("shows a retry phase while the request is backing off", () => {
+    expect(
+      turnPendingLabel(
+        turn({
+          retry: {
+            scope: "turn",
+            attempt: 2,
+            maxRetries: 10,
+            delayMs: 4000,
+            nextAt: Date.now() + 4000,
+            message: "retry",
+          },
+        }),
+      ),
+    ).toBe("第 2 次重试中…");
+  });
 });

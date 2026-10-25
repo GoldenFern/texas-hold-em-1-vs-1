@@ -12,6 +12,9 @@ import type { TurnView } from "./types";
  */
 export function turnPendingLabel(turn: TurnView): string {
   if (turn.status !== "running") return "";
+  if (turn.retry) {
+    return t("turnPhase.retrying", { attempt: turn.retry.attempt });
+  }
 
   const last = turn.messages[turn.messages.length - 1];
   const runningTool = last?.tools.find((tool) => tool.status === "running");

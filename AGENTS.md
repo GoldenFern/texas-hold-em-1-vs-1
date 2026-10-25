@@ -127,6 +127,19 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - 客户端在 400 时会自动去掉可选厂商字段（`thinking`、`reasoning_effort`、`tool_stream`、`stream_options`、`preserve_thinking`、`reasoning_content`）重试一次。
 - `LLMAgent` 不拥有引擎；通过 `validate_action` 回调让 session 用 `game.preview()` 在副本上校验。
 
+## 重试策略（对齐 OpenCode）
+
+- 默认 10 次重试，退避间隔 2s、4s、8s，之后每次 10s，带 20% 抖动；`Retry-After` 最长封顶 15 分钟，传输超时最多重试 3 次。`retry_deadline_seconds` 保留为可选总时限，默认 0（不额外限制）。
+- 重试预算按逻辑步骤共享，透明请求重试和部分输出的续写共用同一个 `RetryBudget`，不能各自重试 10 次。传输重试不消耗 `max_steps_per_turn`。
+- 输出前断流：整段重试，保留同一个 assistant `message_id`。输出后断流：保留半截 assistant 消息并标为失败，追加 `agent.continuation.incomplete` 用户提示，新建 assistant `message_id` 继续；`partial_retry_mode=restart` 可改为丢弃半截消息后整段重试。
+- 已经收到的完整 `apply_action` 直接校验并执行；截断或多个 `apply_action` 只执行第一个合法动作。截断参数不猜，回工具错误让模型重发。
+- 传输失败、incomplete stream、输出上限不消耗“连续没调用工具”的失败次数。重试耗尽后的自动动作按 check > fold，不再自动跟注；模型连续非法动作仍保留 call 优先。
+- `finish_reason="length"` 走单独的续写路径，最多两次；`content_filter` 直接 fallback。干净 EOF 或只有 `[DONE]` 但缺少 `finish_reason` 视为 incomplete；确认某个中转不返回 `finish_reason` 时，在该厂商的 `request` 里把 `require_finish_reason` 设为 `false`，不要改全局默认。
+- `x-should-retry: true/false` 可以覆盖重试判定；`LLMClient` 支持可选的 `retry_hook`，测试用它强制停止重试或把延迟设为 0。
+- 前端 `retry_scheduled` 显示 OpenCode 风格的重试卡片：错误信息截断到 80 字符，标题保留全文，每秒刷新 `Attempt N - retrying in Xs`；`message_end.incomplete` 给消息加“不完整”标记。
+- checkpoint 摘要复用同一重试策略，模板纠正和网络重试共享预算；上下文过长按 85%、70%、50%、35% 缩小；`length` 和 `content-filter` 不重试、不提交草稿；模板不完整只 nudge 一次；预算耗尽后使用确定性兜底 checkpoint。
+- 相关测试：`tests/test_llm_retry.py`、`tests/test_llm_client.py`、`tests/test_llm_agent.py`；前端 `RetryNotice.test.ts`、`store.test.ts`、`turnPhase.test.ts`。
+
 ## 上下文策略（默认 checkpoint / fresh）
 
 - `LLMAgent` 的 `runtime.context_policy` 支持 `legacy` / `full` / `compact` / `compact_slim` / `checkpoint`。当前默认已切到 `checkpoint`，`final_talk_context` 默认 `fresh`；`compact_slim` 是 checkpoint 连续失败后的回退，`legacy` / `full` 只作为实验基线。

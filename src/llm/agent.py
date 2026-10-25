@@ -8,7 +8,7 @@ import random
 import threading
 import time
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Callable, List, Optional, Sequence
 
 from src.agents.base import AgentView, BaseAgent
@@ -26,6 +26,7 @@ from src.engine.evaluator import hand_category_name
 from src.i18n import normalize_locale, tr
 
 from .client import LLMClient, LLMError, ToolCall, estimate_tokens
+from .retry import RetryBudget, RetryPolicy
 from .context import (
     CheckpointCut,
     ContextSettings,
@@ -91,6 +92,15 @@ class EquityBudgetError(RuntimeError):
     """Raised when the per-turn equity budget is exhausted."""
 
 
+@dataclass
+class ResumeOutcome:
+    """Result of resolving an incomplete or output-limited reply."""
+
+    action: Optional[Action] = None
+    length_continuations: int = 0
+    reused_step: bool = False
+
+
 class LLMAgent(BaseAgent):
     """An agent that keeps a full conversation and decides through tools."""
 
@@ -130,6 +140,14 @@ class LLMAgent(BaseAgent):
         self.history_provider = history_provider
         self.max_steps = int(runtime.get("max_steps_per_turn", 12))
         self.max_failures = int(runtime.get("max_consecutive_failures", 3))
+        self.retry_policy = RetryPolicy.from_runtime(runtime)
+        self.partial_retry_mode = str(
+            runtime.get("partial_retry_mode", "continue")
+        ).strip().lower()
+        if self.partial_retry_mode not in ("continue", "restart"):
+            self.partial_retry_mode = "continue"
+        self._incomplete_streams = 0
+        self._retry_scheduled = 0
         self.require_estimate_first = bool(runtime.get("require_estimate_first", False))
         self.require_estimate_each_turn = bool(
             runtime.get("require_estimate_each_turn", False)
@@ -546,6 +564,12 @@ class LLMAgent(BaseAgent):
             "usage": dict(self.total_usage),
             "context_usage": dict(self.context_usage),
             "last_error": self.last_error,
+            "retry": {
+                "mode": self.partial_retry_mode,
+                "max_retries": self.retry_policy.max_retries,
+                "scheduled": self._retry_scheduled,
+                "incomplete_streams": self._incomplete_streams,
+            },
             "table_talk": TABLE_TALK_TOOL_NAME in self.tool_names,
             "history_tool": HISTORY_TOOL_NAME in self.tool_names,
             "context": {
@@ -582,6 +606,11 @@ class LLMAgent(BaseAgent):
         usage_total = {key: 0 for key in self.total_usage}
         steps = 0
         failures = 0
+        length_continuations = 0
+        retry_same_step = False
+        continuation_start: Optional[int] = None
+        continuation_active = False
+        continuation_recovery_used = False
         self.turn_count += 1
         self._estimated_this_turn = False
         self._estimate_calls_this_turn = 0
@@ -632,6 +661,9 @@ class LLMAgent(BaseAgent):
         while steps < self.max_steps:
             if self._cancel_event.is_set():
                 return Action(view.seat, ActionType.FOLD, source="llm", auto=True)
+            if not retry_same_step:
+                budget = RetryBudget(self.retry_policy)
+            retry_same_step = False
             steps += 1
             self._prepare_context(emit)
             message_id = uuid.uuid4().hex[:12]
@@ -655,6 +687,8 @@ class LLMAgent(BaseAgent):
             )
 
             def on_stream(event: dict) -> None:
+                if event.get("type") == "retry_scheduled":
+                    self._retry_scheduled += 1
                 event["turn_id"] = turn_id
                 event["message_id"] = message_id
                 emit(event)
@@ -667,12 +701,42 @@ class LLMAgent(BaseAgent):
                     self.params,
                     on_stream,
                     cancel=self._cancel_event.is_set,
+                    retry_budget=budget,
                 )
                 self.last_error = ""
             except LLMError as exc:
                 if exc.kind == "cancelled":
                     return Action(view.seat, ActionType.FOLD, source="llm", auto=True)
-                if exc.kind == "context_length":
+                if (
+                    continuation_active
+                    and not continuation_recovery_used
+                    and exc.kind in (
+                        "param",
+                        "invalid_request",
+                        "unknown",
+                        "context_length",
+                        "payload_too_large",
+                    )
+                ):
+                    if (
+                        continuation_start is not None
+                        and 0 <= continuation_start <= len(self.messages)
+                    ):
+                        del self.messages[continuation_start:]
+                    continuation_active = False
+                    continuation_recovery_used = True
+                    retry_same_step = True
+                    steps -= 1
+                    emit(
+                        {
+                            "type": "note",
+                            "level": "warn",
+                            "turn_id": turn_id,
+                            "text": self._t("agent.note.continuation_rebuild"),
+                        }
+                    )
+                    continue
+                if exc.kind in ("context_length", "payload_too_large"):
                     before = len(self.messages)
                     if self.context.uses_checkpoint and not self._checkpoint_disabled:
                         self._maybe_checkpoint(emit, mid_hand=True, force=True)
@@ -692,6 +756,8 @@ class LLMAgent(BaseAgent):
                                 "estimated_usage": False,
                             }
                         )
+                        retry_same_step = True
+                        steps -= 1
                         continue
                 self.last_error = str(exc)
                 emit(
@@ -723,6 +789,9 @@ class LLMAgent(BaseAgent):
                     usage_total,
                     reason=self._t("agent.llm.failed", kind=exc.kind),
                     allow_check=True,
+                    allow_call=False,
+                    reason_code=exc.kind or "llm_error",
+                    auto_kind="api_error",
                 )
             except Exception as exc:  # noqa: BLE001
                 self.last_error = f"{type(exc).__name__}: {exc}"
@@ -755,6 +824,9 @@ class LLMAgent(BaseAgent):
                     usage_total,
                     reason=self._t("agent.llm.exception"),
                     allow_check=True,
+                    allow_call=False,
+                    reason_code="exception",
+                    auto_kind="api_error",
                 )
 
             for key in usage_total:
@@ -762,6 +834,19 @@ class LLMAgent(BaseAgent):
                 usage_total[key] += amount
                 self.total_usage[key] = self.total_usage.get(key, 0) + amount
 
+            length_stop = result.finish_reason == "length"
+            if not length_stop:
+                length_continuations = 0
+            incomplete = bool(
+                result.incomplete
+                or length_stop
+                or result.finish_reason == "content_filter"
+            )
+            if result.incomplete:
+                self._incomplete_streams += 1
+            if not incomplete:
+                continuation_active = False
+                continuation_start = None
             emit(
                 {
                     "type": "message_end",
@@ -773,24 +858,115 @@ class LLMAgent(BaseAgent):
                     "usage": dict(result.usage),
                     "estimated_usage": bool(result.estimated_usage),
                     "latency_ms": round(result.latency_ms, 1),
+                    "error": bool(incomplete),
+                    "incomplete": bool(incomplete),
+                    "incomplete_reason": result.incomplete_reason,
                     "tool_calls": [
                         {
                             "index": index,
                             "call_id": call.id,
                             "name": call.name,
                             "arguments": call.arguments,
+                            "complete": bool(call.complete),
                         }
                         for index, call in enumerate(result.tool_calls)
                     ],
                 }
             )
 
+            if (
+                result.finish_reason == "content_filter"
+                or result.incomplete_reason == "content_filter"
+            ):
+                return self._fallback(
+                    view,
+                    emit,
+                    turn_id,
+                    started,
+                    steps,
+                    usage_total,
+                    reason=self._t("agent.reason.content_filter"),
+                    allow_check=True,
+                    allow_call=False,
+                    reason_code="content_filter",
+                    auto_kind="content_filter",
+                )
+
+            action_hint = (
+                self._find_valid_action(view, result)
+                if (incomplete or length_stop)
+                else None
+            )
+            if (
+                incomplete
+                and not length_stop
+                and action_hint is None
+                and self.partial_retry_mode == "restart"
+            ):
+                decision = budget.next_retry("incomplete_stream", retryable=True)
+                if not decision.retry:
+                    return self._fallback(
+                        view,
+                        emit,
+                        turn_id,
+                        started,
+                        steps,
+                        usage_total,
+                        reason=self._t("agent.reason.incomplete"),
+                        allow_check=True,
+                        allow_call=False,
+                        reason_code="incomplete_stream",
+                        auto_kind="incomplete",
+                    )
+                self._emit_retry(
+                    emit,
+                    turn_id,
+                    message_id,
+                    decision,
+                    "incomplete_stream",
+                    scope="turn",
+                )
+                if not budget.wait(decision.delay, self._cancel_event.is_set):
+                    return Action(view.seat, ActionType.FOLD, source="llm", auto=True)
+                steps -= 1
+                retry_same_step = True
+                continue
+
+            if incomplete and not continuation_active:
+                continuation_start = len(self.messages)
             self.messages.append(
-                result.assistant_message(bool(self.spec.request.get("reasoning_echo", False)))
+                result.assistant_message(
+                    bool(self.spec.request.get("reasoning_echo", False)),
+                    lower_reasoning=bool(
+                        incomplete and not length_stop and not result.tool_calls
+                    ),
+                )
             )
             self._update_context_anchor(result)
+            soft_failures = bool(incomplete or length_stop)
 
             if not result.tool_calls:
+                if incomplete or length_stop:
+                    resume = self._resume_partial(
+                        view,
+                        emit,
+                        turn_id,
+                        started,
+                        steps,
+                        usage_total,
+                        budget,
+                        message_id,
+                        length_stop=length_stop,
+                        length_continuations=length_continuations,
+                    )
+                    if resume.action is not None:
+                        return resume.action
+                    length_continuations = resume.length_continuations
+                    if resume.reused_step:
+                        steps -= 1
+                        retry_same_step = True
+                    continuation_active = True
+                    continue
                 failures += 1
                 emit(
                     {
@@ -804,7 +980,7 @@ class LLMAgent(BaseAgent):
                         ),
                     }
                 )
-                if failures >= self.max_failures:
+                if failures >= self.max_failures and not soft_failures:
                     return self._fallback(
                         view,
                         emit,
@@ -813,6 +989,8 @@ class LLMAgent(BaseAgent):
                         steps,
                         usage_total,
                         reason=self._t("agent.reason.no_action"),
+                        reason_code="no_action",
+                        auto_kind="no_action",
                     )
                 self.messages.append(
                     {
@@ -825,6 +1003,7 @@ class LLMAgent(BaseAgent):
                 continue
 
             chosen: Optional[Action] = None
+            failures_before = failures
             for index, call in enumerate(result.tool_calls):
                 if chosen is not None:
                     self._append_tool_error(
@@ -867,7 +1046,7 @@ class LLMAgent(BaseAgent):
                         turn_id,
                         index,
                     )
-                    if failures >= self.max_failures:
+                    if failures >= self.max_failures and not soft_failures:
                         return self._fallback(
                             view,
                             emit,
@@ -876,13 +1055,15 @@ class LLMAgent(BaseAgent):
                             steps,
                             usage_total,
                             reason=self._t("agent.reason.invalid_action"),
+                            reason_code="invalid_action",
+                            auto_kind="invalid_action",
                         )
                     continue
 
                 if call.name == "estimate_hand_probabilities":
                     if not self._handle_estimate(view, call, parsed, emit, turn_id, index, tool_started):
                         failures += 1
-                        if failures >= self.max_failures:
+                        if failures >= self.max_failures and not soft_failures:
                             return self._fallback(
                                 view,
                                 emit,
@@ -891,13 +1072,15 @@ class LLMAgent(BaseAgent):
                                 steps,
                                 usage_total,
                                 reason=self._t("agent.reason.invalid_action"),
+                                reason_code="invalid_action",
+                                auto_kind="invalid_action",
                             )
                     continue
 
                 if call.name == "estimate_equity":
                     if not self._handle_equity(view, call, parsed, emit, turn_id, index, tool_started):
                         failures += 1
-                        if failures >= self.max_failures:
+                        if failures >= self.max_failures and not soft_failures:
                             return self._fallback(
                                 view,
                                 emit,
@@ -906,13 +1089,15 @@ class LLMAgent(BaseAgent):
                                 steps,
                                 usage_total,
                                 reason=self._t("agent.reason.invalid_action"),
+                                reason_code="invalid_action",
+                                auto_kind="invalid_action",
                             )
                     continue
 
                 if call.name == "call_ev":
                     if not self._handle_call_ev(view, call, parsed, emit, turn_id, index, tool_started):
                         failures += 1
-                        if failures >= self.max_failures:
+                        if failures >= self.max_failures and not soft_failures:
                             return self._fallback(
                                 view,
                                 emit,
@@ -921,13 +1106,15 @@ class LLMAgent(BaseAgent):
                                 steps,
                                 usage_total,
                                 reason=self._t("agent.reason.invalid_action"),
+                                reason_code="invalid_action",
+                                auto_kind="invalid_action",
                             )
                     continue
 
                 if call.name == "get_random_number":
                     if not self._handle_random(call, parsed, emit, turn_id, index, tool_started):
                         failures += 1
-                        if failures >= self.max_failures:
+                        if failures >= self.max_failures and not soft_failures:
                             return self._fallback(
                                 view,
                                 emit,
@@ -936,6 +1123,8 @@ class LLMAgent(BaseAgent):
                                 steps,
                                 usage_total,
                                 reason=self._t("agent.reason.invalid_action"),
+                                reason_code="invalid_action",
+                                auto_kind="invalid_action",
                             )
                     continue
 
@@ -974,7 +1163,7 @@ class LLMAgent(BaseAgent):
                             turn_id,
                             index,
                         )
-                        if failures >= self.max_failures:
+                        if failures >= self.max_failures and not soft_failures:
                             return self._fallback(
                                 view,
                                 emit,
@@ -983,6 +1172,8 @@ class LLMAgent(BaseAgent):
                                 steps,
                                 usage_total,
                                 reason=self._t("agent.reason.invalid_action"),
+                                reason_code="invalid_action",
+                                auto_kind="invalid_action",
                             )
                         continue
 
@@ -1044,7 +1235,7 @@ class LLMAgent(BaseAgent):
                             index,
                             extra=self._constraint_payload(view),
                         )
-                        if failures >= self.max_failures:
+                        if failures >= self.max_failures and not soft_failures:
                             return self._fallback(
                                 view,
                                 emit,
@@ -1053,6 +1244,8 @@ class LLMAgent(BaseAgent):
                                 steps,
                                 usage_total,
                                 reason=self._t("agent.reason.invalid_action"),
+                                reason_code="invalid_action",
+                                auto_kind="invalid_action",
                             )
                         continue
 
@@ -1073,7 +1266,7 @@ class LLMAgent(BaseAgent):
                             index,
                             extra=self._constraint_payload(view),
                         )
-                        if failures >= self.max_failures:
+                        if failures >= self.max_failures and not soft_failures:
                             return self._fallback(
                                 view,
                                 emit,
@@ -1082,6 +1275,8 @@ class LLMAgent(BaseAgent):
                                 steps,
                                 usage_total,
                                 reason=self._t("agent.reason.invalid_action"),
+                                reason_code="invalid_action",
+                                auto_kind="invalid_action",
                             )
                         continue
 
@@ -1111,6 +1306,29 @@ class LLMAgent(BaseAgent):
                 )
                 return chosen
 
+            if incomplete or length_stop:
+                failures = failures_before
+                resume = self._resume_partial(
+                    view,
+                    emit,
+                    turn_id,
+                    started,
+                    steps,
+                    usage_total,
+                    budget,
+                    message_id,
+                    length_stop=length_stop,
+                    length_continuations=length_continuations,
+                )
+                if resume.action is not None:
+                    return resume.action
+                length_continuations = resume.length_continuations
+                if resume.reused_step:
+                    steps -= 1
+                    retry_same_step = True
+                continuation_active = True
+                continue
+
         return self._fallback(
             view,
             emit,
@@ -1119,6 +1337,8 @@ class LLMAgent(BaseAgent):
             steps,
             usage_total,
             reason=self._t("agent.reason.max_steps", max=self.max_steps),
+            reason_code="max_steps",
+            auto_kind="max_steps",
         )
 
     # ------------------------------------------------------------------
@@ -1828,6 +2048,158 @@ class LLMAgent(BaseAgent):
     # Fallback and context
     # ------------------------------------------------------------------
 
+    def _find_valid_action(
+        self,
+        view: AgentView,
+        result,
+    ) -> Optional[Action]:
+        """Return a fully valid action already present in a partial reply."""
+        for call in result.tool_calls:
+            if call.name != "apply_action" or not call.complete:
+                continue
+            parsed = call.parsed_arguments()
+            if not isinstance(parsed, dict):
+                continue
+            action, error = self._build_action(view, parsed)
+            if action is None or error:
+                continue
+            try:
+                validation_error = self.validate_action(action)
+            except Exception:  # noqa: BLE001
+                continue
+            if validation_error:
+                continue
+            return action
+        return None
+
+    def _emit_retry(
+        self,
+        emit,
+        turn_id: str,
+        message_id: str,
+        decision,
+        kind: str,
+        *,
+        scope: str = "turn",
+    ) -> None:
+        """Publish one retry countdown event."""
+        self._retry_scheduled += 1
+        emit(
+            {
+                "type": "retry_scheduled",
+                "scope": scope,
+                "turn_id": turn_id,
+                "message_id": message_id,
+                "attempt": decision.attempt,
+                "max_retries": self.retry_policy.max_retries,
+                "delay_ms": round(decision.delay * 1000.0),
+                "at": round(time.time() * 1000.0 + decision.delay * 1000.0),
+                "error_kind": kind,
+                "text": self._t(
+                    "agent.retry_scheduled",
+                    kind=kind,
+                    delay=f"{decision.delay:.1f}",
+                    attempt=decision.attempt,
+                ),
+            }
+        )
+
+    def _resume_partial(
+        self,
+        view: AgentView,
+        emit,
+        turn_id: str,
+        started: float,
+        steps: int,
+        usage: dict,
+        budget: RetryBudget,
+        message_id: str,
+        *,
+        length_stop: bool,
+        length_continuations: int,
+    ) -> ResumeOutcome:
+        """Continue or stop after an incomplete or output-limited reply."""
+        if length_stop:
+            if length_continuations >= 2:
+                action = self._fallback(
+                    view,
+                    emit,
+                    turn_id,
+                    started,
+                    steps,
+                    usage,
+                    reason=self._t("agent.reason.output_limit"),
+                    allow_check=True,
+                    allow_call=False,
+                    reason_code="output_limit",
+                    auto_kind="output_limit",
+                )
+                return ResumeOutcome(
+                    action=action,
+                    length_continuations=length_continuations,
+                )
+            emit(
+                {
+                    "type": "note",
+                    "level": "warn",
+                    "turn_id": turn_id,
+                    "text": self._t("agent.note.output_limit"),
+                }
+            )
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": self._t("agent.continuation.output_limit"),
+                }
+            )
+            return ResumeOutcome(
+                length_continuations=length_continuations + 1,
+                reused_step=False,
+            )
+
+        decision = budget.next_retry("incomplete_stream", retryable=True)
+        if not decision.retry:
+            action = self._fallback(
+                view,
+                emit,
+                turn_id,
+                started,
+                steps,
+                usage,
+                reason=self._t("agent.reason.incomplete"),
+                allow_check=True,
+                allow_call=False,
+                reason_code="incomplete_stream",
+                auto_kind="incomplete",
+            )
+            return ResumeOutcome(
+                action=action,
+                length_continuations=length_continuations,
+            )
+        self._emit_retry(
+            emit,
+            turn_id,
+            message_id,
+            decision,
+            "incomplete_stream",
+            scope="turn",
+        )
+        if not budget.wait(decision.delay, self._cancel_event.is_set):
+            return ResumeOutcome(
+                action=Action(view.seat, ActionType.FOLD, source="llm", auto=True),
+                length_continuations=length_continuations,
+            )
+        self.messages.append(
+            {
+                "role": "user",
+                "content": self._t("agent.continuation.incomplete"),
+            }
+        )
+        return ResumeOutcome(
+            length_continuations=length_continuations,
+            reused_step=True,
+        )
+
     def _fallback(
         self,
         view: AgentView,
@@ -1838,14 +2210,17 @@ class LLMAgent(BaseAgent):
         usage: dict,
         reason: str,
         allow_check: bool = False,
+        allow_call: bool = True,
+        reason_code: str = "",
+        auto_kind: str = "",
     ) -> Action:
         legal = set(view.legal_actions)
-        if "call" in legal:
-            action = Action(view.seat, ActionType.CALL, source="llm", auto=True)
-            note = self._t("agent.note.auto_call")
-        elif allow_check and "check" in legal:
+        if allow_check and "check" in legal:
             action = Action(view.seat, ActionType.CHECK, source="llm", auto=True)
             note = self._t("agent.note.auto_check")
+        elif allow_call and "call" in legal:
+            action = Action(view.seat, ActionType.CALL, source="llm", auto=True)
+            note = self._t("agent.note.auto_call")
         else:
             action = Action(view.seat, ActionType.FOLD, source="llm", auto=True)
             note = self._t("agent.note.auto_fold")
@@ -1869,6 +2244,8 @@ class LLMAgent(BaseAgent):
                 "usage": usage,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 1),
                 "reason": reason,
+                "reason_code": reason_code or auto_kind or "fallback",
+                "auto_kind": auto_kind or "fallback",
             }
         )
         return action
@@ -2126,15 +2503,22 @@ class LLMAgent(BaseAgent):
         filled = sum(1 for heading in headings if heading in body)
         return (filled >= 4 and not stats_dump), stats_dump
 
-    def _summary_call(
+    def _summary_stream(
         self,
         messages: Sequence[dict],
         params: dict,
-        *,
-        tool_choice: Optional[str] = "none",
+        budget: RetryBudget,
+        emit,
+        tool_choice: Optional[str],
     ):
-        """Call the model for a summary and bill usage separately."""
-        self._summary_calls += 1
+        """Call the model once, forwarding retry countdown events."""
+
+        def on_event(event: dict) -> None:
+            if event.get("type") != "retry_scheduled":
+                return
+            payload = dict(event)
+            payload["scope"] = "summary"
+            emit(payload)
 
         def run(choice: Optional[str]):
             try:
@@ -2143,30 +2527,150 @@ class LLMAgent(BaseAgent):
                     list(messages),
                     self.tools,
                     params,
-                    lambda _event: None,
+                    on_event,
                     cancel=self._cancel_event.is_set,
                     tool_choice=choice,
+                    retry_budget=budget,
                 )
             except TypeError:
-                # Older/fake clients may not accept the optional keyword.
-                return self.client.stream(
-                    self.spec,
-                    list(messages),
-                    self.tools,
-                    params,
-                    lambda _event: None,
-                    cancel=self._cancel_event.is_set,
-                )
+                # Older/fake clients may not accept the optional keywords.
+                try:
+                    return self.client.stream(
+                        self.spec,
+                        list(messages),
+                        self.tools,
+                        params,
+                        on_event,
+                        cancel=self._cancel_event.is_set,
+                        tool_choice=choice,
+                    )
+                except TypeError:
+                    return self.client.stream(
+                        self.spec,
+                        list(messages),
+                        self.tools,
+                        params,
+                        on_event,
+                        cancel=self._cancel_event.is_set,
+                    )
 
         try:
-            return run(tool_choice), None
+            return run(tool_choice)
         except LLMError as exc:
             if exc.kind == "param" and tool_choice is not None:
-                try:
-                    return run(None), None
-                except LLMError as retry_exc:
-                    return None, retry_exc
-            return None, exc
+                return run(None)
+            raise
+
+    def _emit_summary_retry(self, emit, decision, kind: str) -> None:
+        """Publish a retry countdown for a checkpoint summary request."""
+        self._retry_scheduled += 1
+        emit(
+            {
+                "type": "retry_scheduled",
+                "scope": "summary",
+                "attempt": decision.attempt,
+                "max_retries": self.retry_policy.max_retries,
+                "delay_ms": round(decision.delay * 1000.0),
+                "at": round(time.time() * 1000.0 + decision.delay * 1000.0),
+                "error_kind": kind,
+                "text": self._t(
+                    "agent.retry_scheduled",
+                    kind=kind,
+                    delay=f"{decision.delay:.1f}",
+                    attempt=decision.attempt,
+                ),
+            }
+        )
+
+    def _summary_attempt(
+        self,
+        messages: Sequence[dict],
+        params: dict,
+        budget: RetryBudget,
+        emit,
+        usage_total: dict,
+    ):
+        """Send one summary request, retrying partial drafts under the budget."""
+        while True:
+            if self._cancel_event.is_set():
+                return None, LLMError(
+                    "cancelled", self._t("client.cancelled"), retryable=False
+                )
+            self._summary_calls += 1
+            try:
+                result = self._summary_stream(
+                    messages, params, budget, emit, "none"
+                )
+            except LLMError as exc:
+                return None, exc
+            for key in usage_total:
+                usage_total[key] += int(result.usage.get(key, 0) or 0)
+            self._add_context_usage(result.usage)
+            if result.finish_reason == "length" or result.incomplete_reason == "length":
+                return None, LLMError(
+                    "summary_length",
+                    "summary reached the output token limit",
+                    retryable=False,
+                )
+            if (
+                result.finish_reason == "content_filter"
+                or result.incomplete_reason == "content_filter"
+            ):
+                return None, LLMError(
+                    "summary_content_filter",
+                    "summary was blocked by the provider",
+                    retryable=False,
+                )
+            if result.incomplete:
+                decision = budget.next_retry(
+                    "incomplete_stream", retryable=True
+                )
+                if not decision.retry:
+                    return None, LLMError(
+                        "incomplete_stream",
+                        "summary stream was interrupted",
+                        retryable=False,
+                    )
+                self._emit_summary_retry(emit, decision, "incomplete_stream")
+                if not budget.wait(decision.delay, self._cancel_event.is_set):
+                    return None, LLMError(
+                        "cancelled", self._t("client.cancelled"), retryable=False
+                    )
+                continue
+            return result, None
+
+    def _summary_send(
+        self,
+        messages: Sequence[dict],
+        params: dict,
+        budget: RetryBudget,
+        emit,
+        usage_total: dict,
+    ):
+        """Send one candidate and allow one template-correction nudge."""
+        result, error = self._summary_attempt(
+            messages, params, budget, emit, usage_total
+        )
+        if result is None:
+            return None, error, 1
+        valid, stats_dump = self._summary_valid(result.content)
+        if valid:
+            return result, None, 1
+        nudge = build_checkpoint_nudge(self.locale, stats_dump=stats_dump)
+        nudged = list(messages) + [{"role": "user", "content": nudge}]
+        retry, retry_error = self._summary_attempt(
+            nudged, params, budget, emit, usage_total
+        )
+        if retry is None:
+            return None, retry_error, 2
+        valid, _ = self._summary_valid(retry.content)
+        if valid:
+            return retry, None, 2
+        return None, LLMError(
+            "summary_invalid",
+            "summary did not match the required template",
+            retryable=False,
+        ), 2
 
     def _run_checkpoint_summary(
         self,
@@ -2183,6 +2687,7 @@ class LLMAgent(BaseAgent):
         ``context_summary_retries``.  The newest hand is never removed.
         """
         started = time.perf_counter()
+        start_calls = self._summary_calls
         params = dict(self.params)
         max_tokens = max(
             512,
@@ -2193,8 +2698,8 @@ class LLMAgent(BaseAgent):
         )
         params["max_tokens"] = max_tokens
         usage_total = {key: 0 for key in self.context_usage}
-        attempts = 0
         last_error_kind = ""
+        budget = RetryBudget(self.retry_policy)
         prompt_tokens = estimate_tokens(prompt)
         available = max(
             2_000,
@@ -2233,72 +2738,24 @@ class LLMAgent(BaseAgent):
         if not candidates:
             self._last_checkpoint_error = "no_summary_candidate"
             return None
-        max_attempts = len(self.context.summary_retry_steps) + 3
         for messages in candidates:
-            if attempts >= max_attempts or self._cancel_event.is_set():
+            if self._cancel_event.is_set():
                 break
-            result, error = self._summary_call(
-                messages, params, tool_choice="none"
+            result, error, _calls = self._summary_send(
+                messages, params, budget, emit, usage_total
             )
-            attempts += 1
-            if error is not None:
-                last_error_kind = error.kind
-                if error.kind == "cancelled":
-                    break
-                if error.kind in ("context_length", "payload_too_large"):
-                    continue
-                break
-            if result is None:
-                continue
-            for key in usage_total:
-                usage_total[key] += int(result.usage.get(key, 0) or 0)
-            self._add_context_usage(result.usage)
-            valid, stats_dump = self._summary_valid(result.content)
-            if valid:
+            if result is not None:
                 return (
                     str(result.content).strip(),
                     usage_total,
-                    attempts,
+                    self._summary_calls - start_calls,
                     (time.perf_counter() - started) * 1000.0,
                 )
-            if result.finish_reason == "length":
-                max_output = max(
-                    1_024,
-                    int(getattr(self.spec, "max_output", 8_192) or 8_192),
-                )
-                params["max_tokens"] = min(
-                    max_output,
-                    8_192,
-                    max(1_024, max_tokens * 2),
-                )
-                max_tokens = int(params["max_tokens"])
+            if error is None:
                 continue
-            if attempts >= max_attempts:
-                break
-            nudge = build_checkpoint_nudge(self.locale, stats_dump=stats_dump)
-            nudged = list(messages) + [{"role": "user", "content": nudge}]
-            retry, retry_error = self._summary_call(
-                nudged, params, tool_choice="none"
-            )
-            attempts += 1
-            if retry_error is not None:
-                last_error_kind = retry_error.kind
-                if retry_error.kind in ("context_length", "payload_too_large"):
-                    continue
-                break
-            if retry is None:
+            last_error_kind = error.kind
+            if error.kind in ("context_length", "payload_too_large"):
                 continue
-            for key in usage_total:
-                usage_total[key] += int(retry.usage.get(key, 0) or 0)
-            self._add_context_usage(retry.usage)
-            valid, stats_dump = self._summary_valid(retry.content)
-            if valid:
-                return (
-                    str(retry.content).strip(),
-                    usage_total,
-                    attempts,
-                    (time.perf_counter() - started) * 1000.0,
-                )
             break
         self._last_checkpoint_error = last_error_kind or "summary_invalid"
         return None

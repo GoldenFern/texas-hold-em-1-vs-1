@@ -42,6 +42,13 @@
     "context_summary_retries": [0.85, 0.7, 0.5, 0.35],
     "max_history_calls_per_turn": 2,
     "final_talk_context": "fresh",
+    "max_retries": 10,
+    "retry_base_delay_ms": 2000,
+    "retry_max_delay_ms": 10000,
+    "retry_after_cap_seconds": 900,
+    "max_timeout_retries": 3,
+    "retry_jitter": 0.2,
+    "partial_retry_mode": "continue",
     "request_timeout_seconds": 300,
     "connect_timeout_seconds": 20
   }

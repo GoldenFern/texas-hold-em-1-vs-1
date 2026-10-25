@@ -383,3 +383,25 @@ def test_history_provider_swaps_you_and_opponent_by_seat() -> None:
     assert seat_zero["current_match"]["you"]["result"]["hands"] == 1
     assert seat_one["current_match"]["you"]["result"]["hands"] == 1
     assert seat_zero["current_match"]["positions"]["you"] != seat_one["current_match"]["positions"]["you"]
+
+
+def test_safe_action_prefers_check_then_fold() -> None:
+    class FakeGame:
+        def __init__(self, legal: list[str]) -> None:
+            self.legal = legal
+
+        def legal_actions(self, seat: int) -> list[str]:
+            return list(self.legal)
+
+    session = make_session()
+    try:
+        session.game = FakeGame(["fold", "call", "check"])
+        assert session._safe_action(0).type == ActionType.CHECK
+
+        session.game = FakeGame(["fold", "call"])
+        assert session._safe_action(0).type == ActionType.FOLD
+
+        session.game = FakeGame(["call"])
+        assert session._safe_action(0).type == ActionType.CALL
+    finally:
+        session.shutdown()

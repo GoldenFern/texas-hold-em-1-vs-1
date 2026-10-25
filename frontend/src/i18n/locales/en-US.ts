@@ -221,6 +221,7 @@ export const enUS = {
   "console.collapseDefault": "Reasoning collapsed by default",
   "console.collapseTitle": "Restore automatic reasoning collapse",
   "console.statusThinking": "Thinking",
+  "console.statusRetrying": "Retrying",
   "console.statusRunning": "Running",
   "console.statusAuto": "System fallback",
   "console.statusDone": "Complete",
@@ -241,6 +242,14 @@ export const enUS = {
   "turnPhase.preparingTool": "Preparing tool call…",
   "turnPhase.submitting": "Submitting action…",
   "turnPhase.runningTool": "Running {tool}…",
+  "turnPhase.retrying": "Retrying (attempt {attempt})…",
+
+  "turn.retry.request": "Request retry",
+  "turn.retry.summary": "Summary retry",
+  "turn.retry.waiting": "Attempt {attempt} · retrying in {seconds}s",
+  "turn.retry.now": "Attempt {attempt} · retrying",
+  "turn.incomplete": "Incomplete",
+  "turn.toolIncomplete": "Tool call incomplete",
 
   "tool.title.estimate": "Hand distribution",
   "tool.title.equity": "Equity estimate",

@@ -17,6 +17,7 @@ from src.analysis.hand_distribution import HandDistributionAnalyzer
 from src.i18n import DEFAULT_LOCALE, normalize_locale, tr
 from src.llm.client import LLMClient, LLMError
 from src.llm.providers import PROJECT_ROOT, ProviderRegistry
+from src.llm.retry import RetryPolicy
 from src.server.session import GameSession
 
 APP_VERSION = "0.1.0"
@@ -116,6 +117,7 @@ def create_app() -> tuple[Flask, SocketIO, GameSession]:
         read_timeout=float(
             os.environ.get("HU_READ_TIMEOUT", runtime.get("request_timeout_seconds", 300))
         ),
+        retry_policy=RetryPolicy.from_runtime(runtime),
     )
     analyzer = HandDistributionAnalyzer()
     equity_analyzer = EquityAnalyzer()

@@ -20,6 +20,7 @@ import type {
   MatchSetupPayload,
   MessageView,
   ProviderModel,
+  RetryView,
   SeatSetup,
   TableTalkEntry,
   Toast,
@@ -600,6 +601,9 @@ function handleAgentEvent(event: AgentEvent, replay = false): void {
       }
       break;
     }
+    case "retry_scheduled":
+      onRetryScheduled(seat, event);
+      break;
     case "note":
       addNote(seat, String(event.level || "info"), String(event.text || ""), event.turn_id as string | undefined);
       break;
@@ -631,6 +635,7 @@ function onTurnStart(seat: number, event: AgentEvent): void {
   const running = state.currentTurns[seat];
   if (running && running.status === "running") {
     running.status = "done";
+    running.retry = null;
     running.endedAt = Date.now();
   }
   const turn: TurnView = {
@@ -683,6 +688,7 @@ function messageById(turn: TurnView, id: string): MessageView | null {
 
 function onMessageStart(seat: number, event: AgentEvent): void {
   const turn = ensureTurn(seat, event);
+  turn.retry = null;
   const id = String(event.message_id || `msg-${Date.now()}`);
   if (messageById(turn, id)) return;
   turn.messages.push({
@@ -704,6 +710,7 @@ function onDelta(seat: number, event: AgentEvent): void {
     message = messageById(turn, id);
   }
   if (!message) return;
+  turn.retry = null;
   const delta = String(event.delta || "");
   if (event.type === "reasoning_delta") message.reasoning += delta;
   else message.content += delta;
@@ -715,6 +722,7 @@ function toolByIndex(message: MessageView, index: number): ToolView | null {
 
 function onToolStart(seat: number, event: AgentEvent): void {
   const turn = ensureTurn(seat, event);
+  turn.retry = null;
   const messageId = String(event.message_id || "");
   let message = messageById(turn, messageId);
   if (!message) {
@@ -813,13 +821,24 @@ function onMessageEnd(seat: number, event: AgentEvent): void {
     message = messageById(turn, id);
   }
   if (!message) return;
+  turn.retry = null;
   if (event.content) message.content = String(event.content);
   if (event.reasoning) message.reasoning = String(event.reasoning);
-  message.status = event.error ? "error" : "done";
+  message.incomplete = Boolean(event.incomplete);
+  message.incompleteReason = String(event.incomplete_reason || "");
+  if (message.incomplete) {
+    for (const tool of message.tools) {
+      if (tool.status === "running") {
+        tool.status = "error";
+        tool.summary = tool.summary || t("turn.toolIncomplete");
+      }
+    }
+  }
+  message.status = event.error || message.incomplete ? "error" : "done";
   message.usage = (event.usage as MessageView["usage"]) || message.usage;
   message.latencyMs = Number(event.latency_ms ?? 0);
   message.finishReason = String(event.finish_reason || "");
-  if (event.error) message.error = t("errors.llmFailed");
+  if (event.error && !message.incomplete) message.error = t("errors.llmFailed");
 }
 
 function onTurnEnd(seat: number, event: AgentEvent): void {
@@ -832,8 +851,25 @@ function onTurnEnd(seat: number, event: AgentEvent): void {
   turn.latencyMs = Number(event.latency_ms ?? 0);
   turn.steps = Number(event.steps ?? turn.steps);
   turn.reason = String(event.reason || "");
+  turn.retry = null;
   turn.endedAt = Date.now();
   state.currentTurns[seat] = null;
+}
+
+function onRetryScheduled(seat: number, event: AgentEvent): void {
+  const turn = currentTurn(seat);
+  if (!turn) return;
+  const delayMs = Number(event.delay_ms ?? 0);
+  const nextAt = Number(event.at ?? Date.now() + delayMs);
+  const retry: RetryView = {
+    scope: String(event.scope || "turn"),
+    attempt: Number(event.attempt ?? 1),
+    maxRetries: Number(event.max_retries ?? 0),
+    delayMs,
+    nextAt,
+    message: String(event.text || ""),
+  };
+  turn.retry = retry;
 }
 
 function addNote(seat: number, level: string, text: string, turnId?: string): void {

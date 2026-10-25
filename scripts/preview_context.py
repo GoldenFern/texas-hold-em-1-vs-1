@@ -52,6 +52,7 @@ from src.llm.agent import LLMAgent
 from src.llm.client import LLMClient
 from src.llm.prompt import GAME_TOOL_NAMES, build_system_prompt
 from src.llm.providers import ProviderRegistry
+from src.llm.retry import RetryPolicy
 from src.llm.tools import select_tools
 
 AUX_TOOL_NAMES = tuple(name for name in GAME_TOOL_NAMES if name != "apply_action")
@@ -73,7 +74,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-tokens", type=int, default=32768)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--connect-timeout", type=float, default=20.0)
-    parser.add_argument("--llm-retries", type=int, default=5)
+    parser.add_argument("--llm-retries", type=int, default=10)
     parser.add_argument("--retry-backoff", type=float, default=2.0)
     parser.add_argument("--chips", type=int, default=1000)
     parser.add_argument("--sb", type=int, default=5)
@@ -271,9 +272,13 @@ def play_session(args: argparse.Namespace) -> dict:
             read_timeout=args.timeout,
             locale="zh-CN",
             user_id=cache_scope,
+            retry_policy=RetryPolicy(
+                max_retries=args.llm_retries,
+                base_delay=args.retry_backoff,
+                max_delay=10.0,
+            ),
         ),
-        attempts=args.llm_retries,
-        backoff=args.retry_backoff,
+        attempts=1,
     )
     history_stats = HistoryStats()
 

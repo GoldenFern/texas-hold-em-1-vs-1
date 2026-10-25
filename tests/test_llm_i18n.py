@@ -70,7 +70,18 @@ class FakeClient:
 
 
 class UnknownToolClient(FakeClient):
-    def stream(self, spec, messages, tools, params, on_event, cancel=None):
+    def stream(
+        self,
+        spec,
+        messages,
+        tools,
+        params,
+        on_event,
+        cancel=None,
+        tool_choice=None,
+        retry_budget=None,
+        **kwargs,
+    ):
         call = ToolCall(id="call_0", name="bogus_tool", arguments="{}")
         on_event(
             {

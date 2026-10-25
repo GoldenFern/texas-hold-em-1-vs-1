@@ -62,6 +62,7 @@ from src.llm.prompt import (
     build_system_prompt,
 )
 from src.llm.providers import ModelSpec, ProviderRegistry
+from src.llm.retry import RetryPolicy
 
 DEFAULT_BOT_MODEL = PROJECT_ROOT / "models" / "rlcard" / "nlh_dqn_project.pth"
 GAME_CONFIG_PATH = PROJECT_ROOT / "config" / "game.json"
@@ -292,14 +293,12 @@ def estimate_hand_cost(
 
 
 class RetryingClient:
-    """Add bounded exponential backoff around transient relay failures."""
-
-    TRANSIENT = ("rate_limit", "timeout", "network", "server", "unknown")
+    """Compatibility wrapper; ``LLMClient`` owns the retry budget."""
 
     def __init__(
         self,
         client: LLMClient,
-        attempts: int = 4,
+        attempts: int = 1,
         backoff: float = 2.0,
     ) -> None:
         self.client = client
@@ -308,19 +307,7 @@ class RetryingClient:
         self.locale = getattr(client, "locale", "zh-CN")
 
     def stream(self, *args: Any, **kwargs: Any) -> Any:
-        last: Optional[LLMError] = None
-        for attempt in range(self.attempts):
-            try:
-                return self.client.stream(*args, **kwargs)
-            except LLMError as exc:
-                last = exc
-                if exc.kind not in self.TRANSIENT or attempt >= self.attempts - 1:
-                    raise
-                delay = self.backoff * (2**attempt) + 0.25 * attempt
-                time.sleep(delay)
-        if last is not None:
-            raise last
-        raise LLMError("unknown", "retry loop exited unexpectedly")
+        return self.client.stream(*args, **kwargs)
 
     def close(self) -> None:
         self.client.close()
@@ -347,6 +334,7 @@ CSV_FIELDS = [
     "llm_actions_count",
     "bot_actions_count",
     "llm_turns",
+    "retry_attempts",
     "aux_tool_calls",
     "tool_turns",
     "aux_tool_errors",
@@ -540,8 +528,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--llm-retries",
         type=int,
-        default=4,
-        help="Per-call retries for transient relay failures.",
+        default=10,
+        help="Per-call retries for transient relay failures (OpenCode default: 10).",
     )
     parser.add_argument(
         "--retry-backoff",
@@ -772,9 +760,17 @@ def count_auto_turns(events: Sequence[dict]) -> tuple[int, int, int]:
             continue
         auto_turns += 1
         reason = str(event.get("reason") or "")
-        if any(marker in reason for marker in INVALID_ACTION_REASONS):
+        auto_kind = str(event.get("auto_kind") or "")
+        if auto_kind in ("invalid_action", "no_action", "max_steps") or any(
+            marker in reason for marker in INVALID_ACTION_REASONS
+        ):
             invalid_auto += 1
-        if "LLM 调用失败" in reason or "LLM 调用异常" in reason:
+        if auto_kind in (
+            "api_error",
+            "incomplete",
+            "output_limit",
+            "content_filter",
+        ) or "LLM 调用失败" in reason or "LLM 调用异常" in reason:
             api_error_auto += 1
     return auto_turns, invalid_auto, api_error_auto
 
@@ -782,6 +778,7 @@ def count_auto_turns(events: Sequence[dict]) -> tuple[int, int, int]:
 def hand_tool_stats(events: Sequence[dict]) -> dict:
     """Count auxiliary tool usage from compacted agent events."""
     stats = {
+        "retry_attempts": 0,
         "aux_tool_calls": 0,
         "tool_turns": 0,
         "aux_tool_errors": 0,
@@ -793,6 +790,9 @@ def hand_tool_stats(events: Sequence[dict]) -> dict:
     }
     turn_ids: set[str] = set()
     for event in events:
+        if event.get("type") == "retry_scheduled":
+            stats["retry_attempts"] += 1
+            continue
         if event.get("type") != "tool_result":
             continue
         name = str(event.get("name") or "")
@@ -933,9 +933,13 @@ def play_hand(
                 connect_timeout=float(args.connect_timeout),
                 read_timeout=float(args.timeout),
                 locale=args.agent_locale,
+                retry_policy=RetryPolicy(
+                    max_retries=int(args.llm_retries),
+                    base_delay=float(args.retry_backoff),
+                    max_delay=10.0,
+                ),
             ),
-            attempts=int(args.llm_retries),
-            backoff=float(args.retry_backoff),
+            attempts=1,
         )
         llm = make_llm_agent(
             task,
@@ -1092,6 +1096,7 @@ def play_hand(
             "auto_turns": 0,
             "invalid_action_auto": 0,
             "api_error_auto": 0,
+            "retry_attempts": 0,
             "api_errors": 0,
             "infra_error": 0,
             "fatal_error": f"{type(exc).__name__}: {exc}",
@@ -1215,6 +1220,7 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
     invalid_auto = sum(int(row.get("invalid_action_auto", 0)) for row in valid)
     api_error_auto = sum(int(row.get("api_error_auto", 0)) for row in valid)
     llm_turns = sum(int(row.get("llm_turns", 0)) for row in valid)
+    retry_attempts = sum(int(row.get("retry_attempts", 0)) for row in valid)
     aux_tool_calls = sum(int(row.get("aux_tool_calls", 0)) for row in valid)
     tool_turns = sum(int(row.get("tool_turns", 0)) for row in valid)
     aux_tool_errors = sum(int(row.get("aux_tool_errors", 0)) for row in valid)
@@ -1352,6 +1358,7 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
         "auto_turns": auto_turns,
         "invalid_action_auto": invalid_auto,
         "api_error_auto": api_error_auto,
+        "retry_attempts": retry_attempts,
         "hands_with_auto": sum(1 for row in valid if int(row["auto_turns"]) > 0),
         "avg_api_latency_ms": round(statistics.fmean(api_latencies), 1)
         if api_latencies
@@ -1447,6 +1454,7 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         f"| 估算费用 | ¥{summary.get('est_cost_cny', 0.0):.4f} |",
         f"| 自动行动回合 | {summary.get('auto_turns', 0)} |",
         f"| 其中 API 错误导致 | {summary.get('api_error_auto', 0)} |",
+        f"| 重试次数 | {summary.get('retry_attempts', 0)} |",
         "",
         "## 工具使用",
         "",
@@ -1480,6 +1488,7 @@ def write_report(path: Path, summary: dict, args: argparse.Namespace) -> None:
         "- 同牌换座只对偶数手生效；奇数手会多出一手未配对牌局。",
         "- `invalid_action_auto` 记录模型连续非法动作或超步数导致的自动跟注/弃牌。",
         "- `api_error_auto` 记录 API 失败后系统自动跟注/过牌/弃牌的回合。",
+        "- `retry_attempts` 统计 `retry_scheduled` 事件次数，包含请求重试和摘要重试。",
         "- 工具使用统计来自 `tool_result` 事件，`call_ev` 在无跟注时返回 `applicable=false`，仍计入调用次数。",
         "- 费用按缓存未命中输入、缓存命中输入与输出三档单价估算；未指定 `--price-cache-input` 时缓存命中输入按 `--price-input` 计，等价于旧的估算方式。",
         "- 缓存命中率按总输入 token 加权（缓存命中 / 输入）；Provider 未返回缓存字段时按全部未命中处理，结果会偏保守。",
@@ -1604,6 +1613,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "infra_error": 0,
                         "api_errors": 0,
                         "api_error_auto": 0,
+                        "retry_attempts": 0,
                         "net_llm": 0,
                         "net_bot": 0,
                         "pot": 0,

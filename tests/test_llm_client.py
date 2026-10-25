@@ -10,6 +10,7 @@ import requests
 
 from src.llm.client import LLMClient, LLMError, classify_http, redact_secrets
 from src.llm.providers import ProviderRegistry
+from src.llm.retry import RetryBudget, RetryPolicy
 
 
 @pytest.fixture(autouse=True)
@@ -65,12 +66,32 @@ class FakeSession:
         self.closed = True
 
 
-def sse(*events: dict) -> List[bytes]:
+def sse(
+    *events: dict,
+    finish: Optional[str] = "stop",
+    done: bool = True,
+) -> List[bytes]:
     lines: List[bytes] = []
     for event in events:
         lines.append(("data: " + json.dumps(event, ensure_ascii=False)).encode("utf-8"))
         lines.append(b"")
-    lines.append(b"data: [DONE]")
+    has_finish = any(
+        (event.get("choices") or [{}])[0].get("finish_reason")
+        for event in events
+    )
+    if finish and not has_finish:
+        lines.append(
+            (
+                "data: "
+                + json.dumps(
+                    {"choices": [{"delta": {}, "finish_reason": finish}]},
+                    ensure_ascii=False,
+                )
+            ).encode("utf-8")
+        )
+        lines.append(b"")
+    if done:
+        lines.append(b"data: [DONE]")
     return lines
 
 
@@ -90,6 +111,16 @@ def make_client(
     session = FakeSession(responses)
     client._get_session = lambda: session  # type: ignore[method-assign]
     return client, session
+
+
+def fast_budget(max_retries: int = 10) -> RetryBudget:
+    policy = RetryPolicy(
+        max_retries=max_retries,
+        base_delay=0.0,
+        max_delay=0.0,
+        jitter=0.0,
+    )
+    return RetryBudget(policy, sleep=lambda _delay: None)
 
 
 class TimeoutSession(FakeSession):
@@ -271,14 +302,25 @@ def test_disconnect_keeps_complete_tool_call() -> None:
                                 }
                             }
                         ]
-                    }
+                    },
+                    finish=None,
+                    done=False,
                 ),
                 error_after_lines=requests.exceptions.ChunkedEncodingError("cut"),
             )
         ]
     )
-    result = client.stream(spec(), [{"role": "user", "content": "hi"}], None, {}, lambda e: None)
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        lambda e: None,
+        retry_budget=fast_budget(),
+    )
     assert result.tool_calls[0].name == "apply_action"
+    assert result.incomplete is True
+    assert result.incomplete_reason == "network"
 
 
 def test_stream_unsupported_falls_back_to_non_stream() -> None:
@@ -528,3 +570,324 @@ def test_stream_sends_tool_choice_and_defaults_to_auto() -> None:
         lambda _event: None,
     )
     assert session.calls[0]["json"]["tool_choice"] == "auto"
+
+
+def test_stream_retries_incomplete_stream_before_output() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {}}]},
+                    finish=None,
+                    done=False,
+                )
+            ),
+            FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]})),
+        ]
+    )
+    events = []
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        events.append,
+        retry_budget=fast_budget(),
+    )
+    assert result.content == "ok"
+    assert len(session.calls) == 2
+    retries = [event for event in events if event["type"] == "retry_scheduled"]
+    assert retries and retries[0]["attempt"] == 2
+    assert retries[0]["scope"] == "request"
+    assert retries[0]["max_retries"] == 10
+
+
+def test_stream_retries_server_error_before_output() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(status=503, body="service unavailable"),
+            FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]})),
+        ]
+    )
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        lambda _event: None,
+        retry_budget=fast_budget(),
+    )
+    assert result.content == "ok"
+    assert len(session.calls) == 2
+
+
+def test_stream_does_not_retry_auth_error() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(status=401, body="invalid api key"),
+            FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]})),
+        ]
+    )
+    with pytest.raises(LLMError) as caught:
+        client.stream(
+            spec(),
+            [{"role": "user", "content": "hi"}],
+            None,
+            {},
+            lambda _event: None,
+            retry_budget=fast_budget(),
+        )
+    assert caught.value.kind == "auth"
+    assert len(session.calls) == 1
+
+
+def test_stream_honors_x_should_retry_false() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(
+                status=503,
+                body="service unavailable",
+                headers={"x-should-retry": "false"},
+            ),
+            FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]})),
+        ]
+    )
+    with pytest.raises(LLMError):
+        client.stream(
+            spec(),
+            [{"role": "user", "content": "hi"}],
+            None,
+            {},
+            lambda _event: None,
+            retry_budget=fast_budget(),
+        )
+    assert len(session.calls) == 1
+
+
+def test_stream_retry_hook_can_stop_retries() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(status=503, body="service unavailable"),
+            FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]})),
+        ]
+    )
+    with pytest.raises(LLMError):
+        client.stream(
+            spec(),
+            [{"role": "user", "content": "hi"}],
+            None,
+            {},
+            lambda _event: None,
+            retry_budget=fast_budget(),
+            retry_hook=lambda _context: {"retry": False},
+        )
+    assert len(session.calls) == 1
+
+
+def test_stream_honors_retry_after_header() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(
+                status=429,
+                body="rate limited",
+                headers={"Retry-After": "5"},
+            ),
+            FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]})),
+        ]
+    )
+    events = []
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        events.append,
+        retry_budget=fast_budget(),
+    )
+    assert result.content == "ok"
+    assert len(session.calls) == 2
+    retries = [event for event in events if event["type"] == "retry_scheduled"]
+    assert retries and retries[0]["delay_ms"] == 5000
+
+
+def test_stream_marks_missing_finish_reason_as_incomplete() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {"content": "partial"}}]},
+                    finish=None,
+                    done=False,
+                )
+            )
+        ]
+    )
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        lambda _event: None,
+        retry_budget=fast_budget(),
+    )
+    assert result.content == "partial"
+    assert result.incomplete is True
+    assert result.incomplete_reason == "missing_finish"
+
+
+def test_stream_marks_unknown_finish_as_incomplete() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {"content": "partial"}}]},
+                    finish="unknown",
+                    done=False,
+                )
+            )
+        ]
+    )
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        lambda _event: None,
+        retry_budget=fast_budget(),
+    )
+    assert result.incomplete is True
+    assert result.incomplete_reason == "unknown_finish"
+
+
+def test_stream_accepts_finish_reason_without_done_marker() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {"content": "complete"}}]},
+                    finish="stop",
+                    done=False,
+                )
+            )
+        ]
+    )
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        lambda _event: None,
+        retry_budget=fast_budget(),
+    )
+    assert result.content == "complete"
+    assert result.incomplete is False
+
+
+def test_stream_marks_done_without_finish_reason_as_incomplete() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {"choices": [{"delta": {"content": "partial"}}]},
+                    finish=None,
+                    done=True,
+                )
+            )
+        ]
+    )
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        lambda _event: None,
+        retry_budget=fast_budget(),
+    )
+    assert result.content == "partial"
+    assert result.incomplete is True
+    assert result.incomplete_reason == "missing_finish"
+
+
+def test_stream_marks_truncated_tool_arguments_incomplete() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                lines=sse(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_0",
+                                            "function": {
+                                                "name": "apply_action",
+                                                "arguments": '{"action":"ra',
+                                            },
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                    finish=None,
+                    done=False,
+                ),
+            )
+        ]
+    )
+    result = client.stream(
+        spec(),
+        [{"role": "user", "content": "hi"}],
+        None,
+        {},
+        lambda _event: None,
+        retry_budget=fast_budget(),
+    )
+    assert result.incomplete is True
+    assert result.tool_calls[0].complete is False
+
+
+def test_stream_exhausts_retry_budget() -> None:
+    responses = [
+        FakeResponse(status=503, body="service unavailable") for _ in range(11)
+    ]
+    client, session = make_client(responses)
+    with pytest.raises(LLMError):
+        client.stream(
+            spec(),
+            [{"role": "user", "content": "hi"}],
+            None,
+            {},
+            lambda _event: None,
+            retry_budget=fast_budget(),
+        )
+    assert len(session.calls) == 11
+
+
+def test_stream_cancel_stops_retry_wait() -> None:
+    client, session = make_client(
+        [
+            FakeResponse(status=503, body="service unavailable"),
+            FakeResponse(lines=sse({"choices": [{"delta": {"content": "ok"}}]})),
+        ]
+    )
+    cancelled = {"value": False}
+    policy = RetryPolicy(max_retries=10, base_delay=1.0, max_delay=1.0, jitter=0.0)
+    budget = RetryBudget(
+        policy,
+        sleep=lambda _delay: cancelled.__setitem__("value", True),
+    )
+    with pytest.raises(LLMError) as caught:
+        client.stream(
+            spec(),
+            [{"role": "user", "content": "hi"}],
+            None,
+            {},
+            lambda _event: None,
+            cancel=lambda: cancelled["value"],
+            retry_budget=budget,
+        )
+    assert caught.value.kind == "cancelled"
+    assert len(session.calls) == 1

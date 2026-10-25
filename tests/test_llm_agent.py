@@ -32,9 +32,24 @@ class FakeClient:
         self.responses = list(responses)
         self.calls = 0
 
-    def stream(self, spec, messages, tools, params, on_event, cancel=None):
+    def stream(
+        self,
+        spec,
+        messages,
+        tools,
+        params,
+        on_event,
+        cancel=None,
+        tool_choice=None,
+        retry_budget=None,
+        **kwargs,
+    ):
         self.calls += 1
+        if retry_budget is not None:
+            retry_budget.begin()
         response = self.responses.pop(0)
+        if response.get("error_kind"):
+            raise LLMError(response["error_kind"], response.get("detail", "error"))
         if response.get("reasoning"):
             on_event({"type": "reasoning_delta", "delta": response["reasoning"]})
         if response.get("content"):
@@ -45,6 +60,7 @@ class FakeClient:
                 id=item.get("id", f"call_{index}"),
                 name=item["name"],
                 arguments=item["arguments"],
+                complete=bool(item.get("complete", True)),
             )
             calls.append(call)
             on_event(
@@ -67,9 +83,13 @@ class FakeClient:
             content=response.get("content", ""),
             reasoning=response.get("reasoning", ""),
             tool_calls=calls,
-            finish_reason="tool_calls" if calls else "stop",
+            finish_reason=response.get(
+                "finish_reason", "tool_calls" if calls else "stop"
+            ),
             usage={"input_tokens": 100, "output_tokens": 30, "reasoning_tokens": 10},
             latency_ms=12.3,
+            incomplete=bool(response.get("incomplete", False)),
+            incomplete_reason=str(response.get("incomplete_reason", "")),
         )
 
 
@@ -145,6 +165,9 @@ def build_agent(
         "max_consecutive_failures": failures,
         "require_estimate_first": require_estimate_first,
         "max_context_tokens_estimate": 200000,
+        "retry_base_delay_ms": 0,
+        "retry_max_delay_ms": 0,
+        "retry_jitter": 0,
     }
     if runtime:
         settings.update(runtime)
@@ -1262,6 +1285,8 @@ class RecordingClient:
         tool_choice=None,
         **kwargs,
     ):
+        if kwargs.get("retry_budget") is not None:
+            kwargs["retry_budget"].begin()
         self.requests.append(
             {
                 "messages": copy.deepcopy(messages),
@@ -1296,6 +1321,8 @@ class RecordingClient:
             ),
             latency_ms=1.0,
             estimated_usage=bool(response.get("estimated_usage", False)),
+            incomplete=bool(response.get("incomplete", False)),
+            incomplete_reason=str(response.get("incomplete_reason", "")),
         )
 
 
@@ -1357,6 +1384,9 @@ def make_checkpoint_agent(
         "context_summary_max_tokens": 4096,
         "max_steps_per_turn": 4,
         "max_history_calls_per_turn": 2,
+        "retry_base_delay_ms": 0,
+        "retry_max_delay_ms": 0,
+        "retry_jitter": 0,
     }
     if runtime_extra:
         runtime.update(runtime_extra)
@@ -1791,3 +1821,432 @@ def test_checkpoint_low_water_restores_older_raw_hands() -> None:
         event for event in events if event.get("type") == "context_compacted"
     )
     assert compacted["retained_from"] == 1
+
+
+def test_incomplete_after_output_continues_with_synthetic_prompt() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Partial thought",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is False
+    assert agent.client.calls == 2
+    synthetic = [
+        message
+        for message in agent.messages
+        if message.get("role") == "user"
+        and "网络中断" in str(message.get("content") or "")
+    ]
+    assert synthetic
+    retries = [event for event in events if event["type"] == "retry_scheduled"]
+    assert retries and retries[0]["attempt"] == 2
+    assert retries[0]["scope"] == "turn"
+
+
+def test_incomplete_with_valid_action_is_executed_once() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Half a sentence",
+                "incomplete": True,
+                "incomplete_reason": "network",
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ],
+            }
+        ]
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is False
+    assert agent.client.calls == 1
+    assert not [event for event in events if event["type"] == "retry_scheduled"]
+
+
+def test_incomplete_restart_discards_partial_message() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Discard me",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ],
+        runtime={"partial_retry_mode": "restart"},
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert agent.client.calls == 2
+    assert not any(
+        message.get("role") == "assistant"
+        and "Discard me" in str(message.get("content") or "")
+        for message in agent.messages
+    )
+    assert [event for event in events if event["type"] == "retry_scheduled"]
+
+
+def test_retry_budget_is_shared_between_partial_attempts() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "First partial",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {
+                "content": "Second partial",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ],
+        runtime={"max_retries": 1},
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is True
+    assert agent.client.calls == 2
+    assert len([event for event in events if event["type"] == "retry_scheduled"]) == 1
+
+
+def test_incomplete_stream_does_not_count_as_no_tool_failure() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Still thinking",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ],
+        failures=1,
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is False
+    assert agent.client.calls == 2
+
+
+def test_transport_failure_prefers_check_over_call() -> None:
+    view = replace(make_view(), legal_actions=["fold", "check", "call"])
+    agent, events = build_agent([{"error_kind": "network"}])
+    action = agent.decide(view, events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is True
+
+
+def test_transport_failure_folds_when_check_is_not_legal() -> None:
+    agent, events = build_agent([{"error_kind": "network"}])
+    action = agent.decide(make_river_view(), events.append)
+
+    assert action.type == ActionType.FOLD
+    assert action.auto is True
+
+
+def test_output_limit_continuation_adds_prompt() -> None:
+    agent, events = build_agent(
+        [
+            {"content": "Part one", "finish_reason": "length"},
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert agent.client.calls == 2
+    assert any(
+        "输出上限" in str(message.get("content") or "")
+        for message in agent.messages
+        if message.get("role") == "user"
+    )
+    assert not [event for event in events if event["type"] == "retry_scheduled"]
+
+
+def test_output_limit_stops_after_two_continuations() -> None:
+    agent, events = build_agent(
+        [{"content": "Part", "finish_reason": "length"}] * 3
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is True
+    assert agent.client.calls == 3
+
+
+def test_content_filter_falls_back_without_retry() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Blocked",
+                "incomplete": True,
+                "incomplete_reason": "content_filter",
+                "finish_reason": "content_filter",
+            }
+        ]
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is True
+    assert agent.client.calls == 1
+    assert not [event for event in events if event["type"] == "retry_scheduled"]
+
+
+def test_truncated_action_arguments_are_not_executed() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Trying to act",
+                "incomplete": True,
+                "incomplete_reason": "network",
+                "tool_calls": [
+                    {
+                        "name": "apply_action",
+                        "arguments": '{"action":"ra',
+                        "complete": False,
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is False
+    assert agent.client.calls == 2
+    errors = [event for event in events if event["type"] == "tool_result" and not event.get("ok")]
+    assert errors
+
+
+def test_checkpoint_summary_retries_incomplete_draft() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [
+            {
+                "content": "Partial checkpoint draft",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {"content": CHECKPOINT_SUMMARY},
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ],
+        runtime_extra={"max_retries": 1},
+    )
+    action = agent.decide(checkpoint_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert len(client.requests) == 3
+    assert agent._summary_calls == 2
+    checkpoint = str(agent.messages[1].get("content") or "")
+    assert "Partial checkpoint draft" not in checkpoint
+    retries = [event for event in events if event["type"] == "retry_scheduled"]
+    assert retries and retries[0]["scope"] == "summary"
+    assert retries[0]["attempt"] == 2
+
+
+def test_checkpoint_summary_rejects_length_without_retry() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [
+            {
+                "content": CHECKPOINT_SUMMARY,
+                "finish_reason": "length",
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    action = agent.decide(checkpoint_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert len(client.requests) == 2
+    assert agent._summary_calls == 1
+    failed = next(
+        event for event in events if event.get("type") == "context_summary_failed"
+    )
+    assert failed["kind"] == "summary_length"
+    assert "checkpoint" in str(agent.messages[1].get("content") or "")
+
+
+def test_checkpoint_summary_rejects_content_filter_without_retry() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [
+            {
+                "content": CHECKPOINT_SUMMARY,
+                "finish_reason": "content_filter",
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    action = agent.decide(checkpoint_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert len(client.requests) == 2
+    assert agent._summary_calls == 1
+    failed = next(
+        event for event in events if event.get("type") == "context_summary_failed"
+    )
+    assert failed["kind"] == "summary_content_filter"
+
+
+def test_checkpoint_summary_shares_budget_with_template_nudge() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [
+            {"content": "not a checkpoint"},
+            {
+                "content": "Partial after nudge",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {"content": CHECKPOINT_SUMMARY},
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ],
+        runtime_extra={"max_retries": 1},
+    )
+    action = agent.decide(checkpoint_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert len(client.requests) == 4
+    assert agent._summary_calls == 3
+    retries = [event for event in events if event["type"] == "retry_scheduled"]
+    assert len(retries) == 1
+    assert retries[0]["scope"] == "summary"
+
+
+def test_checkpoint_summary_shrinks_then_falls_back() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [{"error_kind": "context_length", "detail": "too long"}] * 8
+    )
+    agent._current_hand = 3
+    agent._current_street = "flop"
+    agent._maybe_checkpoint(events.append, mid_hand=False, force=True)
+
+    assert agent._summary_calls >= 4
+    assert agent._last_checkpoint_error == "context_length"
+    assert agent._summary_failures == 1
+    assert str(agent.messages[1].get("content") or "").startswith("【比赛 checkpoint")
+    assert any(
+        event.get("type") == "context_summary_failed" for event in events
+    )
+
+
+def test_retry_budget_resets_for_a_new_logical_step() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "First partial",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {
+                "tool_calls": [
+                    {
+                        "name": "estimate_hand_probabilities",
+                        "arguments": '{"iterations": 2000}',
+                    }
+                ]
+            },
+            {
+                "content": "Second partial",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ],
+        runtime={"max_retries": 1},
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is False
+    assert agent.client.calls == 4
+    retries = [event for event in events if event["type"] == "retry_scheduled"]
+    assert len(retries) == 2
+
+
+def test_continuation_rejection_rebuilds_full_context_once() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Discard after rejection",
+                "incomplete": True,
+                "incomplete_reason": "network",
+            },
+            {"error_kind": "param", "detail": "reasoning_content rejected"},
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ]
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is False
+    assert agent.client.calls == 3
+    assert not any(
+        "Discard after rejection" in str(message.get("content") or "")
+        for message in agent.messages
+    )
+    assert any(
+        event.get("type") == "note"
+        and "丢弃半截回复" in str(event.get("text") or "")
+        for event in events
+    )

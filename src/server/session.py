@@ -31,6 +31,7 @@ from src.llm.prompt import (
     build_system_prompt,
 )
 from src.llm.providers import ProviderRegistry
+from src.llm.retry import RetryPolicy
 from src.llm.table_talk import TableTalkLimits, normalize_table_talk
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -1188,10 +1189,12 @@ class GameSession:
     def _safe_action(self, seat: int, source: str = "system") -> Action:
         assert self.game is not None
         legal = set(self.game.legal_actions(seat))
-        if ActionType.CALL.value in legal:
-            return Action(seat, ActionType.CALL, source=source, auto=True)
         if ActionType.CHECK.value in legal:
             return Action(seat, ActionType.CHECK, source=source, auto=True)
+        if ActionType.FOLD.value in legal:
+            return Action(seat, ActionType.FOLD, source=source, auto=True)
+        if ActionType.CALL.value in legal:
+            return Action(seat, ActionType.CALL, source=source, auto=True)
         return Action(seat, ActionType.FOLD, source=source, auto=True)
 
     def _validate_for_generation(
@@ -1375,6 +1378,7 @@ class GameSession:
             connect_timeout=min(10.0, float(runtime.get("connect_timeout_seconds", 20))),
             read_timeout=min(60.0, float(runtime.get("request_timeout_seconds", 300))),
             locale=self.ui_locale,
+            retry_policy=RetryPolicy(max_retries=0),
         )
         try:
             result = test_client.stream(spec, messages, None, test_params, lambda event: None)

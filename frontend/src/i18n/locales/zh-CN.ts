@@ -219,6 +219,7 @@ export const zhCN = {
   "console.collapseDefault": "思考默认折叠",
   "console.collapseTitle": "恢复思考自动折叠",
   "console.statusThinking": "思考中",
+  "console.statusRetrying": "重试中",
   "console.statusRunning": "运行中",
   "console.statusAuto": "系统兜底",
   "console.statusDone": "已完成",
@@ -239,6 +240,14 @@ export const zhCN = {
   "turnPhase.preparingTool": "正在准备工具调用…",
   "turnPhase.submitting": "正在提交动作…",
   "turnPhase.runningTool": "正在执行 {tool}…",
+  "turnPhase.retrying": "第 {attempt} 次重试中…",
+
+  "turn.retry.request": "请求重试",
+  "turn.retry.summary": "摘要压缩重试",
+  "turn.retry.waiting": "第 {attempt} 次尝试 · {seconds} 秒后重试",
+  "turn.retry.now": "第 {attempt} 次尝试 · 正在重试",
+  "turn.incomplete": "不完整",
+  "turn.toolIncomplete": "工具调用未完成",
 
   "tool.title.estimate": "牌型概率",
   "tool.title.equity": "胜率估算",

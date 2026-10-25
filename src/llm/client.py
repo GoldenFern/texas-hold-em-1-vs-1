@@ -16,6 +16,7 @@ import requests
 from src.i18n import normalize_locale, tr
 
 from .providers import ModelSpec, ProviderRegistry
+from .retry import RetryBudget, RetryPolicy, is_retryable, parse_retry_after
 
 logger = logging.getLogger("hu.llm")
 TRAFFIC = os.environ.get("HU_LLM_LOG_TRAFFIC", "").strip().lower() in ("1", "true", "yes", "on")
@@ -45,12 +46,34 @@ def redact_secrets(text: str, api_key: str = "") -> str:
 class LLMError(Exception):
     """Typed error surfaced to the UI."""
 
-    def __init__(self, kind: str, detail: str, status: int = 0, api_key: str = "") -> None:
+    def __init__(
+        self,
+        kind: str,
+        detail: str,
+        status: int = 0,
+        api_key: str = "",
+        *,
+        retryable: Optional[bool] = None,
+        retry_after: float = 0.0,
+        headers: Optional[dict] = None,
+    ) -> None:
         detail = redact_secrets(detail, api_key)
         super().__init__(f"[{kind}] {detail}")
         self.kind = kind
         self.detail = detail
         self.status = status
+        self.headers = {
+            str(key).lower(): value for key, value in (headers or {}).items()
+        }
+        self.retry_after = max(0.0, float(retry_after or 0.0))
+        self.retryable = (
+            is_retryable(kind, status) if retryable is None else bool(retryable)
+        )
+        override = str(self.headers.get("x-should-retry", "")).strip().lower()
+        if override == "true":
+            self.retryable = True
+        elif override == "false":
+            self.retryable = False
 
 
 @dataclass
@@ -58,6 +81,7 @@ class ToolCall:
     id: str
     name: str
     arguments: str
+    complete: bool = True
 
     def parsed_arguments(self) -> Optional[dict]:
         text = (self.arguments or "").strip()
@@ -79,11 +103,23 @@ class ChatResult:
     usage: Dict[str, int] = field(default_factory=dict)
     latency_ms: float = 0.0
     estimated_usage: bool = False
+    incomplete: bool = False
+    incomplete_reason: str = ""
+    started: bool = False
 
-    def assistant_message(self, echo_reasoning: bool) -> dict:
+    def assistant_message(
+        self,
+        echo_reasoning: bool,
+        *,
+        lower_reasoning: bool = False,
+    ) -> dict:
         message: Dict[str, Any] = {"role": "assistant", "content": self.content or ""}
         if echo_reasoning and self.reasoning:
             message["reasoning_content"] = self.reasoning
+        if lower_reasoning:
+            if not message["content"] and self.reasoning:
+                message["content"] = self.reasoning
+            message.pop("reasoning_content", None)
         if self.tool_calls:
             message["tool_calls"] = [
                 {
@@ -187,6 +223,12 @@ def _classify_text(text: str) -> Optional[str]:
         "input is too long",
     )):
         return "context_length"
+    if any(phrase in lowered for phrase in (
+        "payload too large",
+        "request entity too large",
+        "request too large",
+    )):
+        return "payload_too_large"
     if "stream" in lowered and any(
         phrase in lowered for phrase in ("not support", "unsupported", "not enabled", "disabled")
     ):
@@ -202,6 +244,8 @@ def classify_http(status: int, body: str) -> str:
         return "rate_limit"
     if status == 408:
         return "timeout"
+    if status == 413:
+        return "payload_too_large"
     if status >= 500:
         return "server"
     text_kind = _classify_text(body)
@@ -222,11 +266,15 @@ class LLMClient:
         read_timeout: float = 300.0,
         locale: str = "zh-CN",
         user_id: Optional[str] = None,
+        retry_policy: Optional[RetryPolicy] = None,
+        retry_hook: Optional[Callable[[dict], Optional[dict]]] = None,
     ) -> None:
         self.registry = registry
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.locale = normalize_locale(locale, "zh-CN") or "zh-CN"
+        self.retry_policy = retry_policy or RetryPolicy()
+        self.retry_hook = retry_hook
         # DeepSeek uses user_id as a KV-cache isolation key.  Other providers
         # may ignore it; only send it when explicitly configured.
         self.user_id = str(user_id or "").strip() or None
@@ -271,6 +319,8 @@ class LLMClient:
         on_event: Callable[[dict], None],
         cancel: Optional[Callable[[], bool]] = None,
         tool_choice: Optional[str] = None,
+        retry_budget: Optional[RetryBudget] = None,
+        retry_hook: Optional[Callable[[dict], Optional[dict]]] = None,
     ) -> ChatResult:
         api_key = ProviderRegistry.get_api_key(spec, locale=self.locale)
         payload = self.registry.build_payload(
@@ -283,58 +333,123 @@ class LLMClient:
             payload = _apply_payload_drops(payload, dropped)
         self._log_request(spec, payload)
 
-        attempts = 0
-        last_error: Optional[LLMError] = None
-        while attempts < 3:
+        budget = retry_budget or RetryBudget(self.retry_policy)
+        hook = retry_hook or self.retry_hook
+        param_retries = 0
+        while True:
             if cancel and cancel():
                 raise LLMError("cancelled", tr(self.locale, "client.cancelled"))
-            attempts += 1
+            budget.begin()
+            error: Optional[LLMError] = None
             try:
-                result = self._stream_once(spec, api_key, payload, on_event, cancel)
-                self._log_response(spec, result)
-                return result
-            except LLMError as exc:
-                last_error = exc
-                if exc.kind == "cancelled":
-                    raise
-                if exc.kind == "rate_limit" and attempts == 1:
-                    time.sleep(1.5)
-                    continue
-                if exc.kind == "param" and attempts < 3:
-                    reduced = self._reduce_payload(payload, exc.detail)
-                    if reduced is not None:
-                        payload, removed = reduced
-                        self._remember_degraded(spec, removed)
-                        on_event(
-                            {
-                                "type": "note",
-                                "level": "warn",
-                                "text": tr(self.locale, "client.param_degraded"),
-                            }
-                        )
-                        continue
-                raise
+                result = self._stream_once(
+                    spec,
+                    api_key,
+                    payload,
+                    on_event,
+                    cancel,
+                    budget,
+                )
             except requests.Timeout as exc:
-                raise LLMError(
+                error = LLMError(
                     "timeout",
                     tr(self.locale, "client.timeout", error=exc),
                     api_key=api_key,
-                ) from exc
+                    retryable=True,
+                )
             except requests.ConnectionError as exc:
-                raise LLMError(
+                error = LLMError(
                     "network",
                     tr(self.locale, "client.network", error=exc),
                     api_key=api_key,
-                ) from exc
+                    retryable=True,
+                )
+            except LLMError as exc:
+                error = exc
             except Exception as exc:  # noqa: BLE001
+                # A bug in our own code is not a transient provider failure.
                 raise LLMError(
                     "unknown",
                     tr(self.locale, "client.unknown_detail", error=f"{type(exc).__name__}: {exc}"),
                     api_key=api_key,
+                    retryable=False,
                 ) from exc
-        if last_error:
-            raise last_error
-        raise LLMError("unknown", tr(self.locale, "client.unknown"))
+            else:
+                self._log_response(spec, result)
+                return result
+
+            if error.kind == "cancelled":
+                raise error
+            if error.kind == "param" and param_retries < 2:
+                reduced = self._reduce_payload(payload, error.detail)
+                if reduced is not None:
+                    payload, removed = reduced
+                    self._remember_degraded(spec, removed)
+                    param_retries += 1
+                    on_event(
+                        {
+                            "type": "note",
+                            "level": "warn",
+                            "text": tr(self.locale, "client.param_degraded"),
+                        }
+                    )
+                    continue
+
+            retry_override: Optional[bool] = None
+            retry_delay: Optional[float] = None
+            if hook is not None:
+                try:
+                    hook_result = hook(
+                        {
+                            "kind": error.kind,
+                            "status": error.status,
+                            "message": error.detail,
+                            "headers": dict(error.headers),
+                            "attempt": budget.attempts + 1,
+                            "max_retries": budget.policy.max_retries,
+                            "retries": budget.retries,
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    hook_result = None
+                if isinstance(hook_result, dict):
+                    if "retry" in hook_result:
+                        retry_override = bool(hook_result["retry"])
+                    if "delay" in hook_result:
+                        try:
+                            retry_delay = max(0.0, float(hook_result["delay"]))
+                        except (TypeError, ValueError):
+                            retry_delay = None
+
+            retryable = error.retryable if retry_override is None else retry_override
+            decision = budget.next_retry(
+                error.kind,
+                retryable=retryable,
+                retry_after=error.retry_after,
+            )
+            if not decision.retry:
+                raise error
+            delay = decision.delay if retry_delay is None else retry_delay
+            on_event(
+                {
+                    "type": "retry_scheduled",
+                    "scope": "request",
+                    "attempt": decision.attempt,
+                    "max_retries": budget.policy.max_retries,
+                    "delay_ms": round(delay * 1000.0),
+                    "at": round(time.time() * 1000.0 + delay * 1000.0),
+                    "error_kind": error.kind,
+                    "text": tr(
+                        self.locale,
+                        "client.retry_scheduled",
+                        kind=error.kind,
+                        delay=f"{delay:.1f}",
+                        attempt=decision.attempt,
+                    ),
+                }
+            )
+            if not budget.wait(delay, cancel):
+                raise LLMError("cancelled", tr(self.locale, "client.cancelled"))
 
     # ------------------------------------------------------------------
     # Streaming
@@ -347,6 +462,7 @@ class LLMClient:
         payload: dict,
         on_event: Callable[[dict], None],
         cancel: Optional[Callable[[], bool]] = None,
+        budget: Optional[RetryBudget] = None,
     ) -> ChatResult:
         start = time.perf_counter()
         response = self._get_session().post(
@@ -363,14 +479,22 @@ class LLMClient:
         if response.status_code >= 400:
             body = response.text[:4000]
             kind = classify_http(response.status_code, body)
+            headers = {
+                str(key).lower(): value
+                for key, value in (getattr(response, "headers", {}) or {}).items()
+            }
             response.close()
             if kind == "stream_unsupported":
-                return self._non_stream_once(spec, api_key, payload, start, on_event, cancel)
+                return self._non_stream_once(
+                    spec, api_key, payload, start, on_event, cancel, budget
+                )
             raise LLMError(
                 kind,
                 f"HTTP {response.status_code}: {body}",
                 response.status_code,
                 api_key=api_key,
+                retry_after=parse_retry_after(headers.get("retry-after")),
+                headers=headers,
             )
 
         content_type = (response.headers.get("Content-Type") or "").lower()
@@ -395,6 +519,8 @@ class LLMClient:
         finish_reason = ""
         usage: dict = {}
         saw_event = False
+        saw_done = False
+        started = False
         bad_lines = 0
         stream_error: Optional[requests.RequestException] = None
 
@@ -414,6 +540,7 @@ class LLMClient:
                 else:
                     continue
                 if data_text == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     event = json.loads(data_text)
@@ -450,20 +577,24 @@ class LLMClient:
 
                 reasoning = _normalize_text(delta.get("reasoning_content") or delta.get("reasoning"))
                 if reasoning:
+                    started = True
                     reasoning_parts.append(reasoning)
                     on_event({"type": "reasoning_delta", "delta": reasoning})
 
                 text = _normalize_text(delta.get("content"))
                 if text:
+                    started = True
                     content_parts.append(text)
                     on_event({"type": "content_delta", "delta": text})
 
                 calls = delta.get("tool_calls")
-                if isinstance(calls, list):
+                if isinstance(calls, list) and calls:
+                    started = True
                     for raw_call in calls:
                         self._accumulate_tool_call(tool_calls, raw_call, on_event, id_map, index_map)
                 legacy = delta.get("function_call")
                 if isinstance(legacy, dict):
+                    started = True
                     self._accumulate_tool_call(
                         tool_calls,
                         {"index": 0, "function": legacy},
@@ -482,7 +613,7 @@ class LLMClient:
             raise LLMError("cancelled", tr(self.locale, "client.cancelled"))
         latency_ms = (time.perf_counter() - start) * 1000.0
 
-        if not saw_event:
+        if not saw_event and not saw_done and stream_error is None:
             if bad_lines:
                 on_event(
                     {
@@ -492,22 +623,47 @@ class LLMClient:
                     }
                 )
             # Some gateways silently return an empty SSE stream or pretty JSON.
-            return self._non_stream_once(spec, api_key, payload, start, on_event, cancel)
-
-        if stream_error is not None:
-            if not tool_calls and not content_parts and not reasoning_parts:
-                raise LLMError(
-                    "network",
-                    tr(self.locale, "client.stream_interrupted", error=stream_error),
-                    api_key=api_key,
-                )
-            on_event(
-                {
-                    "type": "note",
-                    "level": "warn",
-                    "text": tr(self.locale, "client.stream_interrupted_keep"),
-                }
+            return self._non_stream_once(
+                spec, api_key, payload, start, on_event, cancel, budget
             )
+
+        has_output = bool(content_parts or reasoning_parts or tool_calls)
+        if stream_error is not None and not has_output:
+            kind = "timeout" if isinstance(stream_error, requests.Timeout) else "network"
+            raise LLMError(
+                kind,
+                tr(self.locale, "client.stream_interrupted", error=stream_error),
+                api_key=api_key,
+                retryable=True,
+            )
+
+        incomplete_reason = ""
+        if stream_error is not None:
+            incomplete_reason = (
+                "timeout" if isinstance(stream_error, requests.Timeout) else "network"
+            )
+        elif finish_reason in ("length", "content_filter"):
+            incomplete_reason = finish_reason
+        elif finish_reason == "unknown":
+            if not has_output:
+                raise LLMError(
+                    "incomplete_stream",
+                    tr(self.locale, "client.incomplete_stream", reason="unknown_finish"),
+                    api_key=api_key,
+                    retryable=True,
+                )
+            incomplete_reason = "unknown_finish"
+        elif not finish_reason and bool(
+            spec.request.get("require_finish_reason", True)
+        ):
+            if not has_output:
+                raise LLMError(
+                    "incomplete_stream",
+                    tr(self.locale, "client.incomplete_stream", reason="missing_finish"),
+                    api_key=api_key,
+                    retryable=True,
+                )
+            incomplete_reason = "missing_finish"
 
         content = "".join(content_parts)
         reasoning = "".join(reasoning_parts)
@@ -529,14 +685,23 @@ class LLMClient:
         else:
             estimated = False
 
+        calls = self._finalize_tool_calls(tool_calls)
+        if incomplete_reason:
+            for call in calls:
+                if call.parsed_arguments() is None:
+                    call.complete = False
+
         return ChatResult(
             content=content,
             reasoning=reasoning,
-            tool_calls=self._finalize_tool_calls(tool_calls),
+            tool_calls=calls,
             finish_reason=finish_reason,
             usage=usage,
             latency_ms=latency_ms,
             estimated_usage=estimated,
+            incomplete=bool(incomplete_reason),
+            incomplete_reason=incomplete_reason,
+            started=started,
         )
 
     def _non_stream_once(
@@ -547,9 +712,12 @@ class LLMClient:
         start: float,
         on_event: Callable[[dict], None],
         cancel: Optional[Callable[[], bool]] = None,
+        budget: Optional[RetryBudget] = None,
     ) -> ChatResult:
         if cancel and cancel():
             raise LLMError("cancelled", tr(self.locale, "client.cancelled"))
+        if budget is not None:
+            budget.begin()
         fallback = dict(payload)
         fallback["stream"] = False
         fallback.pop("stream_options", None)
@@ -566,12 +734,18 @@ class LLMClient:
         if response.status_code >= 400:
             body = response.text[:4000]
             kind = classify_http(response.status_code, body)
+            headers = {
+                str(key).lower(): value
+                for key, value in (getattr(response, "headers", {}) or {}).items()
+            }
             response.close()
             raise LLMError(
                 kind,
                 f"HTTP {response.status_code}: {body}",
                 response.status_code,
                 api_key=api_key,
+                retry_after=parse_retry_after(headers.get("retry-after")),
+                headers=headers,
             )
         try:
             data = response.json()
@@ -647,6 +821,7 @@ class LLMClient:
             usage=usage,
             latency_ms=(time.perf_counter() - start) * 1000.0,
             estimated_usage=estimated,
+            started=bool(content or reasoning or tool_calls),
         )
 
     # ------------------------------------------------------------------

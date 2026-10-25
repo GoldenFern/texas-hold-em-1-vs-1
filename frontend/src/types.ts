@@ -363,6 +363,17 @@ export interface MessageView {
   latencyMs?: number;
   finishReason?: string;
   error?: string;
+  incomplete?: boolean;
+  incompleteReason?: string;
+}
+
+export interface RetryView {
+  scope: string;
+  attempt: number;
+  maxRetries: number;
+  delayMs: number;
+  nextAt: number;
+  message: string;
 }
 
 export interface TurnView {
@@ -392,6 +403,7 @@ export interface TurnView {
   startedAt: number;
   endedAt: number | null;
   reason?: string;
+  retry?: RetryView | null;
 }
 
 export interface BotDecisionView {

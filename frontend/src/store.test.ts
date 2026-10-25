@@ -276,3 +276,64 @@ describe("analysis resync", () => {
     expect(game.analysisLoading).toBe(false);
   });
 });
+
+describe("retry state", () => {
+  it("stores a retry countdown and clears it on message start", () => {
+    socketMock.handlers.agent_event?.(turnEvent(60, "retry-turn"));
+    socketMock.handlers.agent_event?.({
+      ...turnEvent(61, "retry-turn"),
+      type: "retry_scheduled",
+      scope: "turn",
+      attempt: 2,
+      max_retries: 10,
+      delay_ms: 4000,
+      at: Date.now() + 4000,
+      text: "retry",
+    });
+
+    expect(game.currentTurns[0]?.retry?.attempt).toBe(2);
+    expect(game.currentTurns[0]?.retry?.nextAt).toBeGreaterThan(Date.now());
+
+    socketMock.handlers.agent_event?.({
+      ...turnEvent(62, "retry-turn"),
+      type: "message_start",
+      message_id: "msg-2",
+      step: 2,
+    });
+    expect(game.currentTurns[0]?.retry).toBeNull();
+  });
+
+  it("marks an incomplete message without treating it as complete", () => {
+    socketMock.handlers.agent_event?.(turnEvent(70, "incomplete-turn"));
+    socketMock.handlers.agent_event?.({
+      ...turnEvent(71, "incomplete-turn"),
+      type: "message_start",
+      message_id: "msg-1",
+      step: 1,
+    });
+    socketMock.handlers.agent_event?.({
+      ...turnEvent(72, "incomplete-turn"),
+      type: "tool_call_start",
+      message_id: "msg-1",
+      index: 0,
+      call_id: "call-1",
+      name: "apply_action",
+    });
+    socketMock.handlers.agent_event?.({
+      ...turnEvent(73, "incomplete-turn"),
+      type: "message_end",
+      message_id: "msg-1",
+      content: "half",
+      incomplete: true,
+      incomplete_reason: "network",
+      error: true,
+    });
+
+    const message = game.currentTurns[0]?.messages[0];
+    expect(message?.incomplete).toBe(true);
+    expect(message?.incompleteReason).toBe("network");
+    expect(message?.status).toBe("error");
+    expect(message?.tools[0]?.status).toBe("error");
+    expect(message?.tools[0]?.summary).toBe("工具调用未完成");
+  });
+});
