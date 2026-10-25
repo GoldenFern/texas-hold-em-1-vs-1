@@ -112,6 +112,7 @@ python scripts/preview_final_talk.py --history tmp/context_preview/<run>/message
 - `scripts/run_llm_experiments.py --experiment b` 只跑五组工具对照，不跑三个固定策略 Bot；`--price-input`/`--price-output` 用于不同中转站的单价，`--relay-host` 用于切换健康检查域名。
 - 补跑牌局用 `--deal-offset` 指定新的 deal 区间，避免和已有牌局重叠；`scripts/merge_llm_runs.py` 按 `(deal_index, assignment)` 合并多次运行，重算 1000 手级别的汇总和配对比较。
 - 长实验跨时间补跑时必须固定上下文策略：`eval_llm_vs_bot.py --context-policy legacy --max-context-tokens 220000`（或统一用新的 `compact_slim`），否则默认值切换会让同一实验的前后条件不可比。`run_llm_experiments.py` 已透传这两个参数。
+- 2026-10-25 DXH `compact_slim` 1000 手/组：空白 +136.7 bb/100；随机数 +33.4（p=0.66），牌型分布 -5.1（p=0.94），胜率 +301.6（p=0.0011），跟注 EV +499.3（p=0.0001）。胜率和 EV 首次显著为正，且校正后仍显著；牌型分布无效。对手是随机 Agent，不能外推到强 Bot。
 - `build_system_prompt(..., extra_instructions=...)` 只给实验附加“强烈推荐但非强制”的工具建议；默认不传，UI 提示词仍由模型自行判断是否调用工具。
 - 上下文预算会计入 `reasoning_content`、工具名、参数和 tool id；每轮模型调用前都会重新检查并裁剪。
 - `LLMAgent.cancel()` 会设置取消标记，客户端在每次流式读取前检查，旧比赛不会继续烧模型调用。

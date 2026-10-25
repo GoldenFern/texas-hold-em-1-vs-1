@@ -154,6 +154,14 @@ Each time an LLM is to act:
 
 `send_table_message` is exposed only when both seats are LLM and table talk is enabled; the other five are the core tool set. Event and result fields are documented in [`docs/protocol.md`](docs/protocol.md).
 
+#### What the tools are worth
+
+A 1,000-hand-per-group ablation against a uniform random opponent (GPT-6 Luna, DXH relay, `compact_slim`) shows that only the two numeric tools produced a clear gain. Against the blank group, equity gained **+301.6 bb/100** (p=0.0011) and call EV **+499.3 bb/100** (p=0.0001). Hand-type distribution was flat (-5.1, p=0.94), and the random-number placebo was not significant (+33.4, p=0.66). Same deals and seats were mirrored across groups; error bars are 95% CIs.
+
+[![Tool ablation: 1,000 hands per group](docs/images/dxh_tool_ablation_1000.png)](docs/images/dxh_tool_ablation_1000.png)
+
+The opponent is a uniform random agent, so these numbers should not be read as a win rate against a strong bot. They mainly show which tools reduce obvious mistakes: equity and call EV make the agent call and reach showdown more often, while hand-type distribution does not change its decisions much.
+
 ### Offline LLM vs LLM evaluation
 
 `scripts/eval_llm_vs_llm.py` supports different tool sets and system prompts for the two seats:

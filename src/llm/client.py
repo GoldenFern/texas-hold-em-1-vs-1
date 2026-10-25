@@ -169,7 +169,14 @@ def _classify_text(text: str) -> Optional[str]:
     lowered = (text or "").lower()
     if "invalid api key" in lowered or "authentication" in lowered or "unauthorized" in lowered:
         return "auth"
-    if "rate limit" in lowered or "quota" in lowered or "too many requests" in lowered:
+    if (
+        "rate limit" in lowered
+        or "quota" in lowered
+        or "too many requests" in lowered
+        or "concurrency limit" in lowered
+        or "concurrent" in lowered
+        or "retry later" in lowered
+    ):
         return "rate_limit"
     if any(phrase in lowered for phrase in (
         "context length",

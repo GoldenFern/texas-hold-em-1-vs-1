@@ -346,6 +346,13 @@ def test_context_length_is_classified_for_trimming() -> None:
     assert classify_http(400, "maximum context length exceeded") == "context_length"
 
 
+def test_concurrency_limit_is_classified_as_rate_limit() -> None:
+    assert (
+        classify_http(400, "Concurrency limit exceeded for user, please retry later")
+        == "rate_limit"
+    )
+
+
 def test_duplicate_tool_ids_are_made_unique() -> None:
     client, _ = make_client(
         [
