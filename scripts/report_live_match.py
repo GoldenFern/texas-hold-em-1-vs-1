@@ -457,6 +457,7 @@ def tool_stats(turns: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     turns_with_optional = 0
     total_turns = 0
     forced_calls = 0
+    inline_table_talk = 0
 
     for turn in turns.values():
         total_turns += 1
@@ -473,6 +474,10 @@ def tool_stats(turns: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
             calls_by_name[name] += 1
             if name in FORCED_TOOLS:
                 forced_calls += 1
+            if name == "apply_action":
+                parsed = call.get("parsed") if isinstance(call.get("parsed"), dict) else {}
+                if isinstance(parsed, dict) and str(parsed.get("table_talk") or "").strip():
+                    inline_table_talk += 1
             calls_by_seat[int(turn.get("seat", -1))][name] += 1
             calls_by_street[str(turn.get("street") or "unknown")][name] += 1
             if name in OPTIONAL_TOOLS:
@@ -504,6 +509,7 @@ def tool_stats(turns: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "total_turns": total_turns,
         "calls_by_name": dict(calls_by_name),
+        "inline_table_talk": inline_table_talk,
         "calls_by_seat": {str(seat): dict(counter) for seat, counter in calls_by_seat.items()},
         "calls_by_street": {street: dict(counter) for street, counter in calls_by_street.items()},
         "calls_by_pressure": dict(calls_by_pressure),
@@ -1279,6 +1285,10 @@ def build_report(summary: Dict[str, Any], run_dir: Path) -> str:
     for name in FORCED_TOOLS + OPTIONAL_TOOLS:
         note = "强制" if name in FORCED_TOOLS else "可选"
         lines.append(f"| `{name}` | {tools['calls_by_name'].get(name, 0)} | {note} |")
+    if tools.get("inline_table_talk"):
+        lines.append(
+            f"| `apply_action.table_talk` | {tools['inline_table_talk']} | 强制（内联） |"
+        )
     lines.append("")
     lines.append(
         f"- 总 turn 数 {tools['total_turns']}，其中 {tools['turns_with_optional']} 个 turn 至少调用一次可选工具。"
@@ -1419,10 +1429,16 @@ def build_report(summary: Dict[str, Any], run_dir: Path) -> str:
             f"平均每个 turn {number(tools['optional_calls_per_turn']['mean'], 2)} 次可选工具。"
         )
     else:
-        lines.append(
-            "- 整场没有调用任何可选分析工具；模型全程只用了强制的 "
-            "`send_table_message` 和 `apply_action`。"
-        )
+        if tools.get("inline_table_talk"):
+            lines.append(
+                "- 整场没有调用任何可选分析工具；模型全程只用了强制的 "
+                "`apply_action`，桌边喊话内联在 `table_talk` 参数里。"
+            )
+        else:
+            lines.append(
+                "- 整场没有调用任何可选分析工具；模型全程只用了强制的 "
+                "`send_table_message` 和 `apply_action`。"
+            )
     lines.append(
         f"- 总体缓存命中 {pct(cache['overall_hit'])}，每手第一条请求 {pct(cache['first_hand_hit'])}；"
         f"共触发 {len(cache['compactions'])} 次 checkpoint 压缩。"

@@ -101,7 +101,7 @@ Key 值永远不会返回；只有 `key_present`。
 
 `blind_increase_every_hands` 默认 0，表示关闭；大于 0 时，每完成 N 手，在下一手发牌前按 `blind_increase_factor` 提高大小盲，并保持原来的大小盲比例。`blind_level` 会在状态快照中递增。
 
-`kind` 只能是 `human` / `llm` / `bot`；两个 `human` 返回 400。`table_talk` 必须是布尔值；只有两个座位都是 `llm` 时才真正生效，其他组合会静默关闭并在 `match.table_talk` 返回 `false`。
+`kind` 只能是 `human` / `llm` / `bot`；两个 `human` 返回 400。`table_talk` 必须是布尔值；只有两个座位都是 `llm` 时才真正生效，其他组合会静默关闭并在 `match.table_talk` 返回 `false`。喊话投递方式由服务端 `config/game.json` 的 `llm_runtime.table_talk_mode` 决定，默认 `inline`；快照里的 `match.table_talk_mode` 会返回实际值（`inline` / `tool` / `off`）。
 Bot 座位：
 
 ```json
@@ -248,8 +248,10 @@ Bot 座位：
     "hands_played": 2,
     "max_hands": 0,
     "match_over": false,
+    "aborted": false,
     "god_view": true,
     "table_talk": true,
+    "table_talk_mode": "inline",
     "can_next_hand": false,
     "rules": {"starting_chips": 1000, "small_blind": 10, "big_blind": 20, "starting_small_blind": 5, "starting_big_blind": 10, "blind_level": 1, "auto_rebuy": false, "rebuy_amount": 1000, "max_hands": 0, "blind_increase_every_hands": 10, "blind_increase_factor": 2.0, "seed": 123},
     "seats": [{"seat": 0, "name": "DeepSeek", "kind": "llm", "provider_id": "deepseek", "model_id": "deepseek-flash", "model_name": "DeepSeek V4.1 Flash", "icon": "deepseek.svg", "agent": {}}],
@@ -431,7 +433,7 @@ Socket.IO 事件 `agent_event` 的 payload。所有事件带：
 }
 ```
 
-每个行动回合必须先成功调用一次 `send_table_message`，否则 `apply_action` 返回错误，要求先喊话。被拒绝时返回 `{"ok": false, "error": "...", "remaining_turn": 0}`。喊话失败不计入连续三次非法动作。
+默认 `table_talk_mode=inline`：每个行动回合的第一次 `apply_action` 必须在 `table_talk` 参数里带一到两句喊话。`table_talk` 在 JSON schema 里是可选字段，由 agent 在每回合第一次动作强制要求；这样动作被拒绝后的重试可以省略喊话，也避免只校验 schema 的厂商提前拒绝。缺少 `table_talk` 时返回工具错误 `{"ok": false, "error": "...", "required_tool": "table_talk"}`；喊话通过后执行动作。如果动作本身被拒绝，重试时可以不再重复喊话，重复的 `table_talk` 会被忽略。`table_talk_mode=tool` 保留旧协议：先成功调用一次 `send_table_message`，否则 `apply_action` 返回错误，要求先喊话。旧模式下喊话失败不计入连续三次非法动作；inline 模式下缺少 `table_talk` 属于无效动作，会正常计入失败次数。
 
 ### `table_talk`
 

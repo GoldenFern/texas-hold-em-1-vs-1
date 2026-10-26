@@ -90,12 +90,15 @@ class GameSession:
         self.completed_matches: List[dict] = []
         self.transcripts: Dict[int, List[dict]] = {0: [], 1: []}
         self.table_talk_enabled = False
+        self.table_talk_mode = "off"
         self.table_talk: List[dict] = []
         self.event_seq = 0
         self.state_seq = 0
         self.match_error = ""
+        self.aborted = False
         self.started_at = 0.0
         self._generation = 0
+        self._start_epoch = 0
         self._stop_event = threading.Event()
         self._human_event = threading.Event()
         self._next_hand_event = threading.Event()
@@ -341,6 +344,12 @@ class GameSession:
             raise ValueError(tr(locale, "session.rule.table_talk_bool"))
         return requested and all(seat.kind == "llm" for seat in seats)
 
+    @staticmethod
+    def _resolve_table_talk_mode(runtime: dict) -> str:
+        """Return the configured table-talk delivery mode."""
+        mode = str(runtime.get("table_talk_mode", "inline")).strip().lower()
+        return mode if mode in ("tool", "inline") else "inline"
+
     # ------------------------------------------------------------------
     # Match lifecycle
     # ------------------------------------------------------------------
@@ -359,6 +368,10 @@ class GameSession:
             table_talk_enabled = self._resolve_table_talk(
                 seats, table_talk_requested, locale=self.ui_locale
             )
+            talk_mode = self._resolve_table_talk_mode(
+                self._game_config.get("llm_runtime", {})
+            )
+            effective_talk_mode = talk_mode if table_talk_enabled else "off"
             requested_agent_locale = payload.get("agent_locale")
             if requested_agent_locale in (None, "", "auto"):
                 requested_agent_locale = self.ui_locale
@@ -411,9 +424,15 @@ class GameSession:
             new_agents: Dict[int, object] = {}
             llm_runtime = self._game_config.get("llm_runtime", {})
             llm_tool_names = (
-                AGENT_TOOL_NAMES if table_talk_enabled else GAME_TOOL_NAMES
+                AGENT_TOOL_NAMES
+                if table_talk_enabled and effective_talk_mode == "tool"
+                else GAME_TOOL_NAMES
             )
-            llm_tools = select_tools(llm_tool_names, locale=agent_locale)
+            llm_tools = select_tools(
+                llm_tool_names,
+                locale=agent_locale,
+                table_talk_in_action=(effective_talk_mode == "inline"),
+            )
             llm_system_prompt = build_system_prompt(
                 llm_tool_names,
                 require_estimate_each_turn=bool(
@@ -421,6 +440,7 @@ class GameSession:
                 ),
                 table_talk_max_chars=self._table_talk_limits.max_chars,
                 table_talk_max_per_turn=self._table_talk_limits.max_per_turn,
+                table_talk_mode=effective_talk_mode,
                 locale=agent_locale,
             )
             for seat_index, seat in enumerate(seats):
@@ -450,6 +470,7 @@ class GameSession:
                             else None
                         ),
                         history_provider=self._history_provider,
+                        table_talk_mode=effective_talk_mode,
                         locale=agent_locale,
                     )
                 elif seat.kind == "bot":
@@ -505,6 +526,7 @@ class GameSession:
                 self.current_stats = HistoryStats()
                 self.transcripts = {0: [], 1: []}
                 self.table_talk_enabled = table_talk_enabled
+                self.table_talk_mode = effective_talk_mode
                 self.table_talk = []
                 self._table_talk_seq = 0
                 self._table_talk_cursors = {0: 0, 1: 0}
@@ -1102,8 +1124,10 @@ class GameSession:
             "hands_played": self.game.hands_played,
             "max_hands": self.game.max_hands,
             "match_over": self.game.match_over,
+            "aborted": self.aborted,
             "god_view": self.god_view,
             "table_talk": self.table_talk_enabled,
+            "table_talk_mode": self.table_talk_mode,
             "agent_locale": self.agent_locale,
             "can_next_hand": self.game.street == Street.FINISHED and not self.game.match_over,
             "started_at": self.started_at,

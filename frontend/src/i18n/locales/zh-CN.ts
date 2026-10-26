@@ -91,7 +91,7 @@ export const zhCN = {
   "setup.godView": "上帝视角",
   "setup.godViewHint": "显示双方底牌、烧牌与完整牌堆。Agent 不受影响。",
   "setup.tableTalk": "桌边喊话",
-  "setup.tableTalkHint": "双方 LLM 每个行动回合都必须先喊话一次，再提交动作；比赛结束后还可以再说一句。内容可能是谎言，系统不做真伪核查。",
+  "setup.tableTalkHint": "双方 LLM 每个行动回合都必须喊话一次，话术会和动作一起提交；比赛结束后还可以再说一句。内容可能是谎言，系统不做真伪核查，也不会透露真实底牌。",
   "setup.tableTalkUnavailable": "仅双 LLM 对局可用。",
   "setup.quickBlinds": "快速盲注",
   "setup.valid": "配置有效 · 每个 Agent 只读取自己的底牌，喊话不改变信息边界",
@@ -354,7 +354,7 @@ export const zhCN = {
 
   "talk.note": "双方可见。内容可能是谎言或诱导，系统按原话展示，不做真伪核查。",
   "talk.emptyTitle": "还没有人喊话",
-  "talk.emptyBody": "双方 LLM 每个行动回合都会先喊话一次，比赛结束后还会再说一句。",
+  "talk.emptyBody": "双方 LLM 每个行动回合都会喊话一次，话术和动作一起提交；比赛结束后还会再说一句。",
   "talk.final": "赛后",
 
   "errors.http": "请求失败（HTTP {status}）",

@@ -66,6 +66,11 @@ const talkText = computed(() => String(
   || result.value.text
   || "",
 ));
+const inlineTalk = computed(() => String(
+  result.value.table_talk?.text
+  || result.value.table_talk
+  || "",
+));
 const talkAccepted = computed(() => props.tool.status !== "error" && result.value.ok !== false);
 const constraint = computed(() => {
   if (!isAction.value || !result.value || result.value.ok !== false) return null;
@@ -377,6 +382,9 @@ function percent(value: number): string {
             <span v-for="item in legalActions" :key="item" class="chip">{{ actionLabel(item) }}</span>
           </div>
         </div>
+        <div v-if="inlineTalk" class="inline-talk">
+          <div class="talk-quote">{{ t("tool.talkQuote", { text: inlineTalk }) }}</div>
+        </div>
       </div>
 
       <!-- Random number result -->
@@ -427,7 +435,7 @@ function percent(value: number): string {
         {{ errorText || t("tool.error.generic") }}
       </div>
 
-      <div v-if="tool.status === 'running'" class="running-line">
+      <div v-if="tool.status === 'running' && !isAction && !isTalk" class="running-line">
         <span class="spinner"></span>
         <span>{{ t("tool.executing", { name: toolLabel(tool.name) }) }}</span>
       </div>
@@ -926,6 +934,10 @@ function percent(value: number): string {
   font-size: calc(11.5px * var(--type-scale));
   line-height: 1.65;
   overflow-wrap: anywhere;
+}
+
+.inline-talk {
+  margin-top: 8px;
 }
 
 .talk-meta-row {

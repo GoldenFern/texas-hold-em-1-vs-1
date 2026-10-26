@@ -121,6 +121,7 @@ class LLMAgent(BaseAgent):
         equity_analyzer: Optional[EquityAnalyzer] = None,
         submit_table_talk: Optional[Callable[[str, str], dict]] = None,
         history_provider: Optional[Callable[..., dict]] = None,
+        table_talk_mode: str = "tool",
         locale: str = "zh-CN",
     ) -> None:
         self.seat = seat
@@ -197,7 +198,22 @@ class LLMAgent(BaseAgent):
         self.max_equity_iterations = int(runtime.get("max_equity_iterations", 50000))
         self.max_history_calls = int(runtime.get("max_history_calls_per_turn", 2))
         self.table_talk_limits = TableTalkLimits.from_runtime(runtime)
-        self.tools = list(tools) if tools is not None else build_tools(self.locale)
+        self.submit_table_talk = submit_table_talk
+        mode = str(table_talk_mode or "tool").strip().lower()
+        if mode not in ("tool", "inline", "off"):
+            mode = "tool"
+        if submit_table_talk is None:
+            mode = "off"
+        self.table_talk_mode = mode
+        self.table_talk_required = mode != "off"
+        self.tools = (
+            list(tools)
+            if tools is not None
+            else build_tools(
+                self.locale,
+                table_talk_in_action=(mode == "inline"),
+            )
+        )
         if self.history_provider is None:
             self.tools = [
                 tool
@@ -205,10 +221,30 @@ class LLMAgent(BaseAgent):
                 if tool["function"]["name"] != HISTORY_TOOL_NAME
             ]
         self.tool_names = {tool["function"]["name"] for tool in self.tools}
-        self.table_talk_required = TABLE_TALK_TOOL_NAME in self.tool_names
         if self.require_estimate_each_turn and "estimate_hand_probabilities" not in self.tool_names:
             raise ValueError(self._t("agent.constructor.estimate_required"))
-        self.submit_table_talk = submit_table_talk
+        if self.table_talk_required and mode == "tool" and TABLE_TALK_TOOL_NAME not in self.tool_names:
+            raise ValueError(self._t("agent.constructor.table_talk_tool_missing"))
+        if self.table_talk_required and mode == "inline" and "apply_action" not in self.tool_names:
+            raise ValueError(self._t("agent.constructor.table_talk_action_missing"))
+        if self.table_talk_required and mode == "inline":
+            apply_tool = next(
+                (
+                    tool
+                    for tool in self.tools
+                    if tool["function"]["name"] == "apply_action"
+                ),
+                None,
+            )
+            properties = (
+                apply_tool["function"]["parameters"].get("properties", {})
+                if apply_tool
+                else {}
+            )
+            if "table_talk" not in properties:
+                raise ValueError(
+                    self._t("agent.constructor.table_talk_field_missing")
+                )
         if TABLE_TALK_TOOL_NAME in self.tool_names and submit_table_talk is None:
             raise ValueError(self._t("agent.constructor.table_talk_callback"))
         if system_prompt:
@@ -219,6 +255,7 @@ class LLMAgent(BaseAgent):
                 require_estimate_each_turn=self.require_estimate_each_turn,
                 table_talk_max_chars=self.table_talk_limits.max_chars,
                 table_talk_max_per_turn=self.table_talk_limits.max_per_turn,
+                table_talk_mode=mode,
                 locale=self.locale,
             )
         self.messages: List[dict] = [{"role": "system", "content": self.system_prompt}]
@@ -570,7 +607,8 @@ class LLMAgent(BaseAgent):
                 "scheduled": self._retry_scheduled,
                 "incomplete_streams": self._incomplete_streams,
             },
-            "table_talk": TABLE_TALK_TOOL_NAME in self.tool_names,
+            "table_talk": self.table_talk_required,
+            "table_talk_mode": self.table_talk_mode,
             "history_tool": HISTORY_TOOL_NAME in self.tool_names,
             "context": {
                 "policy": self.context.policy,
@@ -646,12 +684,14 @@ class LLMAgent(BaseAgent):
             turn_message = build_compact_turn_message(
                 view,
                 require_table_talk=self.table_talk_required,
+                table_talk_mode=self.table_talk_mode,
                 locale=self.locale,
             )
         else:
             turn_message = build_turn_message(
                 view,
                 require_table_talk=self.table_talk_required,
+                table_talk_mode=self.table_talk_mode,
                 locale=self.locale,
             )
         self.messages.append({"role": "user", "content": turn_message})
@@ -996,7 +1036,9 @@ class LLMAgent(BaseAgent):
                     {
                         "role": "user",
                         "content": build_nudge_message(
-                            self.table_talk_required, locale=self.locale
+                            self.table_talk_required,
+                            table_talk_mode=self.table_talk_mode,
+                            locale=self.locale,
                         ),
                     }
                 )
@@ -1177,7 +1219,31 @@ class LLMAgent(BaseAgent):
                             )
                         continue
 
-                    if self.table_talk_required and self._talk_count_this_turn == 0:
+                    inline_talk_entry: Optional[dict] = None
+                    if self.table_talk_mode == "inline":
+                        talk_ok, inline_talk_entry = self._submit_inline_table_talk(
+                            call,
+                            parsed,
+                            emit,
+                            turn_id,
+                            index,
+                        )
+                        if not talk_ok:
+                            failures += 1
+                            if failures >= self.max_failures and not soft_failures:
+                                return self._fallback(
+                                    view,
+                                    emit,
+                                    turn_id,
+                                    started,
+                                    steps,
+                                    usage_total,
+                                    reason=self._t("agent.reason.invalid_action"),
+                                    reason_code="invalid_action",
+                                    auto_kind="invalid_action",
+                                )
+                            continue
+                    elif self.table_talk_required and self._talk_count_this_turn == 0:
                         self._append_tool_error(
                             call,
                             self._t("agent.error.talk_first"),
@@ -1289,6 +1355,8 @@ class LLMAgent(BaseAgent):
                         "amount": action.amount,
                         "message": self._t("agent.message.accepted"),
                     }
+                    if inline_talk_entry:
+                        payload["table_talk"] = inline_talk_entry
                     self._append_tool_result(call, payload, emit, turn_id, index, tool_started)
                     continue
 
@@ -1819,6 +1887,62 @@ class LLMAgent(BaseAgent):
             started,
             summary=summary,
         )
+
+    def _submit_inline_table_talk(
+        self,
+        call: ToolCall,
+        parsed: dict,
+        emit,
+        turn_id: str,
+        index: int,
+    ) -> tuple[bool, Optional[dict]]:
+        """Record the mandatory table talk carried by apply_action.
+
+        Only the first apply_action of a turn needs to carry the talk. A
+        retry after an invalid action may omit it or repeat it; a repeated
+        talk is ignored so the per-turn cap does not block the retry.
+        """
+        if self._talk_count_this_turn > 0:
+            return True, None
+        raw_text = parsed.get("table_talk") if isinstance(parsed, dict) else None
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            self._append_tool_error(
+                call,
+                self._t("agent.error.talk_inline_missing"),
+                emit,
+                turn_id,
+                index,
+                extra={"required_tool": "table_talk"},
+            )
+            return False, None
+        if self.submit_table_talk is None:
+            self._append_tool_error(
+                call,
+                self._t("agent.error.talk_disabled"),
+                emit,
+                turn_id,
+                index,
+            )
+            return False, None
+        result = self.submit_table_talk(raw_text, turn_id)
+        if not isinstance(result, dict) or not result.get("ok"):
+            error = (
+                str(result.get("error") or "")
+                if isinstance(result, dict)
+                else ""
+            )
+            self._append_tool_error(
+                call,
+                error or self._t("agent.error.talk_inline_missing"),
+                emit,
+                turn_id,
+                index,
+                extra={"required_tool": "table_talk"},
+            )
+            return False, None
+        self._talk_count_this_turn += 1
+        entry = result.get("entry") if isinstance(result, dict) else None
+        return True, entry if isinstance(entry, dict) else {"text": raw_text}
 
     def _handle_table_talk(
         self,

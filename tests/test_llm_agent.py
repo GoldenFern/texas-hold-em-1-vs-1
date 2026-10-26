@@ -148,6 +148,8 @@ def build_agent(
     tools: list[str] | None = None,
     system_prompt: str | None = None,
     submit_table_talk=None,
+    table_talk_mode: str = "tool",
+    table_talk_in_action: bool = False,
     spec=None,
     params: dict | None = None,
 ):
@@ -181,9 +183,13 @@ def build_agent(
         analyzer=HandDistributionAnalyzer(),
         validate_action=validator or validate,
         runtime=settings,
-        tools=select_tools(tools) if tools is not None else None,
+        tools=select_tools(
+            tools,
+            table_talk_in_action=table_talk_in_action,
+        ) if tools is not None else None,
         system_prompt=system_prompt,
         submit_table_talk=submit_table_talk,
+        table_talk_mode=table_talk_mode,
     )
     return agent, events
 
@@ -403,6 +409,18 @@ def test_table_talk_prompt_and_untrusted_turn_block() -> None:
     assert "没有喊话的 apply_action 会被系统拒绝" in prompted
     assert "默认不可信" in prompted
     assert "不超过 120 字" in prompted
+    assert "不要报牌" in prompted
+    assert "诈唬" in prompted
+    assert "烟雾弹" in prompted
+
+    inline = build_system_prompt(
+        GAME_TOOL_NAMES,
+        table_talk_max_chars=120,
+        table_talk_mode="inline",
+    )
+    assert "table_talk 参数" in inline
+    assert "不需要单独的喊话工具" in inline
+    assert "不要报牌" in inline
 
     view = replace(
         make_view(),
@@ -625,6 +643,126 @@ def test_table_talk_per_turn_cap() -> None:
     assert results[0]["ok"] is True
     assert results[1]["ok"] is False
     assert "上限" in results[1]["summary"]
+
+
+def test_inline_table_talk_is_submitted_with_apply_action() -> None:
+    submitted: list[tuple[str, str]] = []
+
+    def submit(text: str, turn_id: str) -> dict:
+        submitted.append((text, turn_id))
+        return {"ok": True, "entry": {"text": text}}
+
+    agent, events = build_agent(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "name": "apply_action",
+                        "arguments": (
+                            '{"action": "check", "table_talk": '
+                            '"这个尺寸像是在保护中等牌力，我会用更宽的范围继续。"}'
+                        ),
+                    }
+                ]
+            }
+        ],
+        tools=list(GAME_TOOL_NAMES),
+        submit_table_talk=submit,
+        table_talk_mode="inline",
+        table_talk_in_action=True,
+    )
+    action = agent.decide(make_view(), events.append)
+    assert action.type == ActionType.CHECK
+    assert action.auto is False
+    assert submitted and submitted[0][0] == "这个尺寸像是在保护中等牌力，我会用更宽的范围继续。"
+    assert agent._talk_count_this_turn == 1
+    results = [
+        event
+        for event in events
+        if event["type"] == "tool_result" and event.get("name") == "apply_action"
+    ]
+    assert results and results[0]["ok"] is True
+    assert results[0]["result"]["table_talk"]["text"] == submitted[0][0]
+
+
+def test_inline_table_talk_missing_is_rejected() -> None:
+    submitted: list[str] = []
+
+    def submit(text: str, turn_id: str) -> dict:
+        submitted.append(text)
+        return {"ok": True, "entry": {"text": text}}
+
+    agent, events = build_agent(
+        [
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action": "check"}'}
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "name": "apply_action",
+                        "arguments": '{"action": "check", "table_talk": "这次别再便宜跟了。"}',
+                    }
+                ]
+            },
+        ],
+        tools=list(GAME_TOOL_NAMES),
+        submit_table_talk=submit,
+        table_talk_mode="inline",
+        table_talk_in_action=True,
+    )
+    action = agent.decide(make_view(), events.append)
+    assert action.type == ActionType.CHECK
+    assert submitted == ["这次别再便宜跟了。"]
+    results = [
+        event
+        for event in events
+        if event["type"] == "tool_result" and event.get("name") == "apply_action"
+    ]
+    assert [result["ok"] for result in results] == [False, True]
+    assert "table_talk" in results[0]["summary"]
+
+
+def test_inline_talk_is_not_repeated_after_invalid_action() -> None:
+    submitted: list[str] = []
+
+    def submit(text: str, turn_id: str) -> dict:
+        submitted.append(text)
+        return {"ok": True, "entry": {"text": text}}
+
+    agent, events = build_agent(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "name": "apply_action",
+                        "arguments": '{"action": "bet", "amount": 5, "table_talk": "我先放个烟雾弹。"}',
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action": "check"}'}
+                ]
+            },
+        ],
+        tools=list(GAME_TOOL_NAMES),
+        submit_table_talk=submit,
+        table_talk_mode="inline",
+        table_talk_in_action=True,
+    )
+    action = agent.decide(make_view(), events.append)
+    assert action.type == ActionType.CHECK
+    assert submitted == ["我先放个烟雾弹。"]
+    assert agent._talk_count_this_turn == 1
+    results = [
+        event
+        for event in events
+        if event["type"] == "tool_result" and event.get("name") == "apply_action"
+    ]
+    assert [result["ok"] for result in results] == [False, True]
 
 
 def test_final_table_talk_uses_talk_tool_without_action() -> None:

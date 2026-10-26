@@ -33,6 +33,7 @@
     "max_equity_iterations": 50000,
     "table_talk_max_chars": 160,
     "table_talk_max_per_turn": 1,
+    "table_talk_mode": "inline",
     "table_talk_history_limit": 6,
     "table_talk_snapshot_limit": 40,
     "max_context_tokens_estimate": 0,

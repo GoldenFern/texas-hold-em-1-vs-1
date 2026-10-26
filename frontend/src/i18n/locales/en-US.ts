@@ -93,7 +93,7 @@ export const enUS = {
   "setup.godView": "God view",
   "setup.godViewHint": "Show both hole cards, burn cards, and the full deck. Agents are unaffected.",
   "setup.tableTalk": "Table talk",
-  "setup.tableTalkHint": "In LLM vs LLM, both sides must speak before acting each turn and may add one line after the match. Content can be deceptive; the system does not fact-check it.",
+  "setup.tableTalkHint": "In LLM vs LLM, both sides must speak every action turn; the talk is submitted together with the action, and each side may add one line after the match. Content can be deceptive; the system does not fact-check it or reveal real hole cards.",
   "setup.tableTalkUnavailable": "Only available in LLM vs LLM.",
   "setup.quickBlinds": "Quick blinds",
   "setup.valid": "Configuration valid · each agent only sees its own hole cards; table talk does not change the information boundary",
@@ -356,7 +356,7 @@ export const enUS = {
 
   "talk.note": "Visible to both players. Content may be deceptive; the system shows it verbatim and does not fact-check it.",
   "talk.emptyTitle": "No table talk yet",
-  "talk.emptyBody": "Both LLMs speak before acting each turn and add one line after the match.",
+  "talk.emptyBody": "Both LLMs speak every action turn; the talk is submitted with the action, and each side adds one line after the match.",
   "talk.final": "Post-match",
 
   "errors.http": "Request failed (HTTP {status})",

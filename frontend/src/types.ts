@@ -155,8 +155,10 @@ export interface MatchState {
   hands_played: number;
   max_hands: number;
   match_over: boolean;
+  aborted?: boolean;
   god_view: boolean;
   table_talk?: boolean;
+  table_talk_mode?: "tool" | "inline" | "off";
   agent_locale?: "zh-CN" | "en-US";
   can_next_hand: boolean;
   started_at: number;

@@ -1,5 +1,7 @@
 # 真实后端 LLM 自对弈实验（2026-10-25）
 
+> 2026-10-26 起默认 `table_talk_mode=inline`：喊话放进 `apply_action.table_talk`，正常路径一次请求完成“说 + 做”。本报告的 421 次主对局请求 / 210 个 turn 是旧的两步 tool 模式基线，用来对照 inline 模式的请求数和延迟。
+
 ## 目的
 
 在真实 Flask + SocketIO + `GameSession` 后端里，让两个 GPT-6 Luna 完整对打，观察：

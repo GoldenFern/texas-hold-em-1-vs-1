@@ -6,7 +6,8 @@
 
 - 游戏引擎：严格双人规则，Treys 牌力评估
 - Agent：每次行动发一条新的牌局消息，保留上下文；五个基础工具：牌型概率 + 胜率 + 随机数 + 跟注 EV + 执行动作
-- 桌边喊话：LLM vs LLM 时双方每个行动回合都必须先喊话再行动，比赛结束后还可以根据结果再说一句，可以祝贺、复盘或嘲讽；对手下一次决策时看到不可信标记，人类对 LLM 暂不开放
+- 桌边喊话：LLM vs LLM 时双方每个行动回合都必须喊话一次，默认把话术写进 `apply_action.table_talk`，也可以切回旧的 `send_table_message` 两步模式；比赛结束后还可以根据结果再说一句，可以祝贺、复盘或嘲讽；对手下一次决策时看到不可信标记，人类对 LLM 暂不开放
+- 对局控制：设置框可以随时关闭，运行中的对局可以从设置框“中止本局”；客户端请求有超时，不会因为请求挂住把弹窗锁死
 - 可视化：实时思考流、工具卡片、Token/延迟、最终牌型分布、胜率/跟注 EV、双方对话
 - 上帝视角：双方底牌、烧牌、完整牌堆
 - LLM：DeepSeek / 火山引擎 / MiniMax / Qwen / 智谱 GLM / Kimi / LongCat / MiMo / 4Router
@@ -136,7 +137,7 @@ cd frontend && npm run dev     # 终端 2，:5173，代理到 :5050
 4. `estimate_equity` 返回当前摊牌 equity（`胜率 + 平局率/2`），默认假设对手随机手牌。河牌和转牌精确枚举，翻牌和翻前各 20000 次蒙特卡洛，并走 LRU 缓存。
 5. `call_ev` 用当前底池、跟注额和筹码计算静态跟注 EV。`equity` 参数可以省略，省略时自动估算；短码全下会先扣掉对手匹配不上的退款。
 6. 如果分析后仍难以在几个接近的方案中取舍，Agent 可以调用 `get_random_number` 抽一个 `[0, 1)` 随机数。它只是打破僵局的备选方案，不能替代分析。
-7. LLM vs LLM 且开局启用「桌边喊话」时，Agent 每个行动回合都必须先调用 `send_table_message` 一次，再调用 `apply_action`；不喊话的动作会被拒绝。比赛结束后，每个 LLM 还可以根据结果说一句赛后话，可以祝贺、复盘、调侃或嘲讽。对手在下一次决策时看到，内容默认不可信。系统只限制长度、格式和频率，不核查真伪。
+7. LLM vs LLM 且开局启用「桌边喊话」时，Agent 每个行动回合都必须喊话一次。默认 `inline` 模式把话术写进 `apply_action.table_talk`，一次请求完成“说 + 做”；旧的 `tool` 模式先调用 `send_table_message`，再调用 `apply_action`，通常要两次请求。缺少 `table_talk` 会被拒绝。比赛结束后，每个 LLM 还可以根据结果说一句赛后话，可以祝贺、复盘、调侃或嘲讽。对手在下一次决策时看到，内容默认不可信。系统只限制长度、格式和频率，不核查真伪。
 8. `apply_action` 合法就进入下一回合；不合法会把错误、最新约束和合法动作回传给模型，让它重试。
 9. 连续三次无效动作：自动 **call**；无法 call 则 **fold**。网络/超时等非动作失败则优先 check/call，避免无意义弃牌。
 10. 厂商要求回传 `reasoning_content` 的（DeepSeek / Qwen / MiniMax / Kimi / GLM 等）会原样回传；不支持的可选参数在 400 时会自动降级重试。
@@ -149,10 +150,10 @@ cd frontend && npm run dev     # 终端 2，:5173，代理到 :5050
 | `estimate_equity` | 无 | 估算对随机手牌的摊牌 equity（`胜率 + 平局率/2`）。 |
 | `get_random_number` | 无 | 返回 `[0, 1)` 均匀随机数，只用于打破接近的决策。 |
 | `call_ev` | `equity` 可选，0 到 1 | 计算静态跟注 EV、盈亏平衡胜率和有效底池；省略时自动估算。 |
-| `apply_action` | `action` 必填（`fold/check/call/bet/raise/all_in`）；`amount` 仅 bet/raise 使用 | 每回合提交恰好一次最终动作。`amount` 是本街总额（raise-to），不是增量。 |
-| `send_table_message` | `text` 必填 | 仅 LLM vs LLM 的桌边喊话；启用时每回合先喊话再 `apply_action`。 |
+| `apply_action` | `action` 必填（`fold/check/call/bet/raise/all_in`）；`amount` 仅 bet/raise；inline 喊话模式还有 `table_talk` | 每回合恰好提交一次最终动作。`amount` 是本街总额（raise-to），不是增量。inline 模式下每回合第一次动作必须带 `table_talk`。 |
+| `send_table_message` | `text` 必填 | 仅 LLM vs LLM 的桌边喊话；只在旧的 `tool` 模式暴露。inline 模式的喊话放在 `apply_action.table_talk`。 |
 
-`send_table_message` 只在双方都是 LLM 且开启桌边喊话时暴露，其余五个是核心工具集。工具事件与返回字段见 [`docs/protocol.md`](docs/protocol.md)。
+`send_table_message` 只在 `tool` 模式暴露；`inline` 模式把喊话放在 `apply_action` 里。其余五个是核心工具集。工具事件与返回字段见 [`docs/protocol.md`](docs/protocol.md)。
 
 ### 离线 LLM 对 LLM 评测
 

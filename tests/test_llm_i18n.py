@@ -113,6 +113,17 @@ def test_english_system_prompt_and_tools() -> None:
     )
     assert "[Table talk (hard rule)]" in talk_prompt
     assert "English sentences" in talk_prompt
+    assert "Never report your hand" in talk_prompt
+    assert "bluffing" in talk_prompt
+
+    inline_talk = build_system_prompt(
+        GAME_TOOL_NAMES,
+        table_talk_mode="inline",
+        locale="en-US",
+    )
+    assert "table_talk argument of apply_action" in inline_talk
+    assert "no separate table-talk tool" in inline_talk
+    assert "Never report your hand" in inline_talk
 
 
 def test_english_turn_and_result_messages() -> None:

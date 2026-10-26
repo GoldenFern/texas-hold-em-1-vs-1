@@ -133,6 +133,25 @@ def test_agent_tools_insert_history_and_table_talk_before_apply_action() -> None
         assert names[-1] == "apply_action"
 
 
+def test_inline_table_talk_adds_argument_to_apply_action() -> None:
+    for locale in ("zh-CN", "en-US"):
+        tools = select_tools(
+            GAME_TOOL_NAMES,
+            locale,
+            table_talk_in_action=True,
+        )
+        action = next(
+            tool for tool in tools if tool["function"]["name"] == "apply_action"
+        )
+        parameters = action["function"]["parameters"]
+        assert "table_talk" in parameters["properties"]
+        assert "table_talk" not in parameters["required"]
+        assert parameters["properties"]["table_talk"]["description"]
+        assert TABLE_TALK_TOOL_NAME not in [
+            tool["function"]["name"] for tool in tools
+        ]
+
+
 def test_game_tools_add_history_without_changing_the_baseline() -> None:
     assert list(ALL_TOOL_NAMES) == EXPECTED_TOOL_NAMES
     assert HISTORY_TOOL_NAME in GAME_TOOL_NAMES

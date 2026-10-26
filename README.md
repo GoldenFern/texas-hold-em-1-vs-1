@@ -6,7 +6,8 @@ A lab built specifically for **heads-up no-limit Texas Hold'em**: pick any two o
 
 - Game engine: strict two-player rules, Treys hand evaluation
 - Agents: a fresh game-state message for every action while the full context is kept; five core tools: hand-type probabilities + equity + random number + call EV + apply action
-- Table talk: in LLM vs LLM, both sides must speak before acting each turn, and can add one post-match line after the result (congratulate, review, tease, or trash-talk). The opponent sees it flagged as untrusted at its next decision; not available for human vs LLM yet
+- Table talk: in LLM vs LLM, both sides must speak every action turn (inline `apply_action.table_talk` by default, or the older `send_table_message` tool mode), and can add one post-match line after the result (congratulate, review, tease, or trash-talk). The opponent sees it flagged as untrusted at its next decision; not available for human vs LLM yet
+- Match control: the setup sheet can always be closed, a running match can be aborted from the sheet, and client requests time out instead of locking the UI
 - Visualization: live reasoning stream, tool cards, tokens/latency, final hand-type distribution, equity/call EV, and both sides' table talk
 - God view: both hole cards, burn cards, and the full deck
 - LLM: DeepSeek / Volcengine / MiniMax / Qwen / Zhipu GLM / Kimi / LongCat / MiMo / 4Router
@@ -136,7 +137,7 @@ Each time an LLM is to act:
 4. `estimate_equity` returns the current showdown equity (`win rate + tie rate / 2`), assuming a random opponent hand by default. River and turn are exact enumerations; flop and preflop use 20,000 Monte Carlo samples each, with LRU caching.
 5. `call_ev` computes static call EV from the current pot, call amount, and stacks. The `equity` argument may be omitted, in which case it is estimated automatically; for short-stack all-ins, the unmatched refund is deducted first.
 6. If the analysis still leaves several close options, the agent may call `get_random_number` for a uniform `[0, 1)` draw. It is only a tie-breaker, not a substitute for analysis.
-7. When both seats are LLM and table talk is enabled at match start, the agent must call `send_table_message` once before `apply_action` every turn; actions without a message are rejected. After the match, each LLM may add one post-match line based on the result (congratulate, review, tease, or trash-talk). The opponent sees it at its next decision and treats it as untrusted. The system only limits length, format, and frequency; it does not verify truthfulness.
+7. When both seats are LLM and table talk is enabled at match start, every action turn must include one table-talk message. The default `inline` mode puts it in the `table_talk` argument of `apply_action`, so "say" and "act" travel in one model request; the older `tool` mode calls `send_table_message` first and then `apply_action`, which usually takes two requests per turn. A missing `table_talk` is rejected. After the match, each LLM may add one post-match line based on the result (congratulate, review, tease, or trash-talk). The opponent sees it at its next decision and treats it as untrusted. The system only limits length, format, and frequency; it does not verify truthfulness.
 8. A legal `apply_action` advances the turn; an illegal one sends the error, latest constraints, and legal actions back to the model for a retry.
 9. Three invalid actions in a row: automatic **call**; if calling is impossible, **fold**. Non-action failures such as network errors or timeouts prefer check/call to avoid pointless folds.
 10. Providers that require `reasoning_content` to be echoed (DeepSeek / Qwen / MiniMax / Kimi / GLM, etc.) get it passed back verbatim; unsupported optional parameters are automatically dropped with a retry on HTTP 400.
@@ -149,10 +150,10 @@ Each time an LLM is to act:
 | `estimate_equity` | none | Estimates showdown equity against a random hand (`win + tie / 2`). |
 | `get_random_number` | none | Returns a uniform `[0, 1)` number, only for breaking a close decision. |
 | `call_ev` | `equity` optional, 0-1 | Computes static call EV, break-even equity, and effective pot; estimates equity when omitted. |
-| `apply_action` | `action` required (`fold/check/call/bet/raise/all_in`); `amount` for bet/raise only | Submits the final action exactly once per turn. `amount` is the street total (raise-to), not the increment. |
-| `send_table_message` | `text` required | Table talk for LLM vs LLM only; when enabled, call it before `apply_action` each turn. |
+| `apply_action` | `action` required (`fold/check/call/bet/raise/all_in`); `amount` for bet/raise only; `table_talk` in inline table-talk mode | Submits the final action exactly once per turn. `amount` is the street total (raise-to), not the increment. In `inline` mode the first action of a turn must include `table_talk`. |
+| `send_table_message` | `text` required | Table talk for LLM vs LLM only; exposed in the older `tool` mode. In `inline` mode the talk goes in `apply_action.table_talk` instead. |
 
-`send_table_message` is exposed only when both seats are LLM and table talk is enabled; the other five are the core tool set. Event and result fields are documented in [`docs/protocol.md`](docs/protocol.md).
+`send_table_message` is exposed only in `tool` mode; `inline` mode keeps the talk inside `apply_action`. The other five are the core tool set. Event and result fields are documented in [`docs/protocol.md`](docs/protocol.md).
 
 #### What the tools are worth
 
@@ -164,7 +165,7 @@ The opponent is a uniform random agent, so these numbers should not be read as a
 
 #### A complete live self-play match
 
-Two GPT-6 Luna seats also played a full 1,000-chip match through the real Flask + SocketIO backend. With blinds doubling every 10 hands, the match finished in **42 hands and 42.7 minutes**: Luna B won 2,000 to 0. The match cost **¥0.35**, used 17.5M input tokens, and held a **98.0% cache hit rate**. No optional analysis tool was called in 210 turns; the model only used the mandatory `send_table_message` and `apply_action`.
+Two GPT-6 Luna seats also played a full 1,000-chip match through the real Flask + SocketIO backend. With blinds doubling every 10 hands, the match finished in **42 hands and 42.7 minutes**: Luna B won 2,000 to 0. The match cost **¥0.35**, used 17.5M input tokens, and held a **98.0% cache hit rate**. No optional analysis tool was called in 210 turns; the model only used the mandatory table talk and `apply_action`. This run used the older two-step talk protocol: 421 main requests for 210 turns. Inline table talk was added afterwards to bring the normal path down to one request per turn.
 
 [![Complete live self-play match](docs/images/live_match_blinds_stack.png)](docs/images/live_match_blinds_stack.png)
 

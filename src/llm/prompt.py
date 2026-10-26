@@ -39,11 +39,32 @@ def build_table_talk_section(
     max_chars: int = 160,
     max_per_turn: int = 1,
     locale: str = "zh-CN",
+    mode: str = "tool",
 ) -> str:
-    """Build the table-talk rules inserted into the system prompt."""
+    """Build the table-talk rules inserted into the system prompt.
+
+    Args:
+        max_chars: Maximum characters in one table-talk message.
+        max_per_turn: Maximum table-talk messages per turn.
+        locale: Prompt language, ``zh-CN`` or ``en-US``.
+        mode: ``tool`` for the separate send_table_message tool, ``inline``
+            for the table_talk argument of apply_action.
+
+    Returns:
+        The table-talk section.
+    """
     text = prompt_text(_locale(locale))
+    if mode == "inline":
+        delivery = text["table_talk_delivery_inline"]
+        continue_rule = text["table_talk_continue_inline"]
+    else:
+        delivery = text["table_talk_delivery_tool"].format(
+            tool=TABLE_TALK_TOOL_NAME
+        )
+        continue_rule = text["table_talk_continue_tool"]
     return text["table_talk_section"].format(
-        tool=TABLE_TALK_TOOL_NAME,
+        delivery=delivery,
+        continue_rule=continue_rule,
         max_chars=max_chars,
         max_per_turn=max_per_turn,
     )
@@ -56,6 +77,7 @@ def build_system_prompt(
     extra_instructions: str = "",
     table_talk_max_chars: int = 160,
     table_talk_max_per_turn: int = 1,
+    table_talk_mode: str = "tool",
     locale: str = "zh-CN",
 ) -> str:
     """Build a system prompt matching the tools available to one seat.
@@ -69,6 +91,9 @@ def build_system_prompt(
             about whether auxiliary tools should be used.
         table_talk_max_chars: Maximum characters in one table-talk message.
         table_talk_max_per_turn: Maximum table-talk messages per turn.
+        table_talk_mode: ``tool`` for a separate send_table_message tool,
+            ``inline`` for the table_talk argument of apply_action, or
+            ``off`` when table talk is disabled.
         locale: Prompt language, ``zh-CN`` or ``en-US``.
 
     Returns:
@@ -83,12 +108,14 @@ def build_system_prompt(
     unknown = names.difference(AGENT_TOOL_NAMES)
     if unknown:
         raise ValueError(text["unknown_tool"].format(tools=", ".join(sorted(unknown))))
+    mode = table_talk_mode if table_talk_mode in ("tool", "inline", "off") else "tool"
     has_estimate = "estimate_hand_probabilities" in names
     has_equity = "estimate_equity" in names
     has_random = "get_random_number" in names
     has_call_ev = "call_ev" in names
     has_history = HISTORY_TOOL_NAME in names
-    has_table_talk = TABLE_TALK_TOOL_NAME in names
+    has_talk_tool = TABLE_TALK_TOOL_NAME in names
+    has_table_talk = mode == "inline" or (mode == "tool" and has_talk_tool)
 
     steps: List[str] = [text["step_state"]]
     if has_estimate:
@@ -105,7 +132,13 @@ def build_system_prompt(
         steps.append(text["step_random"])
     if has_history:
         steps.append(text["step_history"])
-    if has_table_talk:
+    if mode == "inline":
+        steps.append(
+            text["step_table_talk_inline"].format(
+                max=table_talk_max_per_turn,
+            )
+        )
+    elif has_table_talk:
         steps.append(
             text["step_table_talk"].format(
                 tool=TABLE_TALK_TOOL_NAME,
@@ -131,7 +164,7 @@ def build_system_prompt(
         auxiliaries.append("call_ev")
     if has_history:
         auxiliaries.append(HISTORY_TOOL_NAME)
-    if has_table_talk:
+    if mode == "tool" and has_talk_tool:
         auxiliaries.append(TABLE_TALK_TOOL_NAME)
     if auxiliaries:
         tool_style = text["tool_style_aux"].format(tools=_join(auxiliaries, locale))
@@ -145,6 +178,7 @@ def build_system_prompt(
                 max_chars=table_talk_max_chars,
                 max_per_turn=table_talk_max_per_turn,
                 locale=locale,
+                mode=mode,
             )
             + "\n\n"
         )
@@ -173,6 +207,7 @@ def _localize_action(item: dict, locale: str) -> dict:
 def build_turn_message(
     view: AgentView,
     require_table_talk: bool = False,
+    table_talk_mode: str = "tool",
     locale: str = "zh-CN",
 ) -> str:
     locale = _locale(locale)
@@ -231,7 +266,11 @@ def build_turn_message(
                 )
             )
     if require_table_talk:
-        lines.append(text["turn_talk_required"])
+        lines.append(
+            text["turn_talk_required_inline"]
+            if table_talk_mode == "inline"
+            else text["turn_talk_required"]
+        )
     lines.append(text["turn_closing"])
     return "\n".join(lines)
 
@@ -239,6 +278,7 @@ def build_turn_message(
 def build_compact_turn_message(
     view: AgentView,
     require_table_talk: bool = False,
+    table_talk_mode: str = "tool",
     locale: str = "zh-CN",
 ) -> str:
     """Build a smaller turn update for context experiments.
@@ -298,18 +338,31 @@ def build_compact_turn_message(
                 )
             )
     if require_table_talk:
-        lines.append(text["turn_talk_required"])
+        lines.append(
+            text["turn_talk_required_inline"]
+            if table_talk_mode == "inline"
+            else text["turn_talk_required"]
+        )
     lines.append(text["turn_closing_compact"])
     return "\n".join(lines)
 
 
-def build_nudge_message(require_table_talk: bool = False, locale: str = "zh-CN") -> str:
+def build_nudge_message(
+    require_table_talk: bool = False,
+    table_talk_mode: str = "tool",
+    locale: str = "zh-CN",
+) -> str:
     locale = _locale(locale)
     text = prompt_text(locale)
     prefix = text["nudge_prefix"]
     separator = "" if locale == "zh-CN" else " "
     if require_table_talk:
-        prefix += separator + text["nudge_talk"]
+        nudge = (
+            text["nudge_talk_inline"]
+            if table_talk_mode == "inline"
+            else text["nudge_talk"]
+        )
+        prefix += separator + nudge
     return f"{prefix}{separator}{text['nudge_action']}"
 
 
