@@ -76,6 +76,28 @@ def test_table_talk_requires_boolean_and_two_llm_seats() -> None:
         assert response.status_code == 200
         assert session.table_talk_enabled is False
         assert response.get_json()["state"]["match"]["table_talk"] is False
+        assert response.get_json()["state"]["match"]["table_talk_mode"] == "off"
+    finally:
+        session.shutdown()
+
+
+def test_abort_endpoint_stops_match() -> None:
+    client, session = make_client()
+    try:
+        payload = {
+            "seats": [
+                {"kind": "human", "name": "You"},
+                {"kind": "bot", "name": "Bot", "bot": {"agent_type": "random"}},
+            ],
+            "rules": {"starting_chips": 1000},
+        }
+        response = client.post("/api/game/new", json=payload)
+        assert response.status_code == 200
+        response = client.post("/api/game/abort")
+        assert response.status_code == 200
+        state = response.get_json()["state"]
+        assert state["match"]["aborted"] is True
+        assert state["match"]["match_over"] is True
     finally:
         session.shutdown()
 

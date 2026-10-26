@@ -128,6 +128,43 @@ def test_human_token_is_set_when_state_is_broadcast() -> None:
         session.shutdown()
 
 
+def test_abort_match_marks_state_and_rejects_actions() -> None:
+    session = make_session()
+    try:
+        session.start_match(human_vs_random())
+        state = session.abort_match()
+        assert state["match"]["aborted"] is True
+        assert state["match"]["match_over"] is True
+        assert state["acting_seat"] is None
+        assert session.aborted is True
+
+        with pytest.raises(ValueError):
+            session.human_action({"action": "check"})
+
+        again = session.abort_match()
+        assert again["match"]["aborted"] is True
+    finally:
+        session.shutdown()
+
+
+def test_abort_during_start_cancels_pending_start() -> None:
+    session = make_session()
+    try:
+        original = session._parse_seats
+
+        def parse(payload):
+            seats = original(payload)
+            session.abort_match()
+            return seats
+
+        session._parse_seats = parse  # type: ignore[method-assign]
+        with pytest.raises(ValueError):
+            session.start_match(human_vs_random())
+        assert session.game is None
+    finally:
+        session.shutdown()
+
+
 def test_bot_delay_defaults_and_validates_range() -> None:
     session = make_session()
     try:
@@ -147,6 +184,13 @@ def test_bot_delay_defaults_and_validates_range() -> None:
                 session._parse_seats(payload)
     finally:
         session.shutdown()
+
+
+def test_table_talk_mode_defaults_to_inline_and_rejects_unknown() -> None:
+    assert GameSession._resolve_table_talk_mode({}) == "inline"
+    assert GameSession._resolve_table_talk_mode({"table_talk_mode": "tool"}) == "tool"
+    assert GameSession._resolve_table_talk_mode({"table_talk_mode": "INLINE"}) == "inline"
+    assert GameSession._resolve_table_talk_mode({"table_talk_mode": "nope"}) == "inline"
 
 
 def test_rule_normalization_is_strict_and_explicit() -> None:

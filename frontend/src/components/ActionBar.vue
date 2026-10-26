@@ -32,6 +32,8 @@ const canAct = computed(
     Boolean(snapshot.value?.has_match) &&
     snapshot.value?.acting_kind === "human" &&
     snapshot.value?.street !== "finished" &&
+    !match.value?.match_over &&
+    !match.value?.aborted &&
     !game.busy &&
     !boardLocked.value,
 );
@@ -86,6 +88,7 @@ const phaseText = computed(() => {
   }
   if (game.busy) return t("table.submitting");
   if (!match.value) return t("topbar.noMatch");
+  if (match.value.aborted) return t("table.matchAborted");
   if (match.value.match_over) return t("table.matchOver");
   if (snapshot.value?.street === "finished") return t("table.handOver");
   if (snapshot.value?.acting_kind === "human") return t("table.yourTurn");
@@ -205,7 +208,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
     <div class="status-side">
       <div class="status-line">
         <span v-if="canAct" class="dot live"></span>
-        <span v-else-if="snapshot?.street === 'finished' || match?.match_over" class="dot"></span>
+        <span v-else-if="snapshot?.street === 'finished' || match?.match_over || match?.aborted" class="dot"></span>
         <span v-else class="spinner"></span>
         <span class="status-text">{{ phaseText }}</span>
       </div>
@@ -289,8 +292,8 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
       </div>
     </div>
 
-    <div v-else-if="match?.match_over" class="waiting-side">
-      <span class="match-end">{{ t("table.matchEnded") }}</span>
+    <div v-else-if="match?.match_over || match?.aborted" class="waiting-side">
+      <span class="match-end">{{ match?.aborted ? t("table.matchAborted") : t("table.matchEnded") }}</span>
       <button class="btn btn-primary" @click="openSetup">{{ t("table.newMatch") }}</button>
     </div>
   </div>

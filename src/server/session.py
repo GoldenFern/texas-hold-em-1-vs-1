@@ -357,6 +357,7 @@ class GameSession:
     def start_match(self, payload: dict) -> dict:
         # Serialize match starts so two requests cannot race on the same state.
         with self._start_lock:
+            start_epoch = self._start_epoch
             seats = self._parse_seats(payload)
             rules = self._normalize_rules(
                 payload.get("rules") if isinstance(payload.get("rules"), dict) else {}
@@ -512,6 +513,8 @@ class GameSession:
 
             new_match_id = uuid.uuid4().hex[:12]
             with self.lock:
+                if start_epoch != self._start_epoch:
+                    raise ValueError(self._t("session.start_cancelled"))
                 self._stop_current_thread()
                 generation = self._generation
                 generation_holder["value"] = generation
@@ -535,6 +538,7 @@ class GameSession:
                 self.event_seq = 0
                 self.state_seq = 0
                 self.match_error = ""
+                self.aborted = False
                 self.started_at = time.time()
                 self._last_result_hand_id = -1
                 self._human_token = None
@@ -551,6 +555,8 @@ class GameSession:
         # Give the thread a moment to deal the first hand.
         for _ in range(120):
             with self.lock:
+                if start_epoch != self._start_epoch:
+                    break
                 if self.game and self.game.hand_id > 0:
                     break
             time.sleep(0.025)
@@ -860,10 +866,40 @@ class GameSession:
             except Exception:  # noqa: BLE001
                 pass
 
+    def abort_match(self) -> dict:
+        """Stop the running match without waiting for an in-flight request.
+
+        The game thread is cancelled by generation; any response that arrives
+        later is discarded by the existing ``_alive`` checks. The table stays
+        visible with ``match.aborted`` set so the UI can show an explicit
+        stopped state and offer a new match.
+        """
+        with self.lock:
+            self._start_epoch += 1
+            has_active_match = bool(self.game and not self.game.match_over)
+            if has_active_match:
+                self.aborted = True
+                self.match_error = ""
+                self.game.match_over = True
+                self._human_token = None
+                self._human_event.set()
+                self._next_hand_event.set()
+                self._stop_current_thread()
+                self._emit(
+                    {
+                        "type": "match_aborted",
+                        "text": self._t("session.event.match_aborted"),
+                    }
+                )
+                self._broadcast_state()
+            return self.get_state()
+
     def next_hand(self) -> dict:
         with self.lock:
             if not self.game:
                 raise ValueError(self._t("session.not_started"))
+            if self.aborted:
+                raise ValueError(self._t("session.aborted"))
             if self.match_error or not self._thread_alive_locked():
                 raise ValueError(self._t("session.thread_stopped"))
             if self.game.street != Street.FINISHED:
@@ -883,6 +919,8 @@ class GameSession:
         with self.lock:
             if not self.game:
                 raise ValueError(self._t("session.not_started"))
+            if self.aborted:
+                raise ValueError(self._t("session.aborted"))
             if self.match_error or not self._thread_alive_locked():
                 raise ValueError(self._t("session.thread_stopped"))
             actor = self.game.actor
@@ -1114,6 +1152,12 @@ class GameSession:
         reveal_all = self.god_view
         human_seats = self.game.human_seats
         snapshot = self.game.snapshot(reveal_all=reveal_all, reveal_seats=human_seats)
+        if self.aborted:
+            snapshot["acting_seat"] = None
+            snapshot["acting_kind"] = None
+            snapshot["legal_actions"] = []
+            for player in snapshot.get("players", []):
+                player["is_acting"] = False
         snapshot["has_match"] = True
         snapshot["table_talk"] = [
             dict(item)

@@ -215,6 +215,14 @@ def create_app() -> tuple[Flask, SocketIO, GameSession]:
             return jsonify(result), 400
         return jsonify(result)
 
+    @app.post("/api/game/abort")
+    def game_abort():
+        try:
+            state = session.abort_match()
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({"ok": True, "state": state})
+
     @app.post("/api/game/next-hand")
     def game_next_hand():
         try:

@@ -220,6 +220,15 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - 离线评测脚本支持 `--agent-locale zh-CN|en-US`，默认中文以保持历史基线；Web 对局由 `SetupModal` 的 Agent 语言控件决定。
 - 运行时双语测试在 `tests/test_i18n.py` 和 `tests/test_llm_i18n.py`；前端语言测试在 `frontend/src/i18n/` 和 `LanguageSwitch.test.ts`。
 
+## 对局中止 / 请求超时
+
+- 后端 `GameSession.abort_match()` 是唯一的显式中止入口，复用 `_stop_current_thread()`：取消 agent、递增 generation、设置 stop event、把 `game.match_over` 和快照里的 `match.aborted` 设为 true，然后广播。它不 join 线程，因为模型 HTTP 请求可能还在飞；旧线程后续写入会被 `_alive(generation)` 丢弃。
+- `POST /api/game/abort` 对应 `abort_match()`，无请求体，幂等。中止后 `human_action`、`next_hand` 返回“本局已中止”，设置框可以继续用来开新局。
+- `abort_match()` 会递增 `_start_epoch`；`start_match()` 在构建完 agent 后、提交新对局前比较 epoch，发现被中止就抛 `session.start_cancelled`，避免“刚中止又被旧启动请求拉起来”。abort 不获取 `_start_lock`，否则启动请求卡住时中止也会卡住。
+- 中止只保证对局逻辑停止，不保证已经发出的模型 HTTP 请求立刻断开。`agent.cancel()` 只在流式读取的 chunk 之间检查，最坏要等到读超时（默认 300 秒）；这段线程是 daemon，generation 检查会丢弃它的后续写入，不影响界面和下一局。
+- 前端 `store.starting` 表示启动请求在途，`store.aborting` 表示中止请求在途，`store.busy` 仍然表示普通 REST 请求在途。设置框的 Cancel/X/Esc/点背景必须始终可用，不能被 `busy` 或 `starting` 拦住；开始按钮用 `starting` 防重复提交。`api.request` 默认 30 秒超时，`/api/game/new` 60 秒，`/api/game/abort` 15 秒，超时抛 `ApiError(kind="timeout")`。启动超时会静默调用 `abortMatch(true)`，避免服务端在后台继续构建出幽灵对局。
+- 设置框底部在有活动对局或正在启动时显示“中止本局”，二次确认后调用 `abortMatch()`。`ActionBar` 用 `match.aborted` 显示“对局已中止”和新比赛入口，不再显示行动按钮。
+
 ## 状态同步（容易踩坑）
 
 - 服务端每次广播 state 前递增 `state_seq`，快照带 `seq`。
@@ -294,7 +303,8 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - checkpoint 的触发公式、手牌切点、checkpoint 解析和扁平化重试在 `tests/test_llm_context.py`；摘要前缀、逐级重试、兜底、防统计复述、历史 tool 预算、真实 token 锚点和 checkpoint 保护在 `tests/test_llm_agent.py`。
 - 历史统计的 VPIP/PFR/3-bet/c-bet/摊牌/位置拆分、空历史、样本量、无底牌泄漏在 `tests/test_history_stats.py`。
 - session 的每手公开记录、已完成对局归档、history provider 和座位互换在 `tests/test_server_session.py`。
-- `ALL_TOOL_NAMES` 基线保持 5 个、`GAME_TOOL_NAMES` 增加 `research_history`、`AGENT_TOOL_NAMES` 增加桌边喊话在 `tests/test_llm_tools.py`；checkpoint 提示词和历史 tool 的中英文在 `tests/test_llm_i18n.py`。
+- `ALL_TOOL_NAMES` 基线保持 5 个、`GAME_TOOL_NAMES` 增加 `research_history`、`AGENT_TOOL_NAMES` 增加桌边喊话在 `tests/test_llm_tools.py`；inline 模式给 `apply_action` 增加必填 `table_talk` 也在这里；checkpoint 提示词和历史 tool 的中英文在 `tests/test_llm_i18n.py`。
+- inline 喊话的工具循环（一次请求完成喊话 + 动作、缺少 `table_talk` 被拒绝、动作重试不重复喊话）在 `tests/test_llm_agent.py`；`abort_match()` 的状态、拒绝后续行动和启动竞态在 `tests/test_server_session.py`，`/api/game/abort` 在 `tests/test_server_api.py`；前端 `ActionBar` 的已中止状态在 `ActionBar.test.ts`。
 - `tool_choice="none"` 的 payload 和默认 `auto` 在 `tests/test_llm_client.py`。
 - 桌边喊话的规范化、额度在 `tests/test_table_talk.py`；工具循环、硬性前置喊话、赛后 final 和“失败不触发三次非法动作”在 `tests/test_llm_agent.py`；开关、记录、未读投递和快照在 `tests/test_server_session.py` 与 `tests/test_server_api.py`。
 - 前端喊话合并/去重在 `store.test.ts`；对话页、工具卡片和页签在 `TableTalkPanel.test.ts`、`ToolCard.test.ts`、`AgentConsole.test.ts`。
@@ -324,5 +334,6 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - 可视化保留牌型分布，加上胜率/跟注 EV 工具卡；对手范围推断留到后续。equity 默认对随机手牌，结果必须标明这个假设。
 - RLCard 默认 RandomAgent；模型需要用户训练。短训练 DQN 可能退化为全下，不要把它当作“强 Bot”。
 - 不做人类 vs 人类；UI 会阻止。
-- 桌边喊话只开放 LLM vs LLM；人类对 LLM 暂不提供手动喊话输入。喊话内容不做事实核查，主要靠提示词约束。
+- 桌边喊话只开放 LLM vs LLM；人类对 LLM 暂不提供手动喊话输入。喊话内容不做事实核查，主要靠提示词约束。默认 inline 模式把喊话放进 `apply_action.table_talk`，正常路径一次请求完成“说 + 做”；旧 tool 模式保留用于对照，但每回合通常要两次请求。
+- `abort_match()` 只保证对局逻辑停止，不保证已经发出的模型请求立刻断开，也不提供暂停/恢复。中止时当前手牌不会结算，已完成手牌仍会进入历史；下次开新局时会把这段部分对局按已完成手牌归档。
 - 前端构建产物不入库，`start.bat` / README 会提示构建。

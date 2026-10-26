@@ -6,6 +6,7 @@ import { iconUrl } from "../api";
 import { agentNameFor, providerDisplayName } from "../format";
 import { languageName, locale, localizedText, t } from "../i18n";
 import {
+  abortMatch,
   buildDefaultSetup,
   closeSetup,
   defaultSeat,
@@ -52,6 +53,8 @@ const providers = computed<ProviderInfo[]>(() => boot.value?.providers || []);
 const rlcard = computed(() => boot.value?.rlcard || null);
 const limits = computed(() => boot.value?.game?.limits || {});
 const busy = computed(() => game.busy);
+const starting = computed(() => game.starting);
+const aborting = computed(() => game.aborting);
 const canTableTalk = computed(() => setup.seats.every((item) => item.kind === "llm"));
 const tableTalkTouched = ref(false);
 const modalRef = ref<HTMLElement | null>(null);
@@ -419,7 +422,15 @@ const validation = computed(() => {
   return "";
 });
 
-const canStart = computed(() => !validation.value && !busy.value);
+const canStart = computed(() => !validation.value && !busy.value && !starting.value);
+const canAbort = computed(() => Boolean(
+  starting.value
+  || (
+    game.snapshot?.has_match
+    && !game.snapshot.match?.match_over
+    && !game.snapshot.match?.aborted
+  ),
+));
 
 function applyPreset(kind: "human_deepseek" | "deepseek_glm" | "human_bot"): void {
   const allModels = providers.value.flatMap((provider) => provider.models);
@@ -481,14 +492,20 @@ function modelQuirk(model: ProviderModel): string {
 }
 
 async function submit(): Promise<void> {
-  if (!canStart.value) return;
+  if (!canStart.value || starting.value) return;
   const payload = deepCopy(setup);
   payload.table_talk = Boolean(payload.table_talk && canTableTalk.value);
   await startMatch(payload);
 }
 
+async function abortCurrentMatch(): Promise<void> {
+  if (!canAbort.value || aborting.value) return;
+  if (!window.confirm(t("setup.abortConfirm"))) return;
+  await abortMatch();
+}
+
 function close(): void {
-  if (!busy.value) closeSetup();
+  closeSetup();
 }
 </script>
 
@@ -939,11 +956,22 @@ function close(): void {
           </span>
         </div>
         <div class="footer-actions">
-          <button class="btn" :disabled="busy" @click="close">{{ t("common.cancel") }}</button>
+          <button
+            v-if="canAbort"
+            class="btn btn-danger"
+            :disabled="aborting"
+            :title="t('setup.abortMatch')"
+            @click="abortCurrentMatch"
+          >
+            <span v-if="aborting" class="spinner"></span>
+            <AppIcon v-else name="x" :size="14" />
+            {{ aborting ? t("setup.aborting") : t("setup.abortMatch") }}
+          </button>
+          <button class="btn" @click="close">{{ t("common.cancel") }}</button>
           <button class="btn btn-primary start-btn" :disabled="!canStart" @click="submit">
-            <span v-if="busy" class="spinner"></span>
+            <span v-if="starting" class="spinner"></span>
             <AppIcon v-else name="play" :size="14" />
-            {{ busy ? t("setup.starting") : t("setup.start") }}
+            {{ starting ? t("setup.starting") : t("setup.start") }}
           </button>
         </div>
       </footer>
@@ -1353,7 +1381,7 @@ function close(): void {
 .validation.ok { color: var(--emerald); }
 .validation.error { color: var(--red); }
 .footer-hint { font-size: calc(8.5px * var(--type-scale)); color: var(--faint); }
-.footer-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+.footer-actions { display: flex; align-items: center; gap: 8px; flex: none; flex-wrap: wrap; justify-content: flex-end; }
 .start-btn { min-width: 128px; }
 
 @media (max-width: 980px) {

@@ -62,6 +62,8 @@ interface StoreState {
   godView: boolean;
   godViewBusy: boolean;
   busy: boolean;
+  starting: boolean;
+  aborting: boolean;
   testResults: Record<string, { status: "idle" | "testing" | "ok" | "error"; text: string; latency?: number }>;
 }
 
@@ -95,6 +97,8 @@ const state = reactive<StoreState>({
   godView: true,
   godViewBusy: false,
   busy: false,
+  starting: false,
+  aborting: false,
   testResults: {},
 });
 
@@ -392,6 +396,16 @@ function applySnapshot(snapshot: GameSnapshot): void {
     }
     if (snapshot.match.error && snapshot.match.error !== state.fatalError) {
       state.fatalError = snapshot.match.error;
+    }
+    if (snapshot.match.aborted) {
+      for (const seat of [0, 1]) {
+        const turn = state.currentTurns[seat];
+        if (turn && turn.status === "running") {
+          turn.status = "done";
+          turn.endedAt = turn.endedAt ?? Date.now() / 1000;
+          turn.reason = t("table.matchAborted");
+        }
+      }
     }
     state.godView = Boolean(snapshot.match.god_view);
   } else {
@@ -946,6 +960,7 @@ function onHandResultEvent(event: AgentEvent): void {
 // ---------------------------------------------------------------------
 
 export async function startMatch(payload: MatchSetupPayload): Promise<boolean> {
+  state.starting = true;
   state.busy = true;
   beginEventBuffer();
   try {
@@ -971,6 +986,10 @@ export async function startMatch(payload: MatchSetupPayload): Promise<boolean> {
     state.setupOpen = false;
     applySnapshot(response.state);
     await refreshTranscripts();
+    if (response.state.match?.aborted) {
+      toast("info", t("errors.aborted"), t("errors.abortedDetail"));
+      return false;
+    }
     for (const seat of response.state.match?.seats || []) {
       if (seat.agent?.warning) {
         toast("warn", t("errors.degradedTitle", { name: seat.name }), seat.agent.warning);
@@ -988,11 +1007,41 @@ export async function startMatch(payload: MatchSetupPayload): Promise<boolean> {
     );
     return true;
   } catch (error) {
-    toast("error", t("errors.startFailed"), errorText(error));
+    const timedOut = error instanceof ApiError && error.kind === "timeout";
+    const title = timedOut
+      ? t("errors.startTimeout")
+      : t("errors.startFailed");
+    toast("error", title, errorText(error));
+    if (timedOut) {
+      // The server may still be building the match after the client gave up.
+      // Cancel it so a ghost match does not appear later.
+      void abortMatch(true);
+    }
     return false;
   } finally {
     endEventBuffer();
+    state.starting = false;
     state.busy = false;
+  }
+}
+
+export async function abortMatch(silent = false): Promise<boolean> {
+  if (state.aborting) return false;
+  state.aborting = true;
+  try {
+    const response = await api.abortGame();
+    if (response.state) applySnapshot(response.state);
+    if (!silent) {
+      toast("info", t("errors.abortSuccess"), t("errors.abortDetail"));
+    }
+    return true;
+  } catch (error) {
+    if (!silent) {
+      toast("error", t("errors.abortFailed"), errorText(error));
+    }
+    return false;
+  } finally {
+    state.aborting = false;
   }
 }
 

@@ -115,3 +115,22 @@ describe("ActionBar raise type", () => {
     wrapper.unmount();
   });
 });
+
+describe("ActionBar aborted match", () => {
+  it("shows the aborted state and hides the action controls", () => {
+    storeMock.game.snapshot = snapshot({
+      match: {
+        match_over: true,
+        aborted: true,
+        god_view: false,
+        can_next_hand: false,
+        seats: [],
+      },
+    });
+    const wrapper = mount(ActionBar);
+    expect(wrapper.text()).toContain("对局已中止");
+    expect(wrapper.find(".controls").exists()).toBe(false);
+    expect(wrapper.text()).toContain("新比赛");
+    wrapper.unmount();
+  });
+});

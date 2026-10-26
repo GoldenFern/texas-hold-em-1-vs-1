@@ -128,6 +128,10 @@ Bot 座位：
 
 当前手已结束且比赛未结束时开始下一手。返回新状态。
 
+### `POST /api/game/abort`
+
+无请求体。中止当前对局：取消 Agent、停止对局线程、把 `match.match_over` 和 `match.aborted` 设为 `true`，广播状态并返回 `{"ok": true, "state": ...}`。中止后 `human_action` 和 `next_hand` 返回 400；设置框可以继续开新局。接口幂等。已经发出的模型 HTTP 请求不保证立刻断开，旧线程的后续写入会按 generation 丢弃。
+
 ### `POST /api/game/god-view`
 
 ```json
@@ -521,6 +525,14 @@ RLCard 的紧凑决策事件：
 
 ```json
 {"type": "match_over", "text": "比赛结束。"}
+```
+
+### `match_aborted`
+
+调用 `POST /api/game/abort` 时广播一次，随后广播带 `match.aborted=true` 的 `state`。前端不依赖这个事件，状态快照才是事实来源。
+
+```json
+{"type": "match_aborted", "text": "比赛已中止。"}
 ```
 
 ### Socket.IO 其他
