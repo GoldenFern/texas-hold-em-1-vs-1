@@ -1047,9 +1047,13 @@ export async function abortMatch(silent = false): Promise<boolean> {
 
 export async function humanAction(action: string, amount = 0): Promise<void> {
   if (state.busy) return;
+  const decisionId = state.snapshot?.decision_id;
+  // Without a decision id the view is stale; sending the action would answer
+  // whichever decision is current on the server instead of the one on screen.
+  if (!decisionId) return;
   state.busy = true;
   try {
-    const response = await api.action({ action, amount });
+    const response = await api.action({ action, amount, decision_id: decisionId });
     if (response.state) applySnapshot(response.state);
   } catch (error) {
     toast("error", t("errors.actionFailed"), errorText(error));

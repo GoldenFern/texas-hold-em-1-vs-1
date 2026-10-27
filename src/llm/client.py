@@ -140,6 +140,31 @@ class ChatResult:
         return int(self.usage.get("output_tokens", 0))
 
 
+def _is_timeout_error(exc: BaseException) -> bool:
+    """Return True when a transport error came from a read timeout.
+
+    Requests re-raises urllib3 read timeouts as ``ConnectionError`` while
+    streaming, so ``isinstance(exc, requests.Timeout)`` alone misses the most
+    common case.
+    """
+    seen: Set[int] = set()
+    current: Optional[BaseException] = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, requests.Timeout):
+            return True
+        if "timeout" in type(current).__name__.lower():
+            return True
+        nxt = None
+        for arg in getattr(current, "args", ()) or ():
+            if isinstance(arg, BaseException):
+                nxt = arg
+                break
+        current = nxt or current.__cause__ or current.__context__
+    text = str(exc).lower()
+    return "timed out" in text or "read timeout" in text
+
+
 def estimate_tokens(text: str) -> int:
     """Cheap bilingual token estimate (CJK chars count as one token)."""
     if not text:
@@ -358,9 +383,14 @@ class LLMClient:
                     retryable=True,
                 )
             except requests.ConnectionError as exc:
+                kind = "timeout" if _is_timeout_error(exc) else "network"
                 error = LLMError(
-                    "network",
-                    tr(self.locale, "client.network", error=exc),
+                    kind,
+                    tr(
+                        self.locale,
+                        "client.timeout" if kind == "timeout" else "client.network",
+                        error=exc,
+                    ),
                     api_key=api_key,
                     retryable=True,
                 )
@@ -629,7 +659,7 @@ class LLMClient:
 
         has_output = bool(content_parts or reasoning_parts or tool_calls)
         if stream_error is not None and not has_output:
-            kind = "timeout" if isinstance(stream_error, requests.Timeout) else "network"
+            kind = "timeout" if _is_timeout_error(stream_error) else "network"
             raise LLMError(
                 kind,
                 tr(self.locale, "client.stream_interrupted", error=stream_error),
@@ -640,7 +670,7 @@ class LLMClient:
         incomplete_reason = ""
         if stream_error is not None:
             incomplete_reason = (
-                "timeout" if isinstance(stream_error, requests.Timeout) else "network"
+                "timeout" if _is_timeout_error(stream_error) else "network"
             )
         elif finish_reason in ("length", "content_filter"):
             incomplete_reason = finish_reason
@@ -800,8 +830,11 @@ class LLMClient:
             on_event({"type": "reasoning_delta", "delta": reasoning})
         tool_calls: Dict[int, dict] = {}
         id_map: Dict[str, int] = {}
+        index_map: Dict[int, int] = {}
         for index, raw_call in enumerate(message.get("tool_calls") or []):
-            self._accumulate_tool_call(tool_calls, {**raw_call, "index": index}, on_event, id_map)
+            self._accumulate_tool_call(
+                tool_calls, {**raw_call, "index": index}, on_event, id_map, index_map
+            )
         usage = _usage_from(data)
         estimated = not bool(usage)
         if not usage:

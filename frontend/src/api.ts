@@ -76,7 +76,7 @@ export const api = {
   abortGame(): Promise<{ ok: boolean; state: GameSnapshot }> {
     return request("/api/game/abort", { method: "POST", body: "{}" }, 15000);
   },
-  action(payload: { action: string; amount?: number }): Promise<{ ok: boolean; state: GameSnapshot; error?: string }> {
+  action(payload: { action: string; amount?: number; decision_id?: string | null }): Promise<{ ok: boolean; state: GameSnapshot; error?: string }> {
     return request("/api/game/action", { method: "POST", body: JSON.stringify(payload) });
   },
   nextHand(): Promise<{ ok: boolean; state: GameSnapshot }> {

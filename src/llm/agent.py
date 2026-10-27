@@ -2324,6 +2324,46 @@ class LLMAgent(BaseAgent):
             reused_step=True,
         )
 
+    def _ensure_tool_replies(self) -> None:
+        """Answer every tool call of the latest assistant message.
+
+        A turn can end from inside a batch while later calls are still
+        unanswered. Leaving a dangling tool_call id breaks the message protocol
+        for every following request, so fill the gaps with an explicit error.
+        """
+        start = None
+        for position in range(len(self.messages) - 1, -1, -1):
+            message = self.messages[position]
+            role = message.get("role")
+            if role == "assistant" and message.get("tool_calls"):
+                start = position
+                break
+            if role == "user":
+                break
+        if start is None:
+            return
+        answered = {
+            message.get("tool_call_id")
+            for message in self.messages[start + 1 :]
+            if message.get("role") == "tool"
+        }
+        for call in self.messages[start].get("tool_calls") or []:
+            call_id = str(call.get("id") or "")
+            if not call_id or call_id in answered:
+                continue
+            function = call.get("function") or {}
+            self.messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": str(function.get("name") or ""),
+                    "content": json.dumps(
+                        {"ok": False, "error": self._t("agent.error.tool_skipped")},
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+
     def _fallback(
         self,
         view: AgentView,
@@ -2338,6 +2378,7 @@ class LLMAgent(BaseAgent):
         reason_code: str = "",
         auto_kind: str = "",
     ) -> Action:
+        self._ensure_tool_replies()
         legal = set(view.legal_actions)
         if allow_check and "check" in legal:
             action = Action(view.seat, ActionType.CHECK, source="llm", auto=True)

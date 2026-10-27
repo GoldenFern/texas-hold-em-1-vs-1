@@ -246,6 +246,44 @@ def test_three_invalid_actions_fall_back_to_call_or_fold() -> None:
     assert notes and "连续三次无效动作" in notes[-1]["text"]
 
 
+def test_fallback_answers_unreached_parallel_tool_calls() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_bad",
+                        "name": "apply_action",
+                        "arguments": '{"action": "bet", "amount": 1}',
+                    },
+                    {
+                        "id": "call_skipped",
+                        "name": "estimate_equity",
+                        "arguments": "{}",
+                    },
+                ]
+            }
+        ],
+        failures=1,
+    )
+    action = agent.decide(make_view(), events.append)
+    assert action.auto is True
+    assistant = next(
+        message
+        for message in agent.messages
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    call_ids = [call["id"] for call in assistant["tool_calls"]]
+    assert call_ids == ["call_bad", "call_skipped"]
+    replies = {
+        message.get("tool_call_id")
+        for message in agent.messages
+        if message.get("role") == "tool"
+    }
+    # Every tool_call id needs a reply, otherwise the next request is invalid.
+    assert set(call_ids) == replies
+
+
 def test_no_tool_calls_eventually_falls_back() -> None:
     agent, events = build_agent([{"content": "我再想想。"}] * 3)
     action = agent.decide(make_view(), events.append)

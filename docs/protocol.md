@@ -117,8 +117,10 @@ Bot 座位：
 仅人类回合：
 
 ```json
-{"action": "raise", "amount": 40}
+{"action": "raise", "amount": 40, "decision_id": "m-3:4:120"}
 ```
+
+`decision_id` 必须与当前快照里的 `decision_id` 一致。它由服务端在每次人类决策点生成（包含 match、手牌、动作序号和座位），用来拒绝重放或延迟到达的旧请求；缺失或不匹配返回 400。旧页面在动作序号变化后不能再用旧的 `decision_id` 提交。
 
 `amount` 对 `bet` / `raise` 是**本街总额（raise-to）**。`fold/check/call/all_in` 忽略 `amount`。动作历史里的 `added` 始终表示该动作本次投入的筹码；`amount` 在跟注时是本次投入，在下注/加注时是本街总额。
 
@@ -269,6 +271,7 @@ Bot 座位：
 - `deck_remaining` / `burned` 只在 `god_view=true` 时返回。
 - `table_talk` 是最近 40 条喊话，可能来自之前几手；前端按 `id` 去重、按 `seq` 排序。
 - `seq` 是状态版本；前端丢弃同 match 下更小的 seq。
+- `decision_id` 只在轮到人类时非空，人类动作请求必须原样带回；它是 `match:hand:action_count:seat` 组成的决策标识，用来挡住旧页面重放或延迟到达的动作。
 
 ---
 

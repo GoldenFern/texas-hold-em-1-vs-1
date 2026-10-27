@@ -58,6 +58,7 @@ raise_to = called_target + round_half_up(比例 * pot_after_call)
 - `reset(seed, button)` 创建新牌局，便于同牌换座评估。
 - `play_hand(agents, training)` 返回双方终端奖励和每个座位的 transition。
 - `feed_transitions` 把终端净筹码作为最后一条 transition 的奖励，中间奖励为 0。
+- training 模式下 transition 的 `next_state` 连接**同一玩家**的下一次决策，最后一次决策连接到 terminal state。引擎每步都会把行动权交给对手，所以不能直接把 `step()` 返回的下一行动者状态写进当前玩家的 transition。
 
 奖励默认按 `起始筹码 / 5` 缩放，满筹码大约 ±5。
 

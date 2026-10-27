@@ -129,6 +129,23 @@ def test_fold_refund_and_reward_scale() -> None:
     assert env.payoffs() == pytest.approx([-0.025, 0.025])
 
 
+def test_training_transitions_link_same_player_decisions() -> None:
+    env = ProjectHeadsUpEnv(seed=11)
+    env.reset(button=0)
+    agents = [RandomAgent(NUM_ACTIONS), RandomAgent(NUM_ACTIONS)]
+    _payoffs, transitions = env.play_hand(agents, training=True)
+    assert any(transitions[seat] for seat in (0, 1))
+    for seat in (0, 1):
+        for state, _slot, next_state, done in transitions[seat]:
+            assert state["raw_obs"]["seat"] == seat
+            if done:
+                assert next_state["raw_obs"].get("terminal") is True
+            else:
+                # The bootstrap state must belong to the same player, not to
+                # the opponent who acted in between.
+                assert next_state["raw_obs"]["seat"] == seat
+
+
 def test_observation_version_keeps_legacy_size_feature() -> None:
     env = ProjectHeadsUpEnv(seed=9)
     env.reset(button=0)

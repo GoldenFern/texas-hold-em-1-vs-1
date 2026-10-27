@@ -185,6 +185,7 @@ export interface GameSnapshot {
   acting_seat?: number | null;
   acting_kind?: SeatKind | null;
   legal_actions?: string[];
+  decision_id?: string | null;
   constraints?: Record<string, number | boolean>;
   community?: CardInfo[];
   burned?: CardInfo[];

@@ -87,6 +87,7 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - `src/training/env.py` 的 `ProjectHeadsUpEnv` 包装 `HeadsUpGame`，不复制规则。
 - 观测 73 维（`src/training/obs.py`），动作 10 槽（`src/training/actions.py`）。
 - 动作掩码只使用引擎的 `legal_actions`、`min_raise_to`、`max_raise_to`；低于最小加注的尺寸屏蔽，不夹取。
+- `play_hand(training=True)` 的 transition 必须连接同一玩家的相邻决策，最后一次决策连 `terminal_state()`。不能把 `step()` 返回的下一行动者状态当 `next_state`，那会拿对手的底牌和合法动作做 bootstrap；改这条后 DQN/NFSP 需要重新训练。
 - 训练：`scripts/train_project_bot.py`；离线评估：`scripts/eval_project_bots.py`。
 - 模型格式 `project-bot-v1`，`ProjectBot` 用 `weights_only=True` 加载；旧的 `RLCardBot` 仍是 54 维 / 5 动作。
 - Bot 行动延迟在选对手时配置（`bot.delay_seconds`，默认 3 秒，范围 0 到 10 秒）；`GameSession._run_agent_turn` 在决策前用可中断等待实现，换局或关闭服务时立即退出，不要改成阻塞 `time.sleep`。
@@ -107,6 +108,7 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - `ALL_TOOL_NAMES` 仍是原来的 5 个，是工具消融的基线；`GAME_TOOL_NAMES` 再包含 `research_history`，`AGENT_TOOL_NAMES` 再包含桌边喊话。不要把 `research_history` 加进 `ALL_TOOL_NAMES`，否则历史对照失效。
 - `config/game.json` 的 `llm_runtime.table_talk_mode` 控制喊话投递方式，默认 `inline`：`apply_action` 带 `table_talk` 参数，一次请求完成“说 + 做”。schema 里 `table_talk` 是可选字段，由 agent 在每回合第一次动作强制要求；这样动作被拒绝后的重试可以省略喊话，也不会被只认 JSON schema 的厂商提前拦截。`tool` 保留旧的两步模式（先 `send_table_message`，再 `apply_action`），只用于对照实验。`AGENT_TOOL_NAMES` 仍然只在 `tool` 模式下使用；`ALL_TOOL_NAMES` 不变。
 - 每回合必须调用 `apply_action` 恰好一次；非法则把错误 + 约束 + 合法动作作为 tool 消息回传，让模型重试。
+- 批量工具调用中如果提前结束回合（达到失败阈值等），`_fallback` 会调用 `_ensure_tool_replies()` 给没执行到的调用补一条 tool 错误。不要让 assistant 的 `tool_calls` 留下没有回复的 id，否则后续每个请求都会因消息协议不合法而失败。
 - 估算工具是可选辅助，默认不强制（`require_estimate_first: false`）。系统提示词和工具描述只说明用途与可选性，不引导也不劝阻调用，由模型自行判断。打开开关后只会在每条街第一次 `apply_action` 前软提醒一次，不计入三次失败；`get_random_number` 不能满足这个开关。
 - 估算工具单回合默认最多 2 次、总采样 50000 次；equity 工具同样默认 2 次、50000 次（`config/game.json`），避免阻塞游戏线程。`call_ev` 内部估算也计入 equity 预算。
 - `LLMAgent` 支持按座位传入 `tools`、`system_prompt`、`table_talk_mode` 与 `locale`；`select_tools(names, locale, table_talk_in_action=...)` 只暴露指定工具，未暴露的工具调用会按未知工具拒绝。inline 模式必须传 `table_talk_in_action=True`，否则 `apply_action` schema 没有 `table_talk` 字段，构造函数会直接报错。`require_estimate_each_turn` 要求每次行动前估算一次，`skip_estimate_on_complete_board` 让河牌圈免于该要求。
@@ -136,6 +138,7 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 ## 重试策略（对齐 OpenCode）
 
 - 默认 10 次重试，退避间隔 2s、4s、8s，之后每次 10s，带 20% 抖动；`Retry-After` 最长封顶 15 分钟，传输超时最多重试 3 次。`retry_deadline_seconds` 保留为可选总时限，默认 0（不额外限制）。
+- 流式读取中段的读超时会被 requests 包装成 `ConnectionError`，不能用 `isinstance(exc, requests.Timeout)` 判断；用 `client._is_timeout_error()` 检查异常链和文本，否则会落到通用网络预算，单次调用可能重试 11 × 300 秒。
 - 重试预算按逻辑步骤共享，透明请求重试和部分输出的续写共用同一个 `RetryBudget`，不能各自重试 10 次。传输重试不消耗 `max_steps_per_turn`。
 - 输出前断流：整段重试，保留同一个 assistant `message_id`。输出后断流：保留半截 assistant 消息并标为失败，追加 `agent.continuation.incomplete` 用户提示，新建 assistant `message_id` 继续；`partial_retry_mode=restart` 可改为丢弃半截消息后整段重试。
 - 已经收到的完整 `apply_action` 直接校验并执行；截断或多个 `apply_action` 只执行第一个合法动作。截断参数不猜，回工具错误让模型重发。
@@ -232,6 +235,7 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 ## 状态同步（容易踩坑）
 
 - 服务端每次广播 state 前递增 `state_seq`，快照带 `seq`。
+- 快照的 `decision_id` 只在轮到人类时非空；`/api/game/action` 必须带回它，缺失或不匹配返回 400。它由 match、手牌、动作序号和座位组成，用来挡住旧标签页或延迟请求在新决策点上执行。前端 `humanAction` 没有 `decision_id` 时直接不发请求。
 - REST 变更接口（new/action/next-hand/god-view）和 Socket 广播可能乱序到达；前端 `applySnapshot` 会丢弃同 match 下 `seq` 更小的快照。
 - 本手结果不再使用弹窗；`lastResult` 只用于牌桌胜者高亮、ActionBar 结果行和控制台日志。不要恢复自动弹出的结果弹窗。
 - Agent 事件按 `(match_id, seat, event_id)` 去重；`eventBuffer` 在 `startMatch` 期间缓冲，`refreshTranscripts` 后重放。
@@ -309,6 +313,7 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - 桌边喊话的规范化、额度在 `tests/test_table_talk.py`；工具循环、硬性前置喊话、赛后 final 和“失败不触发三次非法动作”在 `tests/test_llm_agent.py`；开关、记录、未读投递和快照在 `tests/test_server_session.py` 与 `tests/test_server_api.py`。
 - 前端喊话合并/去重在 `store.test.ts`；对话页、工具卡片和页签在 `TableTalkPanel.test.ts`、`ToolCard.test.ts`、`AgentConsole.test.ts`。
 - LLM 工具循环用 `FakeClient`，不要依赖真实 API Key。
+- 这一轮回归补在：`tests/test_training_env.py`（transition 连接同一玩家）、`tests/test_server_session.py`（人类动作抢在等待之前、`decision_id` 校验）、`tests/test_llm_agent.py`（批量工具调用提前结束时补齐 tool 回复）、`tests/test_llm_client.py`（非流式 JSON 的并行工具、读超时走 timeout 预算）。
 - LLM 客户端流式解析、脱敏、降级、断线和取消在 `tests/test_llm_client.py`，不发起真实请求。
 - 服务器建局原子性、规则校验、JSON 类型在 `tests/test_server_session.py` 与 `tests/test_server_api.py`。
 - 前端单元测试在 `frontend/src/**/*.test.ts`，用 `cd frontend && npm test` 运行。动作文案/当前街动作选择在 `actionMeta.test.ts`，思考流手牌分隔符在 `AgentConsole.test.ts`，牌型分布默认收起与最大概率摘要在 `AnalysisPanel.test.ts`。

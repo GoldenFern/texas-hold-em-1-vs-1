@@ -280,6 +280,82 @@ def test_parallel_tool_calls_without_index_are_not_merged() -> None:
     ]
 
 
+def test_json_completion_keeps_parallel_tool_calls_separate() -> None:
+    client, _ = make_client(
+        [
+            FakeResponse(
+                headers={"Content-Type": "application/json"},
+                json_data={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_a",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "estimate_equity",
+                                            "arguments": "{}",
+                                        },
+                                    },
+                                    {
+                                        "id": "call_b",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "apply_action",
+                                            "arguments": '{"action": "call"}',
+                                        },
+                                    },
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    result = client.stream(spec(), [{"role": "user", "content": "hi"}], None, {}, lambda e: None)
+    assert [call.id for call in result.tool_calls] == ["call_a", "call_b"]
+    assert [call.name for call in result.tool_calls] == [
+        "estimate_equity",
+        "apply_action",
+    ]
+    assert result.tool_calls[1].arguments == '{"action": "call"}'
+
+
+def test_stream_read_timeout_counts_against_timeout_budget() -> None:
+    from urllib3.exceptions import ReadTimeoutError
+
+    inner = ReadTimeoutError(None, "/chat/completions", "Read timed out.")
+    responses = [
+        FakeResponse(lines=[], error_after_lines=requests.ConnectionError(inner))
+        for _ in range(11)
+    ]
+    client, session = make_client(responses)
+    policy = RetryPolicy(
+        max_retries=10,
+        max_timeout_retries=1,
+        base_delay=0.0,
+        max_delay=0.0,
+        jitter=0.0,
+    )
+    budget = RetryBudget(policy, sleep=lambda _delay: None)
+    with pytest.raises(LLMError) as excinfo:
+        client.stream(
+            spec(),
+            [{"role": "user", "content": "hi"}],
+            None,
+            {},
+            lambda e: None,
+            retry_budget=budget,
+        )
+    assert excinfo.value.kind == "timeout"
+    # One attempt plus the single timeout retry, not the full network budget.
+    assert len(session.calls) == 2
+
+
 def test_disconnect_keeps_complete_tool_call() -> None:
     client, _ = make_client(
         [

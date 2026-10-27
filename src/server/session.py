@@ -932,6 +932,9 @@ class GameSession:
             token = (self.game.hand_id, len(self.game.actions), actor)
             if self._human_token != token:
                 raise ValueError(self._t("session.action.state_changed"))
+            decision_id = self._decision_id_locked()
+            if not decision_id or payload.get("decision_id") != decision_id:
+                raise ValueError(self._t("session.action.state_changed"))
             action = Action.from_payload(
                 actor, payload, source="human", locale=self.ui_locale
             )
@@ -1134,6 +1137,13 @@ class GameSession:
         with self.lock:
             if not self._alive(generation) or not self.game:
                 return
+            # The state may have moved on between the loop's actor check and this
+            # call. A human action that landed first already advanced the game,
+            # so waiting here would stall the match forever.
+            if self.game.actor != seat:
+                return
+            if self.game.players[seat].kind != "human":
+                return
             self._human_token = (self.game.hand_id, len(self.game.actions), seat)
             self._human_event.clear()
             snapshot = self._snapshot_locked()
@@ -1196,6 +1206,7 @@ class GameSession:
         }
         snapshot["seq"] = self.state_seq
         snapshot["server_time"] = time.time()
+        snapshot["decision_id"] = self._decision_id_locked()
         return snapshot
 
     def _seat_public(self, seat: int) -> dict:
@@ -1345,6 +1356,23 @@ class GameSession:
             return
         if self._human_token is None:
             self._human_token = (self.game.hand_id, len(self.game.actions), actor)
+
+    def _decision_id_locked(self) -> Optional[str]:
+        """Return the id of the decision the client is allowed to answer.
+
+        The value is derived from the state the client last received. An action
+        request must echo it, so a replayed or delayed request for an earlier
+        decision cannot be applied to the current one.
+        """
+        if not self.game or self.game.actor is None:
+            return None
+        actor = self.game.actor
+        if self.game.players[actor].kind != "human":
+            return None
+        return (
+            f"{self.match_id}:{self.game.hand_id}:"
+            f"{len(self.game.actions)}:{actor}"
+        )
 
     def _make_emit(self, generation: int, seat: int):
         def emit(event: dict) -> None:

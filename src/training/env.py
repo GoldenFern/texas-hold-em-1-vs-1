@@ -245,6 +245,11 @@ class ProjectHeadsUpEnv:
         if self.game is None:
             raise RuntimeError("环境尚未 reset")
         transitions: List[List[tuple]] = [[], []]
+        # A transition must link the same player's consecutive decisions. The
+        # engine hands control to the opponent after every action, so the next
+        # state returned by ``step`` belongs to the other seat. Keep the acting
+        # player's state pending until they act again, or until the hand ends.
+        pending: List[Optional[tuple]] = [None, None]
         actions = 0
         while self.game.street != Street.FINISHED:
             actor = self.game.actor
@@ -271,9 +276,22 @@ class ProjectHeadsUpEnv:
                     slot = int(agent.eval_step(state)[0])
                 _next_state, done, _info = self.step(slot)
                 if training:
-                    transitions[actor].append((state, slot, _next_state, done))
+                    previous = pending[actor]
+                    if previous is not None:
+                        transitions[actor].append(
+                            (previous[0], previous[1], state, False)
+                        )
+                    pending[actor] = (state, slot)
             if done:
                 break
+        if training:
+            terminal = self.terminal_state()
+            for seat in (0, 1):
+                previous = pending[seat]
+                if previous is not None:
+                    transitions[seat].append(
+                        (previous[0], previous[1], terminal, True)
+                    )
         return self.payoffs(), transitions
 
     def feed_transitions(
@@ -283,7 +301,12 @@ class ProjectHeadsUpEnv:
         payoffs: Sequence[float],
         seats: Sequence[int] = (0, 1),
     ) -> None:
-        """Feed terminal-reward transitions to RLCard-style agents."""
+        """Feed terminal-reward transitions to RLCard-style agents.
+
+        ``play_hand`` links each transition to the same player's next decision
+        (or the terminal state), so the bootstrap value always belongs to the
+        learning player rather than the opponent.
+        """
         for seat in seats:
             seat_transitions = transitions[seat]
             if not seat_transitions:

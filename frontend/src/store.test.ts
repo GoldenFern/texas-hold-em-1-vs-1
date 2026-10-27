@@ -36,7 +36,7 @@ vi.mock("./api", () => {
 });
 
 import { api } from "./api";
-import { boot, game, refreshAnalysis, refreshTranscripts } from "./store";
+import { boot, game, humanAction, refreshAnalysis, refreshTranscripts } from "./store";
 
 const mockedApi = api as unknown as Record<string, ReturnType<typeof vi.fn>>;
 
@@ -137,8 +137,37 @@ beforeEach(async () => {
   await boot();
 });
 
-describe("transcript resync", () => {
-  it("replays live events that arrive while the snapshot request is in flight", async () => {
+describe("human action decision id", () => {
+  it("sends the decision id the state was rendered from", async () => {
+    game.busy = false;
+    game.snapshot = snapshot({ decision_id: "m1:1:0:0" });
+    mockedApi.action.mockClear();
+    mockedApi.action.mockResolvedValue({
+      ok: true,
+      state: snapshot({ seq: 2, decision_id: null, acting_kind: "bot", acting_seat: 1 }),
+    });
+
+    await humanAction("call");
+
+    expect(mockedApi.action).toHaveBeenCalledWith({
+      action: "call",
+      amount: 0,
+      decision_id: "m1:1:0:0",
+    });
+  });
+
+  it("ignores an action when the view has no decision id", async () => {
+    game.busy = false;
+    game.snapshot = snapshot({ decision_id: null });
+    mockedApi.action.mockClear();
+
+    await humanAction("call");
+
+    expect(mockedApi.action).not.toHaveBeenCalled();
+  });
+});
+
+describe("transcript resync", () => {  it("replays live events that arrive while the snapshot request is in flight", async () => {
     let resolveTranscripts: (value: any) => void = () => undefined;
     mockedApi.transcripts.mockImplementationOnce(
       () => new Promise((resolve) => { resolveTranscripts = resolve; }),

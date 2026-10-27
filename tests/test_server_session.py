@@ -460,3 +460,85 @@ def test_safe_action_prefers_check_then_fold() -> None:
         assert session._safe_action(0).type == ActionType.CALL
     finally:
         session.shutdown()
+
+
+def fast_human_vs_random() -> dict:
+    payload = human_vs_random()
+    payload["seats"][1]["bot"]["delay_seconds"] = 0
+    return payload
+
+
+def wait_for_human_decision(session: GameSession, timeout: float = 5.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = session.get_state()
+        if state.get("decision_id"):
+            return state
+        if (state.get("match") or {}).get("can_next_hand"):
+            session.next_hand()
+        time.sleep(0.02)
+    raise AssertionError("no human decision point")
+
+
+def test_human_action_before_wait_does_not_stall_match() -> None:
+    session = make_session()
+    original = session._wait_for_human
+    fired = {"done": False}
+
+    def racy(generation: int, seat: int) -> None:
+        # Simulates a human request that lands between the main loop reading
+        # the actor and _wait_for_human taking the lock.
+        if not fired["done"]:
+            fired["done"] = True
+            state = session.get_state()
+            result = session.human_action(
+                {"action": "call", "decision_id": state["decision_id"]}
+            )
+            assert result["ok"] is True
+        return original(generation, seat)
+
+    session._wait_for_human = racy  # type: ignore[method-assign]
+    try:
+        session.start_match(fast_human_vs_random())
+        deadline = time.time() + 5.0
+        advanced = False
+        while time.time() < deadline:
+            with session.lock:
+                advanced = bool(session.game and len(session.game.actions) >= 2)
+            if advanced:
+                break
+            time.sleep(0.02)
+        assert fired["done"] is True
+        assert advanced, "the bot never acted after the early human action"
+    finally:
+        session.abort_match()
+        session.shutdown()
+
+
+def test_human_action_requires_current_decision_id() -> None:
+    session = make_session()
+    try:
+        session.start_match(fast_human_vs_random())
+        state = wait_for_human_decision(session)
+        decision_id = state["decision_id"]
+        assert decision_id
+
+        with pytest.raises(ValueError):
+            session.human_action({"action": "call"})
+        with pytest.raises(ValueError):
+            session.human_action({"action": "call", "decision_id": "stale"})
+
+        result = session.human_action(
+            {"action": "call", "decision_id": decision_id}
+        )
+        assert result["ok"] is True
+
+        later = wait_for_human_decision(session)
+        assert later["decision_id"] != decision_id
+        with pytest.raises(ValueError):
+            session.human_action(
+                {"action": "call", "decision_id": decision_id}
+            )
+    finally:
+        session.abort_match()
+        session.shutdown()
