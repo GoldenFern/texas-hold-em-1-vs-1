@@ -27,6 +27,7 @@ const ICONS: Record<string, IconDef> = {
   external: { paths: ["M15 3h6v6", "M10 14 21 3", "M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"] },
   clock: { circles: [[12, 12, 9]], paths: ["M12 7v5l3 2"] },
   coins: { circles: [[8, 8, 5], [16, 16, 5]], paths: [] },
+  history: { paths: ["M3 12a9 9 0 1 0 2.7-6.4", "M3 4v5h5", "M12 8v4l3 2"] },
   zap: { paths: ["M13 2 4 14h7l-1 8 9-12h-7l1-8Z"] },
   dice: {
     rects: [[3, 3, 18, 18, 4]],

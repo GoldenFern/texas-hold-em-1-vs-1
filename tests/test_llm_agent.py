@@ -1423,7 +1423,6 @@ def checkpoint_stats() -> dict:
             "blinds": {"small": 5, "big": 10},
             "stacks": {"you": 1000, "opponent": 1000},
             "you": {
-                "result": {"net": 10, "bb_per_100": 50.0, "hands": 2},
                 "preflop": {
                     "vpip": {"value": 0.5, "n": 2},
                     "pfr": {"value": 0.5, "n": 2},

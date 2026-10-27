@@ -645,18 +645,13 @@ def build_fallback_checkpoint(
     text = prompt_text(locale)
     stats = stats if isinstance(stats, dict) else {}
     current = stats.get("current") or stats.get("current_match") or {}
-    you = current.get("you") or {}
     opponent = current.get("opponent") or {}
-    result = you.get("result") if isinstance(you, dict) else {}
-    result = result if isinstance(result, dict) else {}
     preflop = opponent.get("preflop") if isinstance(opponent, dict) else {}
     preflop = preflop if isinstance(preflop, dict) else {}
     postflop = opponent.get("postflop") if isinstance(opponent, dict) else {}
     postflop = postflop if isinstance(postflop, dict) else {}
 
-    hands = int(current.get("hands", result.get("hands", 0)) or 0)
-    net = int(result.get("net", 0) or 0)
-    bb = float(result.get("bb_per_100", 0.0) or 0.0)
+    hands = int(current.get("hands", 0) or 0)
     vpip, vpip_n = _checkpoint_metric(preflop.get("vpip"))
     pfr, pfr_n = _checkpoint_metric(preflop.get("pfr"))
     three_bet, three_bet_n = _checkpoint_metric(preflop.get("three_bet"))
@@ -677,7 +672,7 @@ def build_fallback_checkpoint(
     lines = [
         text["checkpoint_fallback_header"].format(through=max(1, int(through_hand))),
         text["checkpoint_fallback_note"],
-        text["checkpoint_fallback_line_state"].format(hands=hands, net=net, bb=bb),
+        text["checkpoint_fallback_line_state"].format(hands=hands),
         text["checkpoint_fallback_line_opponent"].format(
             vpip=vpip,
             vpip_n=vpip_n,

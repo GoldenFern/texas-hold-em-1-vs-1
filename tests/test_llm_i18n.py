@@ -230,7 +230,6 @@ def test_checkpoint_prompts_are_localized_and_do_not_copy_stats() -> None:
     snapshot = {
         "current": {
             "hands": 12,
-            "you": {"result": {"net": 40, "bb_per_100": 33.3}},
             "opponent": {
                 "preflop": {
                     "vpip": {"value": 0.7, "n": 12},
@@ -292,7 +291,6 @@ def test_fallback_checkpoint_is_short_and_bookkeeps_sample_sizes() -> None:
     snapshot = {
         "current": {
             "hands": 12,
-            "you": {"result": {"net": 40, "bb_per_100": 33.3}},
             "opponent": {
                 "preflop": {
                     "vpip": {"value": 0.7, "n": 12},

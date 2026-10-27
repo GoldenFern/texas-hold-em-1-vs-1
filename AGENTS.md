@@ -277,11 +277,13 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - 当前行动座位用加强的金色描边、外层光环和呼吸动画（`.seat.active .pod`、`::before`、`turn-flag`）一起突出；不要退回单层细边框。
 - 动作文案统一走 `frontend/src/actionMeta.ts` 的 `describeAction`；取某个座位当前街最后动作走 `lastActionForSeat`。
 - 下注/跟注动作触发筹码飞向 POT 和 POT 脉冲；弃牌、过牌不飞筹码。首次加载和重连不补播动画。
+- 加注输入框的上下箭头按一个大盲（快照 `big_blind`）步进，不要写死 1；盲注递增的牌局要跟着当前盲注走。
 - 思考流按手牌插入 `HAND #N` 分隔符。新一手发牌时（即使当前是人类先行动、Agent 还没出手）就插入新分隔符，并用动态底部占位把旧历史顶出视野：新手内容不足一屏时停在该手顶部，超过一屏后继续向下跟随。用户手动上滚则取消该手的隔离跟随，点「回到最新」或滚到底部后恢复。不要在 Agent 首次行动时才补分隔符。
 - 思考块默认在正文开始后自动折叠；手动折叠任一块后，后续思考（含流式中）默认折叠。偏好由 `frontend/src/reasoning.ts` 存到 localStorage，控制台的「思考默认折叠」徽标可恢复自动。手动展开只影响当前块，不改变全局偏好。
 - `turn_state` 事件保存发给模型的原样牌局输入，在 `AgentTurn` 的「牌局输入」折叠块中可查。`AgentTurn` 头部只保留回合序号、街、位置、手牌号、状态和耗时；底池、筹码、需跟和合法动作不再常驻，避免和牌桌及牌局输入重复。
 - `AgentTurn` 底部的阶段文案由 `turnPhase.ts` 根据最后一条 message 与 tool 状态推导；不要再用 `turn.status === "running"` 当作“等待工具调用”。
 - 工具卡片默认展开；估算工具显示迷你分布条，随机数工具显示数值和 0 到 1 刻度，动作工具显示动作徽章/错误约束，喊话工具显示原文和剩余额度。inline 模式的喊话在 `apply_action` 卡片里显示 `table_talk` 原文，同时仍进入「对话」页，不要只保留一处。动作卡片的 running/成功/失败必须是同一条 `v-if`/`v-else-if`/`v-else` 链，`inlineTalk` 块放在链之后；不要把 `v-if` 插到 `v-else-if` 和 `v-else` 之间，否则运行中会同时出现“正在提交”和“动作被拒绝”。
+- `research_history` 的工具卡用 `frontend/src/historyReport.ts` 生成对比表：翻前/翻后/摊牌按百分比画双色条并显示 `n=`，双方都没有样本的指标不渲染；有 `positions` 时提供全部/按钮/大盲切换。历史统计不再返回对局结果和喊话计数，这两类信息以牌桌和「对话」页为准。新增统计字段时同时补 `METRIC_DEFS`、中英文案和 `historyReport.test.ts`，不要在组件里临时判断 JSON 结构。
 - 控制台模式（`game.consoleMode`）为 `stream` / `log` / `talk`。只有本局启用桌边喊话或已有喊话时才显示「对话」页签；新喊话在非对话页时显示未读点。牌桌 ticker 只显示最近一条，12 秒淡出，点击切到「对话」，`boardLocked` 时隐藏。
 - 响应式断点：1520px 行动区换行，1180px 控制台移到下方；720px 牌桌/表单单列。
 - 720px 以下 `.felt` 必须有确定高度，不能只给 `min-height` 再让 `.felt-inner` 使用 `height: 100%`。
@@ -316,7 +318,7 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - 这一轮回归补在：`tests/test_training_env.py`（transition 连接同一玩家）、`tests/test_server_session.py`（人类动作抢在等待之前、`decision_id` 校验）、`tests/test_llm_agent.py`（批量工具调用提前结束时补齐 tool 回复）、`tests/test_llm_client.py`（非流式 JSON 的并行工具、读超时走 timeout 预算）。
 - LLM 客户端流式解析、脱敏、降级、断线和取消在 `tests/test_llm_client.py`，不发起真实请求。
 - 服务器建局原子性、规则校验、JSON 类型在 `tests/test_server_session.py` 与 `tests/test_server_api.py`。
-- 前端单元测试在 `frontend/src/**/*.test.ts`，用 `cd frontend && npm test` 运行。动作文案/当前街动作选择在 `actionMeta.test.ts`，思考流手牌分隔符在 `AgentConsole.test.ts`，牌型分布默认收起与最大概率摘要在 `AnalysisPanel.test.ts`。
+- 前端单元测试在 `frontend/src/**/*.test.ts`，用 `cd frontend && npm test` 运行。动作文案/当前街动作选择在 `actionMeta.test.ts`，思考流手牌分隔符在 `AgentConsole.test.ts`，牌型分布默认收起与最大概率摘要在 `AnalysisPanel.test.ts`；`research_history` 的分组、样本量过滤和已完成对局摘要在 `historyReport.test.ts` 与 `ToolCard.test.ts`。
 - RLCard 适配器测试会构造 `AgentView` 并重复决策，断言动作合法。
 - 真实 Provider 连通性用 UI 的「测试连接」，不要在测试里发真实请求。
 

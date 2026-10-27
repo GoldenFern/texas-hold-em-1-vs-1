@@ -1843,8 +1843,6 @@ class LLMAgent(BaseAgent):
             "preflop",
             "postflop",
             "showdown",
-            "result",
-            "table_talk",
         ):
             focus = "all"
         self._history_calls_this_turn += 1

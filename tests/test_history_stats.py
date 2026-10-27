@@ -205,7 +205,7 @@ def test_postflop_all_in_call_is_not_counted_as_raise() -> None:
 
     assert hero["postflop"]["raises"] == 0
     assert hero["postflop"]["calls"] == 1
-    assert hero["result"]["all_ins"] == 1
+    assert "result" not in hero
     assert villain["postflop"]["raises"] == 1
     assert villain["postflop"]["calls"] == 0
 
@@ -269,17 +269,16 @@ def test_position_splits_use_the_button_field() -> None:
     villain_button = finalize_counters(compute_counters(records, 1, "button"))
     villain_bb = finalize_counters(compute_counters(records, 1, "bb"))
 
-    assert hero_button["result"]["hands"] == 2
     assert hero_button["preflop"]["steal"]["value"] == 1.0
     assert hero_button["preflop"]["steal"]["n"] == 2
-    assert hero_bb["result"]["hands"] == 2
     assert hero_bb["preflop"]["vpip"]["value"] == 0.5
-    assert villain_button["result"]["hands"] == 2
+    assert hero_bb["preflop"]["vpip"]["n"] == 2
     assert villain_button["preflop"]["steal"]["value"] == 0.5
-    assert villain_bb["result"]["hands"] == 2
+    assert villain_button["preflop"]["vpip"]["n"] == 2
+    assert villain_bb["preflop"]["vpip"]["n"] == 2
 
 
-def test_showdown_and_result_metrics() -> None:
+def test_showdown_metrics_and_removed_result_block() -> None:
     records = four_hands()
     hero = finalize_counters(compute_counters(records, 0))
     villain = finalize_counters(compute_counters(records, 1))
@@ -298,10 +297,9 @@ def test_showdown_and_result_metrics() -> None:
     assert villain["showdown"]["w_sd"]["value"] == 0.0
     assert hero["showdown"]["categories"] == {"pair": 1}
     assert villain["showdown"]["categories"] == {"high_card": 1}
-    assert hero["result"]["hands"] == 4
-    assert hero["result"]["net"] == 70
-    assert hero["result"]["bb_per_100"] == 175.0
-    assert hero["result"]["avg_pot"] == 77.5
+    assert "result" not in hero
+    assert "table_talk" not in hero
+    assert list(hero) == ["preflop", "postflop", "showdown"]
 
 
 def test_empty_history_is_safe_and_json_safe() -> None:
@@ -312,8 +310,8 @@ def test_empty_history_is_safe_and_json_safe() -> None:
         "confidence": "none",
     }
     assert hero["showdown"]["wtsd"]["value"] is None
-    assert hero["result"]["hands"] == 0
-    assert hero["result"]["bb_per_100"] == 0.0
+    assert "result" not in hero
+    assert "table_talk" not in hero
     json.dumps(hero, allow_nan=False)
 
 
@@ -350,6 +348,8 @@ def test_history_report_merges_completed_matches_and_filters_opponent() -> None:
         opponent_identity="llm:villain",
     )
     assert vs["current_match"]["hands"] == 4
+    assert "result" not in vs["current_match"]["you"]
+    assert "table_talk" not in vs["current_match"]["you"]
     assert vs["completed_matches"]["vs_current_opponent"]["matches"] == 1
     assert vs["completed_matches"]["vs_current_opponent"]["hands"] == 4
     assert vs["completed_matches"]["vs_current_opponent"]["opponent"]["preflop"]["vpip"]["value"] == 0.75

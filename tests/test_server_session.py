@@ -458,7 +458,7 @@ def test_finish_hand_records_public_actions_and_stats() -> None:
     assert record["big_blind"] == 10
     assert "hole_cards" not in json.dumps(record, ensure_ascii=False)
     assert len(session.current_stats.records) == 1
-    assert session.current_stats.metrics(0)["result"]["hands"] == 1
+    assert session.current_stats.metrics(0)["preflop"]["vpip"]["n"] == 1
 
     payloads = [
         args[1]
@@ -501,8 +501,8 @@ def test_history_provider_swaps_you_and_opponent_by_seat() -> None:
     seat_one = session._history_provider(1, scope="current_match", last_hands=1)
     assert seat_zero["current_match"]["hands"] == 1
     assert seat_one["current_match"]["hands"] == 1
-    assert seat_zero["current_match"]["you"]["result"]["hands"] == 1
-    assert seat_one["current_match"]["you"]["result"]["hands"] == 1
+    assert seat_zero["current_match"]["you"]["preflop"]["vpip"]["n"] == 1
+    assert seat_one["current_match"]["you"]["preflop"]["vpip"]["n"] == 1
     assert seat_zero["current_match"]["positions"]["you"] != seat_one["current_match"]["positions"]["you"]
 
 

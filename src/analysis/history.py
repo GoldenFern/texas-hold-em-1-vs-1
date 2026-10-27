@@ -20,8 +20,8 @@ from typing import Iterable, Mapping, Optional, Sequence
 
 _VOLUNTARY = {"call", "bet", "raise", "all_in"}
 _SCOPES = ("current_match", "completed_matches", "both")
-_FOCUS_GROUPS = ("all", "preflop", "postflop", "showdown", "result", "table_talk")
-_METRIC_GROUPS = ("preflop", "postflop", "showdown", "result", "table_talk")
+_FOCUS_GROUPS = ("all", "preflop", "postflop", "showdown")
+_METRIC_GROUPS = ("preflop", "postflop", "showdown")
 
 _COUNTER_KEYS = (
     "hands",
@@ -418,9 +418,6 @@ def finalize_counters(counters: Mapping) -> dict:
     postflop_passive = int(counters.get("postflop_calls", 0) or 0) + int(
         counters.get("postflop_folds", 0) or 0
     )
-    net = int(counters.get("net", 0) or 0)
-    bb_net = float(counters.get("bb_net", 0.0) or 0.0)
-    pot_total = int(counters.get("pot_total", 0) or 0)
     return {
         "preflop": {
             "vpip": _metric(int(counters.get("vpip", 0) or 0), hands),
@@ -474,19 +471,6 @@ def finalize_counters(counters: Mapping) -> dict:
             ),
             "showdowns": int(counters.get("showdowns", 0) or 0),
             "categories": dict(counters.get("categories") or {}),
-        },
-        "result": {
-            "hands": hands,
-            "net": net,
-            "bb_per_100": round(bb_net / hands * 100.0, 2) if hands else 0.0,
-            "avg_pot": round(float(pot_total) / hands, 1) if hands else 0.0,
-            "all_ins": int(counters.get("all_ins", 0) or 0),
-        },
-        "table_talk": {
-            "messages": int(counters.get("table_talk_messages", 0) or 0),
-            "per_hand": round(float(counters.get("table_talk_messages", 0) or 0) / hands, 2)
-            if hands
-            else 0.0,
         },
     }
 
@@ -683,8 +667,7 @@ def build_history_report(
         seat: Seat asking for the report.
         scope: ``current_match``, ``completed_matches`` or ``both``.
         last_hands: Number of recent results to include.
-        focus: ``all``, ``preflop``, ``postflop``, ``showdown``,
-            ``result`` or ``table_talk``.
+        focus: ``all``, ``preflop``, ``postflop`` or ``showdown``.
         hero_identity: Stable identity of the asking seat's player.
         opponent_identity: Stable identity of the current opponent.
         match_info: Optional current stacks/blinds/rules.
@@ -845,13 +828,6 @@ def _compact_group(metrics: Mapping) -> dict:
     for group in _METRIC_GROUPS:
         values = metrics.get(group)
         if not isinstance(values, Mapping):
-            continue
-        if group == "result":
-            result[group] = {
-                "net": values.get("net"),
-                "bb_per_100": values.get("bb_per_100"),
-                "hands": values.get("hands"),
-            }
             continue
         compact = {
             key: _compact_metric(value)

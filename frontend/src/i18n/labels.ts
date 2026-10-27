@@ -66,6 +66,7 @@ const TOOL_KEYS: Record<string, MessageKey> = {
   get_random_number: "tool.title.random",
   call_ev: "tool.title.callEv",
   send_table_message: "tool.title.talk",
+  research_history: "tool.title.history",
 };
 
 export function streetLabel(street?: string): string {

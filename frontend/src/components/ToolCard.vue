@@ -1,7 +1,18 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import AppIcon from "./AppIcon.vue";
-import { actionLabel, chips, compactPercent, duration } from "../format";
+import { actionLabel, chips, compactPercent, duration, signedChips } from "../format";
+import {
+  buildHistoryGroups,
+  completedHistory,
+  formatHistoryPercent,
+  historyBarWidth,
+  historyConfidenceClass,
+  historyGroupLabel,
+  historyPositionLabel,
+  historyScopeLabel,
+  recentHistoryHands,
+} from "../historyReport";
 import { handCategoryLabel, handCategoryShort, toolLabel } from "../i18n/labels";
 import { t, type MessageKey } from "../i18n";
 import type { ToolView } from "../types";
@@ -14,6 +25,7 @@ const isAction = computed(() => props.tool.name === "apply_action");
 const isRandom = computed(() => props.tool.name === "get_random_number");
 const isCallEv = computed(() => props.tool.name === "call_ev");
 const isTalk = computed(() => props.tool.name === "send_table_message");
+const isHistory = computed(() => props.tool.name === "research_history");
 const parsed = computed<Record<string, unknown>>(() => {
   if (props.tool.parsed) return props.tool.parsed;
   try {
@@ -26,6 +38,43 @@ const parsed = computed<Record<string, unknown>>(() => {
 const result = computed<Record<string, any>>(() => props.tool.result || {});
 const ok = computed(() => props.tool.status === "done" && result.value.ok !== false);
 const ignored = computed(() => Boolean(props.tool.ignored));
+const historyCurrent = computed<Record<string, any>>(() => {
+  const current = result.value.current_match;
+  return current && typeof current === "object" ? (current as Record<string, any>) : {};
+});
+const historyHands = computed(() => Number(historyCurrent.value.hands || 0));
+const historyBlinds = computed<{ small?: number; big?: number } | null>(() => {
+  const value = historyCurrent.value.blinds;
+  return value && typeof value === "object" ? (value as { small?: number; big?: number }) : null;
+});
+const historyStacks = computed<{ you?: number; opponent?: number } | null>(() => {
+  const value = historyCurrent.value.stacks;
+  return value && typeof value === "object" ? (value as { you?: number; opponent?: number }) : null;
+});
+const historyPositions = computed<Record<string, any> | null>(() => {
+  const value = historyCurrent.value.positions;
+  return value && typeof value === "object" ? (value as Record<string, any>) : null;
+});
+const historyPosition = ref<"all" | "button" | "bb">("all");
+const historyPositionOptions = ["all", "button", "bb"] as const;
+const historySource = computed<Record<string, any>>(() => {
+  if (historyPosition.value === "all" || !historyPositions.value) return historyCurrent.value;
+  const you = historyPositions.value.you?.[historyPosition.value];
+  const opponent = historyPositions.value.opponent?.[historyPosition.value];
+  return {
+    ...historyCurrent.value,
+    you: you && typeof you === "object" ? you : {},
+    opponent: opponent && typeof opponent === "object" ? opponent : {},
+  };
+});
+const historyGroups = computed(() => buildHistoryGroups(historySource.value));
+const historyRecent = computed(() => recentHistoryHands(historyCurrent.value));
+const historyCompleted = computed(() => completedHistory(result.value));
+const historyScope = computed(() => historyScopeLabel(String(result.value.scope || "both")));
+const historyFocus = computed(() => {
+  const focus = String(parsed.value.focus || "all").trim().toLowerCase();
+  return focus && focus !== "all" ? historyGroupLabel(focus) : "";
+});
 const randomValue = computed<number | null>(() => {
   const raw = result.value.value;
   const value = Number(raw);
@@ -94,37 +143,67 @@ const variant = computed(() => {
   if (isRandom.value) return "random";
   if (isCallEv.value) return "call-ev";
   if (isTalk.value) return "talk";
+  if (isHistory.value) return "history";
   return "generic";
 });
 const icon = computed(() =>
-  isEstimate.value || isEquity.value
-    ? "chart"
-    : isAction.value
-      ? "zap"
-      : isRandom.value
-        ? "dice"
-        : isCallEv.value
-          ? "coins"
-          : isTalk.value
-            ? "message"
-            : "wrench",
+  isHistory.value
+    ? "history"
+    : isEstimate.value || isEquity.value
+      ? "chart"
+      : isAction.value
+        ? "zap"
+        : isRandom.value
+          ? "dice"
+          : isCallEv.value
+            ? "coins"
+            : isTalk.value
+              ? "message"
+              : "wrench",
 );
 const title = computed(() =>
-  isEstimate.value
-    ? t("tool.title.estimate")
-    : isEquity.value
-      ? t("tool.title.equity")
-      : isAction.value
-        ? t("tool.title.action")
-        : isRandom.value
-          ? t("tool.title.random")
-          : isCallEv.value
-            ? t("tool.title.callEv")
-            : isTalk.value
-              ? t("tool.title.talk")
-              : props.tool.name || t("tool.title.generic"),
+  isHistory.value
+    ? t("tool.title.history")
+    : isEstimate.value
+      ? t("tool.title.estimate")
+      : isEquity.value
+        ? t("tool.title.equity")
+        : isAction.value
+          ? t("tool.title.action")
+          : isRandom.value
+            ? t("tool.title.random")
+            : isCallEv.value
+              ? t("tool.title.callEv")
+              : isTalk.value
+                ? t("tool.title.talk")
+                : props.tool.name || t("tool.title.generic"),
 );
 const detail = computed(() => {
+  if (isHistory.value) {
+    if (props.tool.status === "running") return t("tool.detail.calculating");
+    const vpip = historyCurrent.value.opponent?.preflop?.vpip;
+    if (vpip && Number.isFinite(Number(vpip.value))) {
+      return t("tool.detail.history", {
+        hands: historyHands.value,
+        value: percent(Number(vpip.value)),
+        n: Number(vpip.n || 0),
+      });
+    }
+    const net = historyCurrent.value.you?.result?.net;
+    if (typeof net === "number" && Number.isFinite(net)) {
+      return t("tool.detail.historyNet", {
+        hands: historyHands.value,
+        value: signedChips(net),
+      });
+    }
+    if (historyCompleted.value) {
+      return t("tool.detail.historyCompleted", {
+        matches: historyCompleted.value.matches,
+        hands: historyCompleted.value.hands,
+      });
+    }
+    return t("tool.detail.historyEmpty", { hands: historyHands.value });
+  }
   if (isEstimate.value || isEquity.value) {
     if (method.value === "exact") {
       return t("tool.detail.exact", { count: samples.value.toLocaleString() });
@@ -429,6 +508,114 @@ function percent(value: number): string {
         </template>
       </div>
 
+      <!-- Research history result -->
+      <div v-else-if="isHistory" class="history-block">
+        <div v-if="tool.status === 'error'" class="generic-error">
+          <AppIcon name="alert" :size="13" />
+          {{ errorText || t("tool.error.generic") }}
+        </div>
+        <div v-else-if="tool.status === 'running'" class="dist-skeleton">
+          <div v-for="n in 4" :key="n" class="skeleton-row">
+            <span class="skeleton-name"></span>
+            <span class="skeleton-bar" :style="{ width: `${70 - n * 8}%` }"></span>
+          </div>
+        </div>
+        <template v-else>
+          <div class="history-meta">
+            <span class="chip gold">{{ historyScope }}</span>
+            <span class="mono">{{ t("tool.history.hands", { count: historyHands }) }}</span>
+            <span v-if="historyBlinds" class="mono faint">
+              {{ t("tool.history.blinds", { sb: chips(historyBlinds.small), bb: chips(historyBlinds.big) }) }}
+            </span>
+            <span v-if="historyStacks" class="mono faint">
+              {{ t("tool.history.stacks", { you: chips(historyStacks.you), opponent: chips(historyStacks.opponent) }) }}
+            </span>
+            <span v-if="historyFocus" class="chip">{{ t("tool.history.focus", { group: historyFocus }) }}</span>
+          </div>
+
+          <div v-if="historyPositions && historyHands" class="history-positions">
+            <button
+              v-for="position in historyPositionOptions"
+              :key="position"
+              type="button"
+              class="history-position"
+              :class="{ active: historyPosition === position }"
+              @click="historyPosition = position"
+            >{{ historyPositionLabel(position) }}</button>
+          </div>
+
+          <div v-if="historyGroups.length" class="history-grid">
+            <div class="history-row history-head-row">
+              <span></span>
+              <span>{{ t("tool.history.you") }}</span>
+              <span>{{ t("tool.history.opponent") }}</span>
+            </div>
+            <template v-for="group in historyGroups" :key="group.key">
+              <div class="history-row history-group-row">
+                <span class="history-group">{{ group.label }}</span>
+              </div>
+              <div v-for="metric in group.metrics" :key="metric.key" class="history-row">
+                <span class="history-name" :title="metric.label">{{ metric.label }}</span>
+                <span class="history-cell" :class="{ empty: metric.you.value === null }">
+                  <span class="history-track">
+                    <span class="history-fill you" :style="{ width: historyBarWidth(metric.you) }"></span>
+                  </span>
+                  <span class="history-value mono">{{ formatHistoryPercent(metric.you) }}</span>
+                  <span
+                    v-if="metric.you.n"
+                    class="history-n mono"
+                    :class="historyConfidenceClass(metric.you)"
+                  >n={{ metric.you.n }}</span>
+                </span>
+                <span class="history-cell" :class="{ empty: metric.opponent.value === null }">
+                  <span class="history-track">
+                    <span class="history-fill opponent" :style="{ width: historyBarWidth(metric.opponent) }"></span>
+                  </span>
+                  <span class="history-value mono">{{ formatHistoryPercent(metric.opponent) }}</span>
+                  <span
+                    v-if="metric.opponent.n"
+                    class="history-n mono"
+                    :class="historyConfidenceClass(metric.opponent)"
+                  >n={{ metric.opponent.n }}</span>
+                </span>
+              </div>
+            </template>
+          </div>
+          <div v-else class="empty-result">{{ t("tool.history.noData") }}</div>
+
+          <div v-if="historyRecent.length" class="history-recent">
+            <span class="history-recent-label">{{ t("tool.history.recent") }}</span>
+            <span
+              v-for="hand in historyRecent"
+              :key="hand.handId"
+              class="history-hand"
+              :class="{ won: hand.won }"
+            >
+              <span class="mono">#{{ hand.handId }}</span>
+              <span class="mono">{{ signedChips(hand.net) }}</span>
+            </span>
+          </div>
+
+          <div v-if="historyCompleted" class="history-completed">
+            <span>
+              {{
+                historyCompleted.vsCurrent
+                  ? t("tool.history.completedVs", {
+                      matches: historyCompleted.matches,
+                      hands: historyCompleted.hands,
+                    })
+                  : t("tool.history.completedOverall", {
+                      matches: historyCompleted.matches,
+                      hands: historyCompleted.hands,
+                    })
+              }}
+            </span>
+          </div>
+
+          <div class="history-note">{{ t("tool.history.note") }}</div>
+        </template>
+      </div>
+
       <!-- Generic result -->
       <div v-else-if="tool.status === 'error'" class="generic-error">
         <AppIcon name="alert" :size="13" />
@@ -480,6 +667,7 @@ function percent(value: number): string {
 .tool-card.random { border-left-color: rgba(121, 169, 255, 0.55); }
 .tool-card.call-ev { border-left-color: rgba(121, 169, 255, 0.55); }
 .tool-card.talk { border-left-color: rgba(232, 195, 122, 0.7); }
+.tool-card.history { border-left-color: rgba(232, 195, 122, 0.45); }
 .tool-card.action.error { border-left-color: rgba(226, 112, 95, 0.6); }
 .tool-card.running { border-left-color: rgba(121, 169, 255, 0.55); }
 .tool-card:hover { background: rgba(255, 255, 255, 0.035); }
@@ -508,6 +696,7 @@ function percent(value: number): string {
 .tool-card.random .tool-icon,
 .tool-card.call-ev .tool-icon { color: var(--blue); }
 .tool-card.talk .tool-icon { color: var(--gold); }
+.tool-card.history .tool-icon { color: var(--gold); }
 .tool-card.action.error .tool-icon { color: var(--red); }
 
 .tool-title {
@@ -1008,4 +1197,191 @@ function percent(value: number): string {
 }
 
 .result-pre { max-height: 260px; color: #93a49a; }
+
+.history-block {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 4px 0 1px;
+}
+
+.history-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: calc(9px * var(--type-scale));
+  color: var(--faint);
+}
+
+.history-meta .chip {
+  padding: 2px 6px;
+  font-size: calc(8px * var(--type-scale));
+}
+
+.history-positions {
+  display: inline-flex;
+  align-self: flex-start;
+  gap: 3px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.history-position {
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--faint);
+  font-size: calc(8.5px * var(--type-scale));
+}
+
+.history-position:hover { color: var(--text-soft); }
+
+.history-position.active {
+  background: rgba(232, 195, 122, 0.12);
+  color: var(--gold);
+}
+
+.history-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-top: 2px;
+}
+
+.history-row {
+  display: grid;
+  grid-template-columns: minmax(52px, 68px) minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-height: 15px;
+}
+
+.history-head-row {
+  padding-bottom: 1px;
+  font-size: calc(8px * var(--type-scale));
+  color: var(--faint);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.history-head-row span:nth-child(2),
+.history-head-row span:nth-child(3) { padding-left: 2px; }
+
+.history-group-row { margin-top: 4px; }
+
+.history-group {
+  grid-column: 1 / -1;
+  font-size: calc(8px * var(--type-scale));
+  font-weight: 700;
+  color: var(--gold);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.78;
+}
+
+.history-name {
+  overflow: hidden;
+  font-size: calc(9px * var(--type-scale));
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-cell {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.history-cell.empty .history-value { color: var(--faint); }
+
+.history-track {
+  flex: 1;
+  min-width: 16px;
+  height: 4px;
+  border-radius: 99px;
+  background: rgba(255, 255, 255, 0.055);
+  overflow: hidden;
+}
+
+.history-fill {
+  display: block;
+  height: 100%;
+  border-radius: 99px;
+  opacity: 0.85;
+  transition: width 0.4s cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+.history-fill.you { background: var(--emerald); }
+.history-fill.opponent { background: var(--gold); }
+
+.history-value {
+  flex: none;
+  min-width: 34px;
+  font-size: calc(9px * var(--type-scale));
+  color: var(--text-soft);
+  text-align: right;
+}
+
+.history-n {
+  flex: none;
+  font-size: calc(7.5px * var(--type-scale));
+  color: var(--faint);
+}
+
+.history-n.low { color: var(--gold); }
+.history-n.medium { color: var(--blue); }
+.history-n.high { color: var(--emerald); opacity: 0.75; }
+
+.history-recent {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding-top: 3px;
+}
+
+.history-recent-label {
+  margin-right: 2px;
+  font-size: calc(8.5px * var(--type-scale));
+  color: var(--faint);
+}
+
+.history-hand {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: calc(8px * var(--type-scale));
+  color: var(--faint);
+}
+
+.history-hand.won {
+  border-color: rgba(84, 214, 168, 0.25);
+  background: rgba(84, 214, 168, 0.06);
+  color: var(--emerald);
+}
+
+.history-completed {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: calc(8.5px * var(--type-scale));
+  color: var(--faint);
+}
+
+.history-note {
+  font-size: calc(8px * var(--type-scale));
+  line-height: 1.45;
+  color: var(--faint);
+  opacity: 0.85;
+}
 </style>

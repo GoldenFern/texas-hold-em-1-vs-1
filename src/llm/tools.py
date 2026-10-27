@@ -68,7 +68,7 @@ _TOOL_TEXT: Dict[str, Dict[str, str]] = {
         ),
         "history_scope": "current_match 只查当前对局，completed_matches 只查本次运行内已完成对局，both 查两者。",
         "history_last_hands": "返回最近多少手的结果，0 到 50，默认 20。",
-        "history_focus": "只看某一组指标：all、preflop、postflop、showdown、result 或 table_talk。",
+        "history_focus": "只看某一组指标：all、preflop、postflop 或 showdown。",
         "unknown_tool": "未知工具：{tools}",
     },
     "en-US": {
@@ -138,7 +138,7 @@ _TOOL_TEXT: Dict[str, Dict[str, str]] = {
         ),
         "history_scope": "current_match for this match only, completed_matches for finished matches in this run, both for both.",
         "history_last_hands": "How many recent results to return, 0 to 50, default 20.",
-        "history_focus": "Limit the report to one group: all, preflop, postflop, showdown, result, or table_talk.",
+        "history_focus": "Limit the report to one group: all, preflop, postflop, or showdown.",
         "unknown_tool": "Unknown tools: {tools}",
     },
 }
@@ -314,8 +314,6 @@ def build_history_tool(locale: str = "zh-CN") -> dict:
                             "preflop",
                             "postflop",
                             "showdown",
-                            "result",
-                            "table_talk",
                         ],
                         "description": text["history_focus"],
                     },
