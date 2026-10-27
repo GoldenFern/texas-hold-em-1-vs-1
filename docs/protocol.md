@@ -6,7 +6,7 @@
 
 ### `GET /api/bootstrap`
 
-返回 Provider/模型元数据、Key 是否配置、牌局默认值与限制、RLCard 可用性与模型文件列表。
+返回 Provider/模型元数据、Key 是否配置、牌局默认值与限制、RLCard 可用性与模型文件列表。`table_talk_styles` 返回桌边喊话风格列表，包含 `id`、中英名称/描述/示例、`intensity` 和 `default`；前端用它渲染 setup 里的风格下拉框。
 
 关键字段：
 
@@ -76,7 +76,8 @@ Key 值永远不会返回；只有 `key_present`。
       "name": "DeepSeek",
       "provider_id": "deepseek",
       "model_id": "deepseek-flash",
-      "params": {"temperature": 1.0, "max_tokens": 32768, "thinking": true, "reasoning_effort": "high"}
+      "params": {"temperature": 1.0, "max_tokens": 32768, "thinking": true, "reasoning_effort": "high"},
+      "table_talk_style": "gentle"
     },
     {
       "kind": "human",
@@ -95,13 +96,16 @@ Key 值永远不会返回；只有 `key_present`。
     "seed": null,
     "god_view": true
   },
-  "table_talk": true
+  "table_talk": true,
+  "table_talk_style": "gentle"
 }
 ```
 
 `blind_increase_every_hands` 默认 0，表示关闭；大于 0 时，每完成 N 手，在下一手发牌前按 `blind_increase_factor` 提高大小盲，并保持原来的大小盲比例。`blind_level` 会在状态快照中递增。
 
 `kind` 只能是 `human` / `llm` / `bot`；两个 `human` 返回 400。`table_talk` 必须是布尔值；只有两个座位都是 `llm` 时才真正生效，其他组合会静默关闭并在 `match.table_talk` 返回 `false`。喊话投递方式由服务端 `config/game.json` 的 `llm_runtime.table_talk_mode` 决定，默认 `inline`；快照里的 `match.table_talk_mode` 会返回实际值（`inline` / `tool` / `off`）。
+
+`table_talk_style` 支持 match 级默认和 `seats[].table_talk_style` 逐座位覆盖，默认 `gentle`。当前 id：`gentle` / `tieba` / `tieba_l3` / `sarcastic` / `newbie` / `veteran` / `chuuni`。只有喊话实际启用时才校验；未知 id 返回 400，关闭喊话时忽略。`tieba_l3` 的攻击性最强，允许脏话，但只针对打法和这手牌。
 Bot 座位：
 
 ```json
@@ -246,7 +250,8 @@ Bot 座位：
       "text": "我这次不会再让你便宜看牌。",
       "turn_id": "1d3e...",
       "created_at": 1760000000.0,
-      "kind": "turn"
+      "kind": "turn",
+      "style": "gentle"
     }
   ],
   "match": {
@@ -258,9 +263,10 @@ Bot 座位：
     "god_view": true,
     "table_talk": true,
     "table_talk_mode": "inline",
+    "table_talk_style": "gentle",
     "can_next_hand": false,
     "rules": {"starting_chips": 1000, "small_blind": 10, "big_blind": 20, "starting_small_blind": 5, "starting_big_blind": 10, "blind_level": 1, "auto_rebuy": false, "rebuy_amount": 1000, "max_hands": 0, "blind_increase_every_hands": 10, "blind_increase_factor": 2.0, "seed": 123},
-    "seats": [{"seat": 0, "name": "DeepSeek", "kind": "llm", "provider_id": "deepseek", "model_id": "deepseek-flash", "model_name": "DeepSeek V4.1 Flash", "icon": "deepseek.svg", "agent": {}}],
+    "seats": [{"seat": 0, "name": "DeepSeek", "kind": "llm", "provider_id": "deepseek", "model_id": "deepseek-flash", "model_name": "DeepSeek V4.1 Flash", "icon": "deepseek.svg", "table_talk_style": "gentle", "table_talk_style_name": "温文尔雅", "table_talk_style_intensity": 0, "agent": {}}],
     "history": [],
     "last_result": null
   }
@@ -269,7 +275,8 @@ Bot 座位：
 
 - `hole_hidden=true` 时 `hole_cards` 为空数组。
 - `deck_remaining` / `burned` 只在 `god_view=true` 时返回。
-- `table_talk` 是最近 40 条喊话，可能来自之前几手；前端按 `id` 去重、按 `seq` 排序。
+- `table_talk` 是最近 40 条喊话，可能来自之前几手；前端按 `id` 去重、按 `seq` 排序。每条带 `style`，对应发送座位的喊话风格。
+- `match.table_talk_style` 是本局默认风格；`match.seats[].table_talk_style` 是该座位实际使用的风格。`table_talk_style_name` 和 `table_talk_style_intensity` 是给 UI 用的展示字段，风格名称以服务端为准。
 - `seq` 是状态版本；前端丢弃同 match 下更小的 seq。
 - `decision_id` 只在轮到人类时非空，人类动作请求必须原样带回；它是 `match:hand:action_count:seat` 组成的决策标识，用来挡住旧页面重放或延迟到达的动作。
 
@@ -434,7 +441,8 @@ Socket.IO 事件 `agent_event` 的 payload。所有事件带：
   "entry": {
     "id": "7f3a...", "seq": 1, "hand_id": 3, "street": "flop",
     "seat": 0, "name": "DeepSeek", "text": "我这次不会再让你便宜看牌。",
-    "turn_id": "1d3e...", "created_at": 1760000000.0, "kind": "turn"
+    "turn_id": "1d3e...", "created_at": 1760000000.0, "kind": "turn",
+    "style": "gentle"
   },
   "remaining_turn": 0
 }
@@ -452,11 +460,12 @@ Socket.IO 事件 `agent_event` 的 payload。所有事件带：
   "match_id": "ab12...", "seat": 0, "event_id": 124,
   "id": "7f3a...", "seq": 1, "hand_id": 3, "street": "flop",
   "name": "DeepSeek", "text": "我这次不会再让你便宜看牌。",
-  "turn_id": "1d3e...", "created_at": 1760000000.0, "kind": "turn"
+  "turn_id": "1d3e...", "created_at": 1760000000.0, "kind": "turn",
+  "style": "gentle"
 }
 ```
 
-对手不会立刻收到；它会在下一次 `turn_state` 的`【牌局更新】`里看到未读喊话。服务端只做文本规范化、长度和频率校验，不扫描真实底牌或牌力，也不核查真伪；前端必须按普通文本渲染，不要使用 `v-html`。
+对手不会立刻收到；它会在下一次 `turn_state` 的`【牌局更新】`里看到未读喊话。服务端只做文本规范化、长度和频率校验，不扫描真实底牌或牌力，也不核查真伪；前端必须按普通文本渲染，不要使用 `v-html`。每条消息带 `style`，用于对话页的风格标签。
 
 比赛结束后，每个 LLM 还会收到一次只暴露 `send_table_message` 的赛后请求。赛后消息的 `kind` 为 `"final"`，`street` 为 `"finished"`，每个座位最多一条。
 

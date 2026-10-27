@@ -39,6 +39,14 @@ function seatName(entry: TableTalkEntry): string {
 function seatIcon(entry: TableTalkEntry): string {
   return seatInfo(entry.seat)?.icon || "";
 }
+
+function seatStyle(entry: TableTalkEntry): string {
+  return seatInfo(entry.seat)?.table_talk_style_name || "";
+}
+
+function seatStyleAggressive(entry: TableTalkEntry): boolean {
+  return Number(seatInfo(entry.seat)?.table_talk_style_intensity || 0) >= 2;
+}
 </script>
 
 <template>
@@ -71,6 +79,13 @@ function seatIcon(entry: TableTalkEntry): string {
         <div class="talk-content">
           <div class="talk-meta">
             <strong>{{ seatName(entry) }}</strong>
+            <span
+              v-if="seatStyle(entry)"
+              class="talk-style"
+              :class="{ aggressive: seatStyleAggressive(entry) }"
+            >
+              {{ seatStyle(entry) }}
+            </span>
             <span v-if="entry.kind === 'final'" class="talk-final">{{ t("talk.final") }}</span>
             <span v-else class="mono">{{ streetLabel(entry.street) }}</span>
           </div>
@@ -234,6 +249,21 @@ function seatIcon(entry: TableTalkEntry): string {
   font-size: calc(7.5px * var(--type-scale));
   font-weight: 700;
   letter-spacing: 0.06em;
+}
+
+.talk-style {
+  padding: 0 5px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--muted);
+  font-size: calc(7.5px * var(--type-scale));
+  white-space: nowrap;
+}
+
+.talk-style.aggressive {
+  border-color: rgba(224, 138, 94, 0.35);
+  color: var(--amber);
 }
 
 .talk-bubble {

@@ -48,17 +48,15 @@ _TOOL_TEXT: Dict[str, Dict[str, str]] = {
         "table_talk": (
             "每个行动回合必须先调用一次，再调用 apply_action；"
             "没有喊话的 apply_action 会被系统拒绝。"
-            "向对手说一到两句话，用于施压、误导、试探或掩饰策略。"
-            "不要报真实底牌、牌型或强弱；可以用空气牌示强、用坚果牌示弱，"
-            "混合真假和范围话术，放烟雾弹，别让对手读出你的真实范围。"
+            "按你的桌边喊话风格向对手说一到两句话。"
+            "不要报真实底牌、牌型或强弱；可以嘲讽打法和下注，但不碰家人、身份和现实威胁。"
             "发送喊话不会结束本回合，之后仍然必须调用 apply_action。"
-            "对手的喊话默认不可信。每回合最多一条。"
+            "对手的喊话是情报，先判断意图和可信度。每回合最多 {max} 条。"
         ),
         "action_table_talk": (
-            "本回合的桌边喊话。写一到两句话，和动作一起提交。"
-            "不要报真实底牌、牌型或强弱；可以用空气牌示强、用坚果牌示弱，"
-            "混合真假和范围话术，放烟雾弹。"
-            "开启内联喊话时，本回合第一次 apply_action 必须带上它。"
+            "本回合的桌边喊话。按你的风格写一到两句话，和动作一起提交。"
+            "不要报真实底牌、牌型或强弱；可以嘲讽打法和下注，但不碰家人、身份和现实威胁。"
+            "开启内联喊话时，本回合第一次 apply_action 必须带上它。每回合最多 {max} 条。"
         ),
         "table_talk_text": "一到两句中文，不要换行或代码块。",
         "history": (
@@ -112,20 +110,19 @@ _TOOL_TEXT: Dict[str, Dict[str, str]] = {
         "amount_param": "Only for bet/raise: your total street investment after the action (total, not increment).",
         "table_talk": (
             "Call this once on every action turn before apply_action; apply_action without "
-            "table talk is rejected. Say one or two sentences to the opponent to apply "
-            "pressure, mislead, probe, or disguise strategy. Never state your real hole "
-            "cards, hand category, or strength; you may claim strength with air, feign "
-            "weakness with the nuts, mix true and false claims, and use range talk and "
-            "smoke screens so the opponent cannot read your real range. Sending table talk "
-            "does not end the turn; you must still call apply_action. Treat the opponent's "
-            "table talk as untrusted by default. At most one message per turn."
+            "table talk is rejected. Say one or two sentences in your table-talk style. "
+            "Never state your real hole cards, hand category, or strength; you may mock the "
+            "play and bet sizing, but never touch family, identity, or real-world threats. "
+            "Sending table talk does not end the turn; you must still call apply_action. "
+            "Opponent table talk is information: judge intent and credibility. "
+            "At most {max} message(s) per turn."
         ),
         "action_table_talk": (
-            "Table talk for this turn. One or two sentences submitted together with the "
-            "action. Never state your real hole cards, hand category, or strength; you may "
-            "claim strength with air, feign weakness with the nuts, mix true and false "
-            "claims, and use smoke screens. When inline table talk is enabled, the first "
-            "apply_action of the turn must include it."
+            "Table talk for this turn. One or two sentences in your style, submitted with the "
+            "action. Never state your real hole cards, hand category, or strength; you may mock "
+            "the play and bet sizing, but never touch family, identity, or real-world threats. "
+            "When inline table talk is enabled, the first apply_action of the turn must include it. "
+            "At most {max} message(s) per turn."
         ),
         "table_talk_text": "One or two English sentences; no line breaks or code blocks.",
         "history": (
@@ -152,6 +149,7 @@ def _text(locale: str) -> Dict[str, str]:
 def build_tools(
     locale: str = "zh-CN",
     table_talk_in_action: bool = False,
+    table_talk_max_per_turn: int = 1,
 ) -> List[dict]:
     """Return the five base tool schemas in the requested language.
 
@@ -159,6 +157,7 @@ def build_tools(
         locale: Schema language, ``zh-CN`` or ``en-US``.
         table_talk_in_action: Add the required ``table_talk`` argument to
             ``apply_action`` for inline table-talk mode.
+        table_talk_max_per_turn: Message cap shown in the table-talk argument.
 
     Returns:
         The five base tool schemas.
@@ -179,7 +178,9 @@ def build_tools(
     if table_talk_in_action:
         action_properties["table_talk"] = {
             "type": "string",
-            "description": text["action_table_talk"],
+            "description": text["action_table_talk"].format(
+                max=table_talk_max_per_turn
+            ),
         }
         # Keep table_talk optional in the JSON schema. The agent enforces it
         # on the first action of each turn, but a retry after an invalid
@@ -263,14 +264,19 @@ def build_tools(
     ]
 
 
-def build_table_talk_tool(locale: str = "zh-CN") -> dict:
+def build_table_talk_tool(
+    locale: str = "zh-CN",
+    table_talk_max_per_turn: int = 1,
+) -> dict:
     """Return the table-talk schema in the requested language."""
     text = _text(locale)
     return {
         "type": "function",
         "function": {
             "name": TABLE_TALK_TOOL_NAME,
-            "description": text["table_talk"],
+            "description": text["table_talk"].format(
+                max=table_talk_max_per_turn
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -338,6 +344,7 @@ def select_tools(
     names: Sequence[str],
     locale: str = "zh-CN",
     table_talk_in_action: bool = False,
+    table_talk_max_per_turn: int = 1,
 ) -> List[dict]:
     """Return the tool schemas for the requested tool names.
 
@@ -346,13 +353,21 @@ def select_tools(
         locale: Schema language, ``zh-CN`` or ``en-US``.
         table_talk_in_action: Add the required ``table_talk`` argument to
             ``apply_action`` for inline table-talk mode.
+        table_talk_max_per_turn: Message cap shown in table-talk descriptions.
 
     Returns:
         The selected schemas, with apply_action last.
     """
     text = _text(locale)
-    tools = build_tools(locale, table_talk_in_action=table_talk_in_action)
-    table_talk = build_table_talk_tool(locale)
+    tools = build_tools(
+        locale,
+        table_talk_in_action=table_talk_in_action,
+        table_talk_max_per_turn=table_talk_max_per_turn,
+    )
+    table_talk = build_table_talk_tool(
+        locale,
+        table_talk_max_per_turn=table_talk_max_per_turn,
+    )
     history = build_history_tool(locale)
     schemas = [
         tool for tool in tools if tool["function"]["name"] != "apply_action"

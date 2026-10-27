@@ -11,6 +11,7 @@ from src.engine.evaluator import hand_category_name
 from src.i18n import normalize_locale, tr
 from src.llm.context import MatchStats
 from src.llm.prompt_texts import prompt_text
+from src.llm.table_talk_styles import DEFAULT_STYLE_ID, resolve_style
 
 ALL_TOOL_NAMES = (
     "estimate_hand_probabilities",
@@ -40,20 +41,23 @@ def build_table_talk_section(
     max_per_turn: int = 1,
     locale: str = "zh-CN",
     mode: str = "tool",
+    style: str = DEFAULT_STYLE_ID,
 ) -> str:
-    """Build the table-talk rules inserted into the system prompt.
+    """Build the table-talk rules and style card for the system prompt.
 
     Args:
-        max_chars: Maximum characters in one table-talk message.
+        max_chars: Hard character cap shown in the prompt.
         max_per_turn: Maximum table-talk messages per turn.
         locale: Prompt language, ``zh-CN`` or ``en-US``.
         mode: ``tool`` for the separate send_table_message tool, ``inline``
             for the table_talk argument of apply_action.
+        style: Table-talk style id.
 
     Returns:
         The table-talk section.
     """
-    text = prompt_text(_locale(locale))
+    normalized_locale = _locale(locale)
+    text = prompt_text(normalized_locale)
     if mode == "inline":
         delivery = text["table_talk_delivery_inline"]
         continue_rule = text["table_talk_continue_inline"]
@@ -62,11 +66,17 @@ def build_table_talk_section(
             tool=TABLE_TALK_TOOL_NAME
         )
         continue_rule = text["table_talk_continue_tool"]
-    return text["table_talk_section"].format(
+    style_spec = resolve_style(style, normalized_locale)
+    base = text["table_talk_section"].format(
         delivery=delivery,
         continue_rule=continue_rule,
         max_chars=max_chars,
         max_per_turn=max_per_turn,
+    )
+    return (
+        f"{base}\n\n"
+        f"{text['table_talk_style_header']}\n"
+        f"{style_spec.localized_prompt(normalized_locale).strip()}"
     )
 
 
@@ -78,6 +88,7 @@ def build_system_prompt(
     table_talk_max_chars: int = 160,
     table_talk_max_per_turn: int = 1,
     table_talk_mode: str = "tool",
+    table_talk_style: str = DEFAULT_STYLE_ID,
     locale: str = "zh-CN",
 ) -> str:
     """Build a system prompt matching the tools available to one seat.
@@ -94,6 +105,7 @@ def build_system_prompt(
         table_talk_mode: ``tool`` for a separate send_table_message tool,
             ``inline`` for the table_talk argument of apply_action, or
             ``off`` when table talk is disabled.
+        table_talk_style: Table-talk style id.
         locale: Prompt language, ``zh-CN`` or ``en-US``.
 
     Returns:
@@ -179,6 +191,7 @@ def build_system_prompt(
                 max_per_turn=table_talk_max_per_turn,
                 locale=locale,
                 mode=mode,
+                style=table_talk_style,
             )
             + "\n\n"
         )
@@ -202,6 +215,22 @@ def _localize_action(item: dict, locale: str) -> dict:
     if action_type:
         action["label"] = action_label(action_type, locale)
     return action
+
+
+def _own_talk_lines(view: AgentView, text: dict, locale: str) -> List[str]:
+    """Format the acting seat's recent table-talk lines for anti-repetition."""
+    if not view.own_table_talk:
+        return []
+    lines = [text["turn_own_talk_header"], text["turn_own_talk_warning"]]
+    for item in view.own_table_talk:
+        lines.append(
+            text["turn_own_talk_item"].format(
+                hand=int(item.get("hand_id") or 0),
+                street=_street_name(str(item.get("street") or ""), locale),
+                text=str(item.get("text") or ""),
+            )
+        )
+    return lines
 
 
 def build_turn_message(
@@ -265,6 +294,7 @@ def build_turn_message(
                     text=talk,
                 )
             )
+    lines.extend(_own_talk_lines(view, text, locale))
     if require_table_talk:
         lines.append(
             text["turn_talk_required_inline"]
@@ -337,6 +367,7 @@ def build_compact_turn_message(
                     text=str(item.get("text") or ""),
                 )
             )
+    lines.extend(_own_talk_lines(view, text, locale))
     if require_table_talk:
         lines.append(
             text["turn_talk_required_inline"]
@@ -486,10 +517,24 @@ def build_final_table_talk_message(
     )
 
 
-def build_final_talk_system_prompt(name: str, locale: str = "zh-CN") -> str:
-    """Build a short system prompt for the post-match table-talk call."""
-    locale = _locale(locale)
-    return prompt_text(locale)["final_system"].format(name=name)
+def build_final_talk_system_prompt(
+    name: str,
+    locale: str = "zh-CN",
+    table_talk_style: str = DEFAULT_STYLE_ID,
+) -> str:
+    """Build a short system prompt for the post-match table-talk call.
+
+    Args:
+        name: Agent display name.
+        locale: Prompt language.
+        table_talk_style: Table-talk style id.
+    """
+    normalized_locale = _locale(locale)
+    style_spec = resolve_style(table_talk_style, normalized_locale)
+    return prompt_text(normalized_locale)["final_system"].format(
+        name=name,
+        style_line=style_spec.localized_final_line(normalized_locale),
+    )
 
 
 def build_final_talk_summary_from_stats(

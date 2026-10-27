@@ -184,6 +184,15 @@ function pickDefaultModel(): ProviderModel | null {
     || null;
 }
 
+export function defaultTableTalkStyle(): string {
+  const styles = state.boot?.table_talk_styles || [];
+  return styles.find((style) => style.default)?.id || styles[0]?.id || "gentle";
+}
+
+function tableTalkStyleIds(): Set<string> {
+  return new Set((state.boot?.table_talk_styles || []).map((style) => style.id));
+}
+
 export function defaultSeat(kind: SeatSetup["kind"], model?: ProviderModel | null): SeatSetup {
   if (kind === "human") {
     return { kind: "human", name: t("common.you") };
@@ -200,6 +209,7 @@ export function defaultSeat(kind: SeatSetup["kind"], model?: ProviderModel | nul
     provider_id: picked?.provider_id || "deepseek",
     model_id: picked?.id || "deepseek-flash",
     params: picked ? { ...picked.defaults } : {},
+    table_talk_style: defaultTableTalkStyle(),
   };
 }
 
@@ -235,6 +245,7 @@ export function buildDefaultSetup(): MatchSetupPayload {
       god_view: defaults.god_view,
     },
     table_talk: defaults.table_talk ?? true,
+    table_talk_style: defaults.table_talk_style || defaultTableTalkStyle(),
     agent_locale: "auto",
   };
 }
@@ -254,6 +265,15 @@ function loadSavedSetup(): MatchSetupPayload | null {
       }
     }
     if (typeof parsed.table_talk !== "boolean") parsed.table_talk = true;
+    const styleIds = tableTalkStyleIds();
+    if (!styleIds.has(String(parsed.table_talk_style || ""))) {
+      parsed.table_talk_style = defaultTableTalkStyle();
+    }
+    for (const seat of parsed.seats) {
+      if (seat.kind === "llm" && !styleIds.has(String(seat.table_talk_style || ""))) {
+        seat.table_talk_style = String(parsed.table_talk_style);
+      }
+    }
     if (!["auto", "zh-CN", "en-US"].includes(String(parsed.agent_locale || ""))) {
       parsed.agent_locale = "auto";
     }
@@ -501,6 +521,7 @@ function tableTalkFromEvent(event: AgentEvent): TableTalkEntry {
     turn_id: event.turn_id ? String(event.turn_id) : undefined,
     created_at: Number(event.created_at || 0) || undefined,
     kind: event.kind === "final" ? "final" : "turn",
+    style: event.style ? String(event.style) : undefined,
   };
 }
 

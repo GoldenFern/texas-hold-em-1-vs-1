@@ -309,6 +309,34 @@ def test_table_talk_requires_two_llm_seats() -> None:
         GameSession._resolve_table_talk([llm, other], "yes")
 
 
+def test_parse_seats_keeps_table_talk_style() -> None:
+    session = make_session()
+    try:
+        seats = session._parse_seats(
+            {
+                "seats": [
+                    {
+                        "kind": "llm",
+                        "name": "A",
+                        "provider_id": "deepseek",
+                        "model_id": "deepseek-flash",
+                        "table_talk_style": "CHUUNI",
+                    },
+                    {
+                        "kind": "llm",
+                        "name": "B",
+                        "provider_id": "deepseek",
+                        "model_id": "deepseek-flash",
+                    },
+                ]
+            }
+        )
+        assert seats[0].table_talk_style == "chuuni"
+        assert seats[1].table_talk_style == ""
+    finally:
+        session.shutdown()
+
+
 def make_table_talk_session():
     session = make_session()
     game = HeadsUpGame(
@@ -325,6 +353,8 @@ def make_table_talk_session():
     session.game = game
     session.match_id = "talk-match"
     session.table_talk_enabled = True
+    session._default_talk_style = "tieba"
+    session._seat_styles = {0: "tieba", 1: "gentle"}
     session._generation = 0
     session._stop_event.clear()
     return session, game
@@ -344,6 +374,7 @@ def test_table_talk_records_event_and_delivers_once() -> None:
         assert entry["seat"] == sender
         assert entry["hand_id"] == game.hand_id
         assert entry["kind"] == "turn"
+        assert entry["style"] == session._seat_styles[sender]
 
         talk_events = [
             args[1]
@@ -361,7 +392,17 @@ def test_table_talk_records_event_and_delivers_once() -> None:
 
         snapshot = session._snapshot_locked()
         assert snapshot["match"]["table_talk"] is True
+        assert snapshot["match"]["table_talk_style"] == "tieba"
         assert snapshot["table_talk"][-1]["text"] == entry["text"]
+        assert snapshot["table_talk"][-1]["style"] == entry["style"]
+        seat_info = {
+            item["seat"]: item for item in snapshot["match"]["seats"]
+        }
+        assert seat_info[0]["table_talk_style"] == "tieba"
+        assert seat_info[0]["table_talk_style_name"] == "贴吧老哥"
+        assert seat_info[0]["table_talk_style_intensity"] == 2
+        assert seat_info[1]["table_talk_style"] == "gentle"
+        assert seat_info[1]["table_talk_style_name"] == "温文尔雅"
     finally:
         session.shutdown()
 
@@ -383,6 +424,26 @@ def test_table_talk_rejects_non_actor_and_enforces_turn_quota() -> None:
         session.shutdown()
 
 
+def test_recent_own_table_talk_returns_last_three_turns() -> None:
+    session, game = make_table_talk_session()
+    try:
+        sender = game.actor
+        assert sender is not None
+        for index in range(4):
+            result = session._record_table_talk(
+                0,
+                sender,
+                f"第{index}句。",
+                f"turn-{index}",
+            )
+            assert result["ok"] is True
+        recent = session._recent_own_table_talk(sender)
+        assert [item["text"] for item in recent] == ["第1句。", "第2句。", "第3句。"]
+        assert session._recent_own_table_talk(1 - sender) == []
+    finally:
+        session.shutdown()
+
+
 def test_final_table_talk_is_one_per_seat_and_marked() -> None:
     session, game = make_table_talk_session()
     try:
@@ -393,6 +454,7 @@ def test_final_table_talk_is_one_per_seat_and_marked() -> None:
         assert result["ok"] is True
         assert result["entry"]["kind"] == "final"
         assert result["entry"]["street"] == "finished"
+        assert result["entry"]["style"] == session._seat_styles[sender]
         assert session._record_final_table_talk(0, sender, "再说一句。")["ok"] is False
         snapshot = session._snapshot_locked()
         assert snapshot["table_talk"][-1]["kind"] == "final"
@@ -478,6 +540,7 @@ def test_archive_current_match_and_history_provider() -> None:
     assert match["hands"] == 1
     assert match["identities"][0].startswith("human:")
     assert match["identities"][1].startswith("bot:")
+    assert match["table_talk_styles"] == {"0": "", "1": ""}
 
     report = session._history_provider(0, scope="both", last_hands=5)
     assert report["current_match"]["hands"] == 1

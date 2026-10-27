@@ -36,7 +36,15 @@ vi.mock("./api", () => {
 });
 
 import { api } from "./api";
-import { boot, game, humanAction, refreshAnalysis, refreshTranscripts } from "./store";
+import {
+  boot,
+  buildDefaultSetup,
+  defaultSeat,
+  game,
+  humanAction,
+  refreshAnalysis,
+  refreshTranscripts,
+} from "./store";
 
 const mockedApi = api as unknown as Record<string, ReturnType<typeof vi.fn>>;
 
@@ -125,10 +133,34 @@ beforeEach(async () => {
     app: {},
     providers: [],
     game: {
-      defaults: {},
+      defaults: { table_talk_style: "gentle" },
       limits: { starting_chips: { min: 100, max: 100000 } },
       llm_runtime: {},
     },
+    table_talk_styles: [
+      {
+        id: "gentle",
+        name: "温文尔雅",
+        name_en: "The Gentleman",
+        description: "礼貌、克制。",
+        description_en: "Polite.",
+        sample: "承让。",
+        sample_en: "Well played.",
+        intensity: 0,
+        default: true,
+      },
+      {
+        id: "tieba",
+        name: "贴吧老哥",
+        name_en: "Forum Trash Talker",
+        description: "嘴硬。",
+        description_en: "Loud.",
+        sample: "哥们，这注下得跟闹着玩似的。",
+        sample_en: "That bet is a joke.",
+        intensity: 2,
+        default: false,
+      },
+    ],
     rlcard: { available: true, models: [] },
     env: {},
   });
@@ -270,6 +302,16 @@ describe("hand result", () => {
   });
 });
 
+describe("table-talk style setup", () => {
+  it("defaults the match and LLM seats to the bootstrap default", () => {
+    localStorage.clear();
+    const setup = buildDefaultSetup();
+    expect(setup.table_talk_style).toBe("gentle");
+    expect(setup.seats[0].table_talk_style).toBe("gentle");
+    expect(defaultSeat("llm").table_talk_style).toBe("gentle");
+  });
+});
+
 function talkEntry(overrides: Record<string, any> = {}) {
   return {
     id: "talk-1",
@@ -281,6 +323,7 @@ function talkEntry(overrides: Record<string, any> = {}) {
     text: "我这次不会再让你便宜看牌。",
     turn_id: "turn-1",
     created_at: 1,
+    style: "gentle",
     ...overrides,
   };
 }
@@ -299,6 +342,7 @@ describe("table talk", () => {
     socketMock.handlers.state?.(snapshot({ seq: 2, table_talk: [entry] }));
     expect(game.tableTalk).toHaveLength(1);
     expect(game.tableTalk[0].text).toContain("便宜看牌");
+    expect(game.tableTalk[0].style).toBe("gentle");
   });
 
   it("drops entries from a previous match", () => {

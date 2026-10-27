@@ -151,6 +151,17 @@ def test_inline_table_talk_adds_argument_to_apply_action() -> None:
             tool["function"]["name"] for tool in tools
         ]
 
+    capped = select_tools(
+        ["apply_action"],
+        "zh-CN",
+        table_talk_in_action=True,
+        table_talk_max_per_turn=3,
+    )
+    description = capped[0]["function"]["parameters"]["properties"]["table_talk"][
+        "description"
+    ]
+    assert "最多 3 条" in description
+
 
 def test_game_tools_add_history_without_changing_the_baseline() -> None:
     assert list(ALL_TOOL_NAMES) == EXPECTED_TOOL_NAMES

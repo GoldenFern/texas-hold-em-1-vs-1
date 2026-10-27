@@ -986,6 +986,7 @@ def build_match_record(
     started_at: float = 0.0,
     ended_at: float = 0.0,
     rules: Optional[Mapping] = None,
+    table_talk_styles: Optional[Mapping] = None,
     recent_limit: int = 20,
 ) -> dict:
     """Build an archived match record with counters for both seats."""
@@ -1010,6 +1011,10 @@ def build_match_record(
         "rules": {
             key: (rules or {}).get(key)
             for key in ("starting_chips", "small_blind", "big_blind", "auto_rebuy")
+        },
+        "table_talk_styles": {
+            str(seat): str(style or "")
+            for seat, style in (table_talk_styles or {}).items()
         },
         "counters": {seat: value for seat, value in seat_counters.items()},
         "counters_button": {seat: value for seat, value in button_counters.items()},

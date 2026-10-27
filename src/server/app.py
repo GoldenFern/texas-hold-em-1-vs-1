@@ -18,6 +18,7 @@ from src.i18n import DEFAULT_LOCALE, normalize_locale, tr
 from src.llm.client import LLMClient, LLMError
 from src.llm.providers import PROJECT_ROOT, ProviderRegistry
 from src.llm.retry import RetryPolicy
+from src.llm.table_talk_styles import list_styles
 from src.server.session import GameSession
 
 APP_VERSION = "0.1.0"
@@ -172,6 +173,7 @@ def create_app() -> tuple[Flask, SocketIO, GameSession]:
                 },
                 "providers": registry.list_providers(),
                 "game": game_config,
+                "table_talk_styles": list_styles(),
                 "rlcard": _rlcard_info(),
                 "env": {
                     "god_view_default": bool(game_config.get("defaults", {}).get("god_view", True)),

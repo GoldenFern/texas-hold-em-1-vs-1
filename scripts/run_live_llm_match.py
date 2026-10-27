@@ -154,6 +154,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider-config", type=Path, default=DEFAULT_PROVIDER_CONFIG)
     parser.add_argument("--seat-a-name", default="Luna A")
     parser.add_argument("--seat-b-name", default="Luna B")
+    parser.add_argument("--seat-a-style", default="gentle")
+    parser.add_argument("--seat-b-style", default="gentle")
     parser.add_argument("--reasoning-effort", default="low")
     parser.add_argument("--max-tokens", type=int, default=32768)
     parser.add_argument("--temperature", type=float, default=1.0)
@@ -278,6 +280,10 @@ def collect_session(session, stop_reason: str, wall_seconds: float) -> Dict[str,
             "stop_reason": stop_reason,
             "match_error": session.match_error,
             "table_talk_enabled": session.table_talk_enabled,
+            "table_talk_styles": {
+                seat: info.get("table_talk_style", "")
+                for seat, info in agents.items()
+            },
             "agent_locale": session.agent_locale,
             "event_seq": session.event_seq,
             "state_seq": session.state_seq,
@@ -449,6 +455,7 @@ def main() -> int:
                 "provider_id": args.provider,
                 "model_id": args.model,
                 "params": dict(params),
+                "table_talk_style": args.seat_a_style,
             },
             {
                 "kind": "llm",
@@ -456,6 +463,7 @@ def main() -> int:
                 "provider_id": args.provider,
                 "model_id": args.model,
                 "params": dict(params),
+                "table_talk_style": args.seat_b_style,
             },
         ],
         "rules": {
@@ -470,6 +478,7 @@ def main() -> int:
             "god_view": True,
         },
         "table_talk": bool(args.table_talk),
+        "table_talk_style": args.seat_a_style,
         "agent_locale": args.agent_locale,
     }
 
@@ -479,6 +488,7 @@ def main() -> int:
         "match:  "
         f"{args.provider}/{args.model}, chips={args.chips}, blinds={args.sb}/{args.bb}, "
         f"max_hands={args.max_hands or 'until bust'}, table_talk={args.table_talk}, "
+        f"styles={args.seat_a_style}/{args.seat_b_style}, "
         f"blind_increase={args.blind_increase_every_hands or 'off'}"
     )
     started = time.time()
@@ -629,6 +639,7 @@ def main() -> int:
             "blind_level": final_state.get("blind_level"),
             "match_error": collected.get("match_error"),
             "table_talk_enabled": collected.get("table_talk_enabled"),
+            "table_talk_styles": collected.get("table_talk_styles") or {},
             "agent_locale": collected.get("agent_locale"),
             "provider": args.provider,
             "model": args.model,

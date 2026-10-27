@@ -73,7 +73,11 @@ def result() -> dict:
     }
 
 
-def make_agent(client: CaptureClient, mode: str) -> LLMAgent:
+def make_agent(
+    client: CaptureClient,
+    mode: str,
+    table_talk_style: str = "gentle",
+) -> LLMAgent:
     registry = ProviderRegistry()
     spec = registry.resolve("deepseek", "deepseek-flash")
     return LLMAgent(
@@ -92,6 +96,7 @@ def make_agent(client: CaptureClient, mode: str) -> LLMAgent:
         tools=select_tools(AGENT_TOOL_NAMES, locale="zh-CN"),
         system_prompt="full system prompt",
         submit_table_talk=lambda text: {"ok": True},
+        table_talk_style=table_talk_style,
         locale="zh-CN",
     )
 
@@ -121,6 +126,8 @@ def test_fresh_final_talk_uses_short_context() -> None:
     assert messages[0]["role"] == "system"
     assert "send_table_message" in messages[0]["content"]
     assert "不要调用 apply_action" in messages[0]["content"]
+    assert "赛后也用温和的语气" in messages[0]["content"]
+    assert agent.describe()["table_talk_style"] == "gentle"
     assert "【整场结果】共 1 手" in messages[1]["content"]
     assert "盈利" in messages[1]["content"]
     assert "【赛后喊话】" in messages[1]["content"]
@@ -146,6 +153,17 @@ def test_fresh_final_talk_uses_short_context() -> None:
     }
     # The fresh call must not replace the agent's long history.
     assert len(agent.messages) == 3
+
+
+def test_final_talk_uses_the_seat_style() -> None:
+    client = CaptureClient()
+    agent = make_agent(client, "fresh", table_talk_style="tieba")
+    agent.match_stats = MatchStats.from_results([result()], 0)
+
+    agent.final_table_talk(result(), lambda text: {"ok": True}, lambda event: None)
+
+    assert agent.describe()["table_talk_style"] == "tieba"
+    assert "赛后也可以嘴两句" in client.captured[0][0]["content"]
 
 
 def test_full_final_talk_keeps_history() -> None:

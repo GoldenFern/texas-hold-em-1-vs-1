@@ -33,6 +33,7 @@ from src.llm.prompt import (
 from src.llm.providers import ProviderRegistry
 from src.llm.retry import RetryPolicy
 from src.llm.table_talk import TableTalkLimits, normalize_table_talk
+from src.llm.table_talk_styles import DEFAULT_STYLE_ID, resolve_style
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 GAME_CONFIG_PATH = PROJECT_ROOT / "config" / "game.json"
@@ -52,6 +53,7 @@ class SeatConfig:
     bot_agent_type: str = "random"
     bot_model_path: Optional[str] = None
     bot_delay_seconds: float = BOT_DELAY_DEFAULT
+    table_talk_style: str = ""
 
     def __post_init__(self) -> None:
         if self.params is None:
@@ -91,6 +93,8 @@ class GameSession:
         self.transcripts: Dict[int, List[dict]] = {0: [], 1: []}
         self.table_talk_enabled = False
         self.table_talk_mode = "off"
+        self._default_talk_style = "off"
+        self._seat_styles: Dict[int, str] = {0: "", 1: ""}
         self.table_talk: List[dict] = []
         self.event_seq = 0
         self.state_seq = 0
@@ -268,6 +272,9 @@ class GameSession:
                     else spec.provider_name_en
                 )
                 name = name or f"{provider_name} · {spec.name}"
+                table_talk_style = str(
+                    raw.get("table_talk_style") or ""
+                ).strip().lower()
                 seats.append(
                     SeatConfig(
                         kind="llm",
@@ -275,6 +282,7 @@ class GameSession:
                         provider_id=provider_id,
                         model_id=model_id,
                         params=dict(raw.get("params") or {}),
+                        table_talk_style=table_talk_style,
                     )
                 )
                 continue
@@ -384,6 +392,26 @@ class GameSession:
                 self._game_config.get("llm_runtime", {})
             )
             effective_talk_mode = talk_mode if table_talk_enabled else "off"
+            default_talk_style = "off"
+            seat_styles: Dict[int, str] = {0: "", 1: ""}
+            if table_talk_enabled:
+                requested_talk_style = payload.get(
+                    "table_talk_style",
+                    self._game_config.get("defaults", {}).get(
+                        "table_talk_style", DEFAULT_STYLE_ID
+                    ),
+                )
+                default_talk_style = resolve_style(
+                    requested_talk_style,
+                    self.ui_locale,
+                ).id
+                for index, seat in enumerate(seats):
+                    if seat.kind != "llm":
+                        continue
+                    seat_styles[index] = resolve_style(
+                        seat.table_talk_style or default_talk_style,
+                        self.ui_locale,
+                    ).id
             requested_agent_locale = payload.get("agent_locale")
             if requested_agent_locale in (None, "", "auto"):
                 requested_agent_locale = self.ui_locale
@@ -444,17 +472,27 @@ class GameSession:
                 llm_tool_names,
                 locale=agent_locale,
                 table_talk_in_action=(effective_talk_mode == "inline"),
-            )
-            llm_system_prompt = build_system_prompt(
-                llm_tool_names,
-                require_estimate_each_turn=bool(
-                    llm_runtime.get("require_estimate_each_turn", False)
-                ),
-                table_talk_max_chars=self._table_talk_limits.max_chars,
                 table_talk_max_per_turn=self._table_talk_limits.max_per_turn,
-                table_talk_mode=effective_talk_mode,
-                locale=agent_locale,
             )
+            llm_system_prompts: Dict[int, str] = {}
+            for seat_index, seat in enumerate(seats):
+                if seat.kind != "llm":
+                    continue
+                llm_system_prompts[seat_index] = build_system_prompt(
+                    llm_tool_names,
+                    require_estimate_each_turn=bool(
+                        llm_runtime.get("require_estimate_each_turn", False)
+                    ),
+                    table_talk_max_chars=self._table_talk_limits.chars_for(
+                        agent_locale
+                    ),
+                    table_talk_max_per_turn=self._table_talk_limits.max_per_turn,
+                    table_talk_mode=effective_talk_mode,
+                    table_talk_style=seat_styles.get(
+                        seat_index, DEFAULT_STYLE_ID
+                    ),
+                    locale=agent_locale,
+                )
             for seat_index, seat in enumerate(seats):
                 if seat.kind == "llm":
                     spec = self.registry.resolve(
@@ -473,7 +511,7 @@ class GameSession:
                         ),
                         runtime=llm_runtime,
                         tools=llm_tools,
-                        system_prompt=llm_system_prompt,
+                        system_prompt=llm_system_prompts.get(seat_index),
                         submit_table_talk=(
                             self._table_talk_submitter(
                                 generation_holder, seat_index, agent_locale
@@ -483,6 +521,9 @@ class GameSession:
                         ),
                         history_provider=self._history_provider,
                         table_talk_mode=effective_talk_mode,
+                        table_talk_style=seat_styles.get(
+                            seat_index, DEFAULT_STYLE_ID
+                        ),
                         locale=agent_locale,
                     )
                 elif seat.kind == "bot":
@@ -541,6 +582,8 @@ class GameSession:
                 self.transcripts = {0: [], 1: []}
                 self.table_talk_enabled = table_talk_enabled
                 self.table_talk_mode = effective_talk_mode
+                self._default_talk_style = default_talk_style
+                self._seat_styles = dict(seat_styles)
                 self.table_talk = []
                 self._table_talk_seq = 0
                 self._table_talk_cursors = {0: 0, 1: 0}
@@ -617,6 +660,7 @@ class GameSession:
             started_at=self.started_at,
             ended_at=time.time(),
             rules=rules,
+            table_talk_styles=dict(self._seat_styles),
         )
         self.completed_matches.append(record)
         if len(self.completed_matches) > 50:
@@ -739,7 +783,7 @@ class GameSession:
             try:
                 normalized = normalize_table_talk(
                     text,
-                    self._table_talk_limits.max_chars,
+                    self._table_talk_limits.chars_for(talk_locale),
                     locale=talk_locale,
                 )
             except ValueError as exc:
@@ -762,6 +806,7 @@ class GameSession:
                 "turn_id": str(turn_id or ""),
                 "created_at": time.time(),
                 "kind": "turn",
+                "style": self._seat_styles.get(seat, ""),
             }
             self.table_talk.append(entry)
             if len(self.table_talk) > 500:
@@ -807,7 +852,7 @@ class GameSession:
             try:
                 normalized = normalize_table_talk(
                     text,
-                    self._table_talk_limits.max_chars,
+                    self._table_talk_limits.chars_for(talk_locale),
                     locale=talk_locale,
                 )
             except ValueError as exc:
@@ -826,6 +871,7 @@ class GameSession:
                 "turn_id": "",
                 "created_at": time.time(),
                 "kind": "final",
+                "style": self._seat_styles.get(seat, ""),
             }
             self.table_talk.append(entry)
             if len(self.table_talk) > 500:
@@ -851,6 +897,19 @@ class GameSession:
         batch = pending[: self._table_talk_limits.history_limit]
         self._table_talk_cursors[seat] = int(batch[-1]["seq"])
         return [dict(item) for item in batch]
+
+    def _recent_own_table_talk(self, seat: int) -> List[dict]:
+        """Return the seat's latest turn messages for anti-repetition."""
+        limit = self._table_talk_limits.self_history_limit
+        if limit <= 0:
+            return []
+        own = [
+            item
+            for item in self.table_talk
+            if int(item.get("seat", -1)) == seat
+            and item.get("kind") == "turn"
+        ]
+        return [dict(item) for item in own[-limit:]]
 
     def _stop_current_thread(self) -> None:
         with self.lock:
@@ -1202,6 +1261,7 @@ class GameSession:
             "god_view": self.god_view,
             "table_talk": self.table_talk_enabled,
             "table_talk_mode": self.table_talk_mode,
+            "table_talk_style": self._default_talk_style,
             "agent_locale": self.agent_locale,
             "can_next_hand": self.game.street == Street.FINISHED and not self.game.match_over,
             "started_at": self.started_at,
@@ -1233,6 +1293,7 @@ class GameSession:
         config = self.seat_configs.get(seat)
         player = self.game.players[seat] if self.game else None
         agent = self.agents.get(seat)
+        style_id = self._seat_styles.get(seat, "")
         info = {
             "seat": seat,
             "name": config.name if config else (player.name if player else f"Seat {seat}"),
@@ -1241,8 +1302,18 @@ class GameSession:
             "provider_id": config.provider_id if config else "",
             "model_id": config.model_id if config else "",
             "model_name": "",
+            "table_talk_style": style_id,
+            "table_talk_style_name": "",
+            "table_talk_style_intensity": 0,
             "agent": {},
         }
+        if style_id:
+            try:
+                style = resolve_style(style_id, self.ui_locale)
+                info["table_talk_style_name"] = style.localized_name(self.ui_locale)
+                info["table_talk_style_intensity"] = style.intensity
+            except ValueError:
+                pass
         if config and config.kind == "llm":
             try:
                 spec = self.registry.resolve(config.provider_id, config.model_id)
@@ -1290,6 +1361,7 @@ class GameSession:
             match_note=self._match_note(seat),
             history_summary=[self._llm_history_item(item, seat) for item in self.hand_history[-3:]],
             table_talk=self._pending_table_talk(seat),
+            own_table_talk=self._recent_own_table_talk(seat),
         )
 
     def _match_note(self, seat: int) -> str:

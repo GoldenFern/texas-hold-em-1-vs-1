@@ -72,11 +72,14 @@ def test_table_talk_requires_boolean_and_two_llm_seats() -> None:
         assert "table_talk" in response.get_json()["error"]
 
         payload["table_talk"] = True
+        payload["table_talk_style"] = "not-a-style"
         response = client.post("/api/game/new", json=payload)
         assert response.status_code == 200
         assert session.table_talk_enabled is False
-        assert response.get_json()["state"]["match"]["table_talk"] is False
-        assert response.get_json()["state"]["match"]["table_talk_mode"] == "off"
+        state = response.get_json()["state"]
+        assert state["match"]["table_talk"] is False
+        assert state["match"]["table_talk_mode"] == "off"
+        assert state["match"]["table_talk_style"] == "off"
     finally:
         session.shutdown()
 
@@ -107,9 +110,15 @@ def test_bootstrap_includes_english_provider_names() -> None:
     try:
         response = client.get("/api/bootstrap", headers={"X-HU-Locale": "en-US"})
         assert response.status_code == 200
-        providers = {item["id"]: item for item in response.get_json()["providers"]}
+        payload = response.get_json()
+        providers = {item["id"]: item for item in payload["providers"]}
         assert providers["doubao"]["name_en"] == "Volcengine"
         assert providers["qwen"]["models"][0]["provider_name_en"] == "Qwen"
+        styles = {item["id"]: item for item in payload["table_talk_styles"]}
+        assert styles["gentle"]["name_en"] == "The Gentleman"
+        assert styles["gentle"]["default"] is True
+        assert styles["tieba_l3"]["name_en"] == "Forum Trash Talker (Hard)"
+        assert styles["tieba_l3"]["intensity"] == 3
     finally:
         session.shutdown()
 

@@ -10,7 +10,8 @@
     "blind_increase_factor": 2.0,
     "seed": null,
     "god_view": true,
-    "table_talk": true
+    "table_talk": true,
+    "table_talk_style": "gentle"
   },
   "limits": {
     "starting_chips": {"min": 100, "max": 100000},
@@ -31,10 +32,12 @@
     "max_estimate_iterations": 50000,
     "max_equity_calls_per_turn": 2,
     "max_equity_iterations": 50000,
-    "table_talk_max_chars": 160,
+    "table_talk_max_chars_zh": 80,
+    "table_talk_max_chars_en": 160,
     "table_talk_max_per_turn": 1,
     "table_talk_mode": "inline",
     "table_talk_history_limit": 6,
+    "table_talk_self_history_limit": 3,
     "table_talk_snapshot_limit": 40,
     "max_context_tokens_estimate": 0,
     "context_policy": "checkpoint",

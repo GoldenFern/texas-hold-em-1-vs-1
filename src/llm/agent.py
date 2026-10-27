@@ -61,6 +61,7 @@ from .prompt import (
 from .prompt_texts import prompt_text
 from .providers import ModelSpec
 from .table_talk import TableTalkLimits
+from .table_talk_styles import DEFAULT_STYLE_ID, resolve_style
 from .tools import (
     HISTORY_TOOL,
     TABLE_TALK_TOOL,
@@ -122,6 +123,7 @@ class LLMAgent(BaseAgent):
         submit_table_talk: Optional[Callable[[str, str], dict]] = None,
         history_provider: Optional[Callable[..., dict]] = None,
         table_talk_mode: str = "tool",
+        table_talk_style: str = DEFAULT_STYLE_ID,
         locale: str = "zh-CN",
     ) -> None:
         self.seat = seat
@@ -198,6 +200,8 @@ class LLMAgent(BaseAgent):
         self.max_equity_iterations = int(runtime.get("max_equity_iterations", 50000))
         self.max_history_calls = int(runtime.get("max_history_calls_per_turn", 2))
         self.table_talk_limits = TableTalkLimits.from_runtime(runtime)
+        self.table_talk_style = resolve_style(table_talk_style, self.locale)
+        self.table_talk_max_chars = self.table_talk_limits.chars_for(self.locale)
         self.submit_table_talk = submit_table_talk
         mode = str(table_talk_mode or "tool").strip().lower()
         if mode not in ("tool", "inline", "off"):
@@ -212,6 +216,7 @@ class LLMAgent(BaseAgent):
             else build_tools(
                 self.locale,
                 table_talk_in_action=(mode == "inline"),
+                table_talk_max_per_turn=self.table_talk_limits.max_per_turn,
             )
         )
         if self.history_provider is None:
@@ -253,9 +258,10 @@ class LLMAgent(BaseAgent):
             self.system_prompt = build_system_prompt(
                 tuple(self.tool_names),
                 require_estimate_each_turn=self.require_estimate_each_turn,
-                table_talk_max_chars=self.table_talk_limits.max_chars,
+                table_talk_max_chars=self.table_talk_max_chars,
                 table_talk_max_per_turn=self.table_talk_limits.max_per_turn,
                 table_talk_mode=mode,
+                table_talk_style=self.table_talk_style.id,
                 locale=self.locale,
             )
         self.messages: List[dict] = [{"role": "system", "content": self.system_prompt}]
@@ -398,7 +404,11 @@ class LLMAgent(BaseAgent):
             messages: List[dict] = [
                 {
                     "role": "system",
-                    "content": build_final_talk_system_prompt(self.name, self.locale),
+                    "content": build_final_talk_system_prompt(
+                        self.name,
+                        self.locale,
+                        self.table_talk_style.id,
+                    ),
                 },
                 {
                     "role": "user",
@@ -418,7 +428,12 @@ class LLMAgent(BaseAgent):
             self.messages.append({"role": "user", "content": prompt})
             self._prepare_context(emit, final=True)
             messages = self.messages
-        tools = [build_table_talk_tool(self.locale)]
+        tools = [
+            build_table_talk_tool(
+                self.locale,
+                table_talk_max_per_turn=self.table_talk_limits.max_per_turn,
+            )
+        ]
         emit(
             {
                 "type": "final_talk_start",
@@ -609,6 +624,10 @@ class LLMAgent(BaseAgent):
             },
             "table_talk": self.table_talk_required,
             "table_talk_mode": self.table_talk_mode,
+            "table_talk_style": self.table_talk_style.id,
+            "table_talk_style_name": self.table_talk_style.localized_name(
+                self.locale
+            ),
             "history_tool": HISTORY_TOOL_NAME in self.tool_names,
             "context": {
                 "policy": self.context.policy,
@@ -2021,7 +2040,7 @@ class LLMAgent(BaseAgent):
                 index,
                 extra={
                     "remaining_turn": result.get("remaining_turn"),
-                    "max_chars": self.table_talk_limits.max_chars,
+                    "max_chars": self.table_talk_max_chars,
                 },
             )
             return True

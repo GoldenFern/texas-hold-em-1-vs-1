@@ -35,22 +35,35 @@ def test_normalize_does_not_inspect_card_content() -> None:
 def test_limits_read_from_runtime_and_clamp() -> None:
     limits = TableTalkLimits.from_runtime(
         {
-            "table_talk_max_chars": 120,
+            "table_talk_max_chars_zh": 80,
+            "table_talk_max_chars_en": 180,
             "table_talk_max_per_turn": 3,
             "table_talk_history_limit": 4,
+            "table_talk_self_history_limit": 5,
             "table_talk_snapshot_limit": 20,
         }
     )
-    assert limits.max_chars == 120
+    assert limits.max_chars_zh == 80
+    assert limits.max_chars_en == 180
+    assert limits.chars_for("zh-CN") == 80
+    assert limits.chars_for("en-US") == 180
     assert limits.max_per_turn == 3
     assert limits.history_limit == 4
+    assert limits.self_history_limit == 5
     assert limits.snapshot_limit == 20
+
+    legacy = TableTalkLimits.from_runtime({"table_talk_max_chars": 120})
+    assert legacy.max_chars_zh == 120
+    assert legacy.max_chars_en == 120
 
     fallback = TableTalkLimits.from_runtime(
         {
-            "table_talk_max_chars": "many",
+            "table_talk_max_chars_zh": "many",
+            "table_talk_max_chars_en": -5,
             "table_talk_max_per_turn": -3,
         }
     )
-    assert fallback.max_chars == 160
+    assert fallback.max_chars_zh == 80
+    assert fallback.max_chars_en == 160
     assert fallback.max_per_turn == 1
+    assert fallback.self_history_limit == 3

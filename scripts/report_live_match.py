@@ -722,10 +722,12 @@ def table_talk_stats(match: Dict[str, Any], events: Sequence[Dict[str, Any]]) ->
         items = [event for event in events if event.get("type") == "table_talk"]
     by_seat = Counter()
     by_kind = Counter()
+    by_style = Counter()
     lengths = []
     for item in items:
         by_seat[int(item.get("seat", -1))] += 1
         by_kind[str(item.get("kind") or "turn")] += 1
+        by_style[str(item.get("style") or "unknown")] += 1
         lengths.append(len(str(item.get("text") or "")))
     finals = [item for item in items if str(item.get("kind") or "") == "final"]
     turns = [item for item in items if str(item.get("kind") or "turn") != "final"]
@@ -733,6 +735,7 @@ def table_talk_stats(match: Dict[str, Any], events: Sequence[Dict[str, Any]]) ->
         "count": len(items),
         "by_seat": {str(seat): count for seat, count in by_seat.items()},
         "by_kind": dict(by_kind),
+        "by_style": dict(by_style),
         "avg_chars": statistics.mean(lengths) if lengths else None,
         "max_chars": max(lengths) if lengths else None,
         "finals": finals,
@@ -1148,7 +1151,11 @@ def build_report(summary: Dict[str, Any], run_dir: Path) -> str:
         f"{start_small}/{start_big} 起始盲注，"
         f"无重购，{'手数上限 ' + str(rules.get('max_hands')) if rules.get('max_hands') else '打到一方筹码归零'}"
     )
-    lines.append(f"- 桌边喊话: {'开启' if match.get('table_talk_enabled') else '关闭'}")
+    talk_line = f"- 桌边喊话: {'开启' if match.get('table_talk_enabled') else '关闭'}"
+    styles = match.get("table_talk_styles") or {}
+    if styles:
+        talk_line += f"（风格 {styles}）"
+    lines.append(talk_line)
     if int(rules.get("blind_increase_every_hands", 0) or 0) > 0:
         lines.append(
             f"- 盲注递增: 每 {rules.get('blind_increase_every_hands')} 手 "
@@ -1362,6 +1369,8 @@ def build_report(summary: Dict[str, Any], run_dir: Path) -> str:
     lines.append("## 桌边喊话")
     lines.append("")
     lines.append(f"- 总消息 {summary['table_talk']['count']} 条，按座位 {summary['table_talk']['by_seat']}。")
+    if summary["table_talk"].get("by_style"):
+        lines.append(f"- 风格分布 {summary['table_talk']['by_style']}。")
     if summary["table_talk"]["avg_chars"]:
         lines.append(f"- 平均 {summary['table_talk']['avg_chars']:.1f} 字，最长 {summary['table_talk']['max_chars']} 字。")
     lines.append("")

@@ -10,6 +10,7 @@ import {
   buildDefaultSetup,
   closeSetup,
   defaultSeat,
+  defaultTableTalkStyle,
   game,
   modelFor,
   providerOf,
@@ -17,7 +18,13 @@ import {
   startMatch,
   testProvider,
 } from "../store";
-import type { MatchSetupPayload, ProviderInfo, ProviderModel, SeatSetup } from "../types";
+import type {
+  MatchSetupPayload,
+  ProviderInfo,
+  ProviderModel,
+  SeatSetup,
+  TableTalkStyleInfo,
+} from "../types";
 
 interface SetupDraft extends MatchSetupPayload {}
 
@@ -45,6 +52,7 @@ const setup = reactive<SetupDraft>({
   ],
   rules: { ...FALLBACK_RULES },
   table_talk: true,
+  table_talk_style: "gentle",
   agent_locale: "auto",
 });
 
@@ -56,8 +64,44 @@ const busy = computed(() => game.busy);
 const starting = computed(() => game.starting);
 const aborting = computed(() => game.aborting);
 const canTableTalk = computed(() => setup.seats.every((item) => item.kind === "llm"));
+const tableTalkStyles = computed<TableTalkStyleInfo[]>(
+  () => boot.value?.table_talk_styles || [],
+);
 const tableTalkTouched = ref(false);
 const modalRef = ref<HTMLElement | null>(null);
+
+function tableTalkStyle(id: string | undefined): TableTalkStyleInfo | null {
+  return tableTalkStyles.value.find((style) => style.id === id) || null;
+}
+
+function tableTalkStyleName(style: TableTalkStyleInfo): string {
+  return localizedText(style.name, style.name_en);
+}
+
+function tableTalkStyleDescription(id: string | undefined): string {
+  const style = tableTalkStyle(id);
+  return style ? localizedText(style.description, style.description_en) : "";
+}
+
+function tableTalkStyleSample(id: string | undefined): string {
+  const style = tableTalkStyle(id);
+  return style ? localizedText(style.sample, style.sample_en) : "";
+}
+
+function setSeatTableTalkStyle(index: number, event: Event): void {
+  const value = (event.target as HTMLSelectElement).value;
+  setup.seats[index] = {
+    ...seat(index),
+    table_talk_style: value,
+  } as SeatSetup;
+}
+
+function normalizeTableTalkStyle(value: unknown): string {
+  const id = String(value || "");
+  return tableTalkStyles.value.some((style) => style.id === id)
+    ? id
+    : defaultTableTalkStyle();
+}
 
 watch(canTableTalk, (enabled) => {
   if (!enabled) {
@@ -90,6 +134,12 @@ function resetSetup(): void {
   setup.seats = copy.seats;
   setup.rules = { ...copy.rules };
   setup.agent_locale = copy.agent_locale || "auto";
+  setup.table_talk_style = normalizeTableTalkStyle(copy.table_talk_style);
+  for (const config of setup.seats) {
+    if (config.kind === "llm") {
+      config.table_talk_style = normalizeTableTalkStyle(config.table_talk_style);
+    }
+  }
   const savedTalk = Boolean(copy.table_talk ?? true);
   setup.table_talk = savedTalk && setup.seats.every((item) => item.kind === "llm");
   tableTalkTouched.value = !savedTalk;
@@ -440,6 +490,7 @@ function applyPreset(kind: "human_deepseek" | "deepseek_glm" | "human_bot"): voi
     setup.seats = [defaultSeat("llm", deepseek), defaultSeat("human")];
   } else if (kind === "deepseek_glm") {
     setup.seats = [defaultSeat("llm", deepseek), defaultSeat("llm", glm)];
+    setup.table_talk_style = defaultTableTalkStyle();
     tableTalkTouched.value = false;
     setup.table_talk = true;
   } else {
@@ -495,6 +546,12 @@ async function submit(): Promise<void> {
   if (!canStart.value || starting.value) return;
   const payload = deepCopy(setup);
   payload.table_talk = Boolean(payload.table_talk && canTableTalk.value);
+  payload.table_talk_style = normalizeTableTalkStyle(payload.table_talk_style);
+  for (const config of payload.seats) {
+    if (config.kind === "llm") {
+      config.table_talk_style = normalizeTableTalkStyle(config.table_talk_style);
+    }
+  }
   await startMatch(payload);
 }
 
@@ -729,6 +786,33 @@ function close(): void {
                       <AppIcon name="zap" :size="11" />
                       <span>{{ modelQuirk(currentModel(index)!) }}</span>
                     </div>
+
+                    <label
+                      v-if="canTableTalk && setup.table_talk && tableTalkStyles.length"
+                      class="table-talk-style"
+                    >
+                      <div class="mode-label">
+                        <span>{{ t("setup.tableTalkStyle") }}</span>
+                        <span class="param-hint">{{ t("setup.tableTalkStyleHint") }}</span>
+                      </div>
+                      <select
+                        class="input"
+                        :value="config.table_talk_style || defaultTableTalkStyle()"
+                        @change="setSeatTableTalkStyle(index, $event)"
+                      >
+                        <option
+                          v-for="style in tableTalkStyles"
+                          :key="style.id"
+                          :value="style.id"
+                        >
+                          {{ tableTalkStyleName(style) }}
+                        </option>
+                      </select>
+                      <p class="param-hint">{{ tableTalkStyleDescription(config.table_talk_style) }}</p>
+                      <p class="style-sample">
+                        {{ t("setup.tableTalkStyleSample", { sample: tableTalkStyleSample(config.table_talk_style) }) }}
+                      </p>
+                    </label>
 
                     <div class="test-row">
                       <button class="btn btn-sm" :disabled="!currentModel(index)!.key_present || isTesting(index)" @click="testConnection(index)">
@@ -1288,6 +1372,21 @@ function close(): void {
   line-height: 1.5;
   color: var(--faint);
   padding-top: 2px;
+}
+
+.table-talk-style {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 4px;
+}
+.table-talk-style .input { width: 100%; }
+.table-talk-style .param-hint { line-height: 1.45; }
+.style-sample {
+  margin: 0;
+  color: var(--faint);
+  font-size: calc(8.5px * var(--type-scale));
+  line-height: 1.45;
 }
 
 .test-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding-top: 2px; }

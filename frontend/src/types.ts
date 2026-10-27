@@ -108,6 +108,8 @@ export interface AgentDescribe {
   turns?: number;
   usage?: { input_tokens: number; output_tokens: number; reasoning_tokens: number };
   last_error?: string;
+  table_talk_style?: string;
+  table_talk_style_name?: string;
   agent_type?: string;
   model_path?: string | null;
   available?: boolean;
@@ -125,6 +127,9 @@ export interface SeatInfo {
   model_name: string;
   icon?: string;
   accent?: string;
+  table_talk_style?: string;
+  table_talk_style_name?: string;
+  table_talk_style_intensity?: number;
   agent: AgentDescribe;
 }
 
@@ -148,6 +153,7 @@ export interface TableTalkEntry {
   turn_id?: string;
   created_at?: number;
   kind?: "turn" | "final";
+  style?: string;
 }
 
 export interface MatchState {
@@ -159,6 +165,7 @@ export interface MatchState {
   god_view: boolean;
   table_talk?: boolean;
   table_talk_mode?: "tool" | "inline" | "off";
+  table_talk_style?: string;
   agent_locale?: "zh-CN" | "en-US";
   can_next_hand: boolean;
   started_at: number;
@@ -290,15 +297,28 @@ export interface RLCardInfo {
 }
 
 export interface GameConfig {
-  defaults: Rules & { god_view: boolean; table_talk?: boolean };
+  defaults: Rules & { god_view: boolean; table_talk?: boolean; table_talk_style?: string };
   limits: Record<string, { min: number; max: number }>;
-  llm_runtime: Record<string, number>;
+  llm_runtime: Record<string, number | string | boolean | number[]>;
+}
+
+export interface TableTalkStyleInfo {
+  id: string;
+  name: string;
+  name_en?: string;
+  description: string;
+  description_en?: string;
+  sample: string;
+  sample_en?: string;
+  intensity: number;
+  default: boolean;
 }
 
 export interface Bootstrap {
   app: { name: string; version: string; description: string };
   providers: ProviderInfo[];
   game: GameConfig;
+  table_talk_styles?: TableTalkStyleInfo[];
   rlcard: RLCardInfo;
   env: { god_view_default: boolean };
   server_time: number;
@@ -310,6 +330,7 @@ export interface SeatSetup {
   provider_id?: string;
   model_id?: string;
   params?: Record<string, unknown>;
+  table_talk_style?: string;
   bot?: { agent_type: string; model_path: string | null; delay_seconds?: number };
 }
 
@@ -317,6 +338,7 @@ export interface MatchSetupPayload {
   seats: [SeatSetup, SeatSetup];
   rules: Rules & { god_view: boolean };
   table_talk?: boolean;
+  table_talk_style?: string;
   agent_locale?: AgentLocaleChoice;
 }
 

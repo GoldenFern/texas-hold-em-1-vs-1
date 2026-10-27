@@ -229,6 +229,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "table_talk.not_text": "喊话内容必须是文本",
         "table_talk.empty": "喊话内容不能为空",
         "table_talk.too_long": "喊话不能超过 {max} 字",
+        "table_talk.style_unknown": "未知的桌边喊话风格：{style}",
 
         "bot.rlcard.unsupported_type": "不支持的 RLCard agent_type: {type}",
         "bot.rlcard.missing_warning": "未安装 rlcard，已退化为 check/call 策略",
@@ -474,6 +475,7 @@ MESSAGES: Dict[str, Dict[str, str]] = {
         "table_talk.not_text": "Table talk must be text",
         "table_talk.empty": "Table talk cannot be empty",
         "table_talk.too_long": "Table talk cannot exceed {max} characters",
+        "table_talk.style_unknown": "Unknown table-talk style: {style}",
 
         "bot.rlcard.unsupported_type": "Unsupported RLCard agent_type: {type}",
         "bot.rlcard.missing_warning": "rlcard is not installed; falling back to check/call",
