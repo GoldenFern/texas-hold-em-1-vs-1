@@ -943,7 +943,8 @@ class LLMAgent(BaseAgent):
                 and action_hint is None
                 and self.partial_retry_mode == "restart"
             ):
-                decision = budget.next_retry("incomplete_stream", retryable=True)
+                retry_kind = self._partial_retry_kind(result.incomplete_reason)
+                decision = budget.next_retry(retry_kind, retryable=True)
                 if not decision.retry:
                     return self._fallback(
                         view,
@@ -955,7 +956,7 @@ class LLMAgent(BaseAgent):
                         reason=self._t("agent.reason.incomplete"),
                         allow_check=True,
                         allow_call=False,
-                        reason_code="incomplete_stream",
+                        reason_code=retry_kind,
                         auto_kind="incomplete",
                     )
                 self._emit_retry(
@@ -963,7 +964,7 @@ class LLMAgent(BaseAgent):
                     turn_id,
                     message_id,
                     decision,
-                    "incomplete_stream",
+                    retry_kind,
                     scope="turn",
                 )
                 if not budget.wait(decision.delay, self._cancel_event.is_set):
@@ -996,6 +997,7 @@ class LLMAgent(BaseAgent):
                         usage_total,
                         budget,
                         message_id,
+                        incomplete_reason=result.incomplete_reason,
                         length_stop=length_stop,
                         length_continuations=length_continuations,
                     )
@@ -1385,6 +1387,7 @@ class LLMAgent(BaseAgent):
                     usage_total,
                     budget,
                     message_id,
+                    incomplete_reason=result.incomplete_reason,
                     length_stop=length_stop,
                     length_continuations=length_continuations,
                 )
@@ -2228,6 +2231,19 @@ class LLMAgent(BaseAgent):
             }
         )
 
+    @staticmethod
+    def _partial_retry_kind(incomplete_reason: str) -> str:
+        """Keep transport failures on their own retry budget.
+
+        A read timeout after partial output is still a timeout. Collapsing it
+        into ``incomplete_stream`` would spend the general retry allowance and
+        bypass ``max_timeout_retries``.
+        """
+        reason = str(incomplete_reason or "").strip().lower()
+        if reason in ("timeout", "transport_timeout", "network"):
+            return reason
+        return "incomplete_stream"
+
     def _resume_partial(
         self,
         view: AgentView,
@@ -2239,6 +2255,7 @@ class LLMAgent(BaseAgent):
         budget: RetryBudget,
         message_id: str,
         *,
+        incomplete_reason: str,
         length_stop: bool,
         length_continuations: int,
     ) -> ResumeOutcome:
@@ -2281,7 +2298,8 @@ class LLMAgent(BaseAgent):
                 reused_step=False,
             )
 
-        decision = budget.next_retry("incomplete_stream", retryable=True)
+        retry_kind = self._partial_retry_kind(incomplete_reason)
+        decision = budget.next_retry(retry_kind, retryable=True)
         if not decision.retry:
             action = self._fallback(
                 view,
@@ -2293,7 +2311,7 @@ class LLMAgent(BaseAgent):
                 reason=self._t("agent.reason.incomplete"),
                 allow_check=True,
                 allow_call=False,
-                reason_code="incomplete_stream",
+                reason_code=retry_kind,
                 auto_kind="incomplete",
             )
             return ResumeOutcome(
@@ -2305,7 +2323,7 @@ class LLMAgent(BaseAgent):
             turn_id,
             message_id,
             decision,
-            "incomplete_stream",
+            retry_kind,
             scope="turn",
         )
         if not budget.wait(decision.delay, self._cancel_event.is_set):
@@ -2324,12 +2342,14 @@ class LLMAgent(BaseAgent):
             reused_step=True,
         )
 
-    def _ensure_tool_replies(self) -> None:
+    def _ensure_tool_replies(self, emit, turn_id: str) -> None:
         """Answer every tool call of the latest assistant message.
 
         A turn can end from inside a batch while later calls are still
         unanswered. Leaving a dangling tool_call id breaks the message protocol
         for every following request, so fill the gaps with an explicit error.
+        The same error must also become a ``tool_result`` event, otherwise the
+        UI and transcript keep showing the skipped call as running.
         """
         start = None
         for position in range(len(self.messages) - 1, -1, -1):
@@ -2347,21 +2367,20 @@ class LLMAgent(BaseAgent):
             for message in self.messages[start + 1 :]
             if message.get("role") == "tool"
         }
-        for call in self.messages[start].get("tool_calls") or []:
+        for index, call in enumerate(self.messages[start].get("tool_calls") or []):
             call_id = str(call.get("id") or "")
             if not call_id or call_id in answered:
                 continue
             function = call.get("function") or {}
-            self.messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": str(function.get("name") or ""),
-                    "content": json.dumps(
-                        {"ok": False, "error": self._t("agent.error.tool_skipped")},
-                        ensure_ascii=False,
-                    ),
-                }
+            name = str(function.get("name") or "")
+            arguments = function.get("arguments") or "{}"
+            self._append_tool_error(
+                ToolCall(id=call_id, name=name, arguments=str(arguments)),
+                self._t("agent.error.tool_skipped"),
+                emit,
+                turn_id,
+                index,
+                ignored=True,
             )
 
     def _fallback(
@@ -2378,7 +2397,7 @@ class LLMAgent(BaseAgent):
         reason_code: str = "",
         auto_kind: str = "",
     ) -> Action:
-        self._ensure_tool_replies()
+        self._ensure_tool_replies(emit, turn_id)
         legal = set(view.legal_actions)
         if allow_check and "check" in legal:
             action = Action(view.seat, ActionType.CHECK, source="llm", auto=True)
@@ -2787,16 +2806,15 @@ class LLMAgent(BaseAgent):
                     retryable=False,
                 )
             if result.incomplete:
-                decision = budget.next_retry(
-                    "incomplete_stream", retryable=True
-                )
+                retry_kind = self._partial_retry_kind(result.incomplete_reason)
+                decision = budget.next_retry(retry_kind, retryable=True)
                 if not decision.retry:
                     return None, LLMError(
-                        "incomplete_stream",
+                        retry_kind,
                         "summary stream was interrupted",
                         retryable=False,
                     )
-                self._emit_summary_retry(emit, decision, "incomplete_stream")
+                self._emit_summary_retry(emit, decision, retry_kind)
                 if not budget.wait(decision.delay, self._cancel_event.is_set):
                     return None, LLMError(
                         "cancelled", self._t("client.cancelled"), retryable=False

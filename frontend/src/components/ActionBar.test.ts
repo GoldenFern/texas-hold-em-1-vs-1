@@ -114,6 +114,24 @@ describe("ActionBar raise type", () => {
     expect(wrapper.text()).not.toContain("需跟注");
     wrapper.unmount();
   });
+
+  it("uses the actual short-stack call and refunded pot for pot odds", () => {
+    storeMock.game.snapshot = snapshot({
+      pot: 400,
+      current_bet: 300,
+      to_call: 300,
+      call_amount: 100,
+      legal_actions: ["fold", "call"],
+      players: [
+        { seat: 0, kind: "human", chips: 100, street_bet: 0, assessment: null },
+        { seat: 1, kind: "bot", chips: 0, street_bet: 300, assessment: null },
+      ],
+    });
+    const wrapper = mount(ActionBar);
+    expect(wrapper.text()).toContain("33%");
+    expect(wrapper.text()).not.toContain("43%");
+    wrapper.unmount();
+  });
 });
 
 describe("ActionBar aborted match", () => {

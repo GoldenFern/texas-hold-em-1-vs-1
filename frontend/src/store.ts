@@ -345,6 +345,25 @@ function connectSocket(): void {
 // Snapshot
 // ---------------------------------------------------------------------
 
+function settleAbortedTurns(): void {
+  for (const seat of [0, 1]) {
+    const turn = state.currentTurns[seat];
+    if (!turn || turn.status !== "running") continue;
+    turn.status = "done";
+    turn.endedAt = turn.endedAt ?? Date.now();
+    turn.reason = t("table.matchAborted");
+    turn.retry = null;
+    for (const message of turn.messages) {
+      if (message.status === "streaming") message.status = "error";
+      for (const tool of message.tools) {
+        if (tool.status !== "running") continue;
+        tool.status = "error";
+        tool.summary = tool.summary || t("turn.toolIncomplete");
+      }
+    }
+  }
+}
+
 function applySnapshot(snapshot: GameSnapshot): void {
   const previousSnapshot = state.snapshot;
   const previousMatchId = state.matchId;
@@ -398,14 +417,7 @@ function applySnapshot(snapshot: GameSnapshot): void {
       state.fatalError = snapshot.match.error;
     }
     if (snapshot.match.aborted) {
-      for (const seat of [0, 1]) {
-        const turn = state.currentTurns[seat];
-        if (turn && turn.status === "running") {
-          turn.status = "done";
-          turn.endedAt = turn.endedAt ?? Date.now() / 1000;
-          turn.reason = t("table.matchAborted");
-        }
-      }
+      settleAbortedTurns();
     }
     state.godView = Boolean(snapshot.match.god_view);
   } else {
@@ -555,6 +567,11 @@ function applyTranscripts(payload: { match_id: string; seats: Record<string, Age
   if (eventBuffer) {
     for (const event of eventBuffer) handleAgentEvent(event, true);
   }
+  // A replay can recreate running turns and retry cards after the aborted
+  // snapshot was applied. Reconcile once more against the terminal state.
+  if (state.snapshot?.match?.aborted) {
+    settleAbortedTurns();
+  }
 }
 
 function resetTranscripts(): void {
@@ -645,6 +662,9 @@ function handleAgentEvent(event: AgentEvent, replay = false): void {
       break;
     case "match_over":
       toast("info", t("errors.matchOver"), String(event.text || ""));
+      break;
+    case "match_aborted":
+      settleAbortedTurns();
       break;
     default:
       break;
@@ -882,7 +902,7 @@ function onTurnEnd(seat: number, event: AgentEvent): void {
 
 function onRetryScheduled(seat: number, event: AgentEvent): void {
   const turn = currentTurn(seat);
-  if (!turn) return;
+  if (!turn || turn.status !== "running") return;
   const delayMs = Number(event.delay_ms ?? 0);
   const nextAt = Number(event.at ?? Date.now() + delayMs);
   const retry: RetryView = {

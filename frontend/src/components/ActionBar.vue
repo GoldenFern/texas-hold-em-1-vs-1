@@ -57,8 +57,13 @@ const toCall = computed(() => {
 });
 const callAmount = computed(() => Math.min(toCall.value, Number(humanPlayer.value?.chips || 0)));
 const potOdds = computed(() => {
-  if (toCall.value <= 0) return 0;
-  return toCall.value / (pot.value + toCall.value);
+  if (toCall.value <= 0 || callAmount.value <= 0) return 0;
+  // An all-in call can be smaller than the outstanding bet. The opponent's
+  // uncalled excess is refunded, so the break-even equity uses the effective
+  // pot and the actual chips put in, not the nominal to-call amount.
+  const effectivePot = pot.value + 2 * callAmount.value - toCall.value;
+  if (effectivePot <= 0) return 0;
+  return callAmount.value / effectivePot;
 });
 const actingName = computed(() => {
   const seat = snapshot.value?.acting_seat;

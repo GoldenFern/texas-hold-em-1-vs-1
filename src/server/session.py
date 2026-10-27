@@ -354,10 +354,21 @@ class GameSession:
     # Match lifecycle
     # ------------------------------------------------------------------
 
+    def _start_epoch_snapshot(self) -> int:
+        """Capture the abort epoch before a start request begins waiting.
+
+        Reading it after acquiring ``_start_lock`` lets a request that queued
+        before an abort observe the new epoch and start anyway.
+        """
+        with self.lock:
+            return self._start_epoch
+
     def start_match(self, payload: dict) -> dict:
+        # The epoch must be captured before waiting for the start lock. An abort
+        # while this request is queued invalidates the request.
+        start_epoch = self._start_epoch_snapshot()
         # Serialize match starts so two requests cannot race on the same state.
         with self._start_lock:
-            start_epoch = self._start_epoch
             seats = self._parse_seats(payload)
             rules = self._normalize_rules(
                 payload.get("rules") if isinstance(payload.get("rules"), dict) else {}
@@ -756,7 +767,7 @@ class GameSession:
             if len(self.table_talk) > 500:
                 del self.table_talk[:100]
             self._table_talk_turn_counts[turn_key] = used_turn + 1
-            self._emit({"type": "table_talk", **entry})
+            self._emit({"type": "table_talk", **entry}, generation=generation)
             return {
                 "ok": True,
                 "entry": entry,
@@ -820,7 +831,7 @@ class GameSession:
             if len(self.table_talk) > 500:
                 del self.table_talk[:100]
             self._final_talk_sent[seat] = True
-            self._emit({"type": "table_talk", **entry})
+            self._emit({"type": "table_talk", **entry}, generation=generation)
             return {"ok": True, "entry": entry}
 
     def _pending_table_talk(self, seat: int) -> List[dict]:
@@ -960,10 +971,10 @@ class GameSession:
                 self._next_hand_event.clear()
                 before_blinds = (self.game.small_blind, self.game.big_blind)
                 self.game.start_hand()
-                self._emit_blinds_up_locked(before_blinds)
+                self._emit_blinds_up_locked(before_blinds, generation=generation)
                 self._broadcast_state()
                 if self.game.street == Street.FINISHED:
-                    self._finish_hand_locked()
+                    self._finish_hand_locked(generation=generation)
             while self._alive(generation):
                 with self.lock:
                     if not self._alive(generation) or not self.game:
@@ -979,7 +990,8 @@ class GameSession:
                                 "type": "match_over",
                                 "match_id": self.match_id,
                                 "text": self._t("session.event.match_over"),
-                            }
+                            },
+                            generation=generation,
                         )
                         self._run_final_table_talk(generation)
                         return
@@ -988,7 +1000,13 @@ class GameSession:
                     if not self._alive(generation):
                         return
                     with self.lock:
-                        if not self.game or self.game.street != Street.FINISHED:
+                        # A new match may have replaced this one while the
+                        # thread was waiting for the next-hand event.
+                        if (
+                            not self._alive(generation)
+                            or not self.game
+                            or self.game.street != Street.FINISHED
+                        ):
                             continue
                         self._next_hand_event.clear()
                         before_blinds = (self.game.small_blind, self.game.big_blind)
@@ -1001,10 +1019,10 @@ class GameSession:
                             self.game.match_over = True
                             self._broadcast_state()
                             return
-                        self._emit_blinds_up_locked(before_blinds)
+                        self._emit_blinds_up_locked(before_blinds, generation=generation)
                         self._broadcast_state()
                         if self.game.street == Street.FINISHED:
-                            self._finish_hand_locked()
+                            self._finish_hand_locked(generation=generation)
                     continue
 
                 if actor is None:
@@ -1023,7 +1041,8 @@ class GameSession:
                         "match_id": self.match_id,
                         "kind": "server",
                         "text": self.match_error,
-                    }
+                    },
+                    generation=generation,
                 )
                 with self.lock:
                     self._broadcast_state()
@@ -1121,7 +1140,8 @@ class GameSession:
                         "text": self._t(
                             "session.event.agent_action_rejected", error=result.error
                         ),
-                    }
+                    },
+                    generation=generation,
                 )
                 fallback = self._safe_action(seat, source="system")
                 result = self.game.apply(fallback)
@@ -1131,7 +1151,7 @@ class GameSession:
                     )
             self._broadcast_state()
             if self.game.street == Street.FINISHED:
-                self._finish_hand_locked()
+                self._finish_hand_locked(generation=generation)
 
     def _wait_for_human(self, generation: int, seat: int) -> None:
         with self.lock:
@@ -1375,13 +1395,19 @@ class GameSession:
         )
 
     def _make_emit(self, generation: int, seat: int):
+        with self.lock:
+            match_id = self.match_id
+
         def emit(event: dict) -> None:
-            if not self._alive(generation):
-                return
             payload = dict(event)
-            payload["match_id"] = self.match_id
             payload["seat"] = seat
             with self.lock:
+                # Check the generation and write the transcript under the same
+                # lock. Reading self.match_id outside this block lets a stale
+                # thread append to a newly started match.
+                if not self._alive(generation) or self.match_id != match_id:
+                    return
+                payload["match_id"] = match_id
                 self.event_seq += 1
                 payload["event_id"] = self.event_seq
                 bucket = self.transcripts.setdefault(seat, [])
@@ -1392,10 +1418,12 @@ class GameSession:
 
         return emit
 
-    def _emit(self, event: dict) -> None:
+    def _emit(self, event: dict, generation: Optional[int] = None) -> None:
         payload = dict(event)
-        payload.setdefault("match_id", self.match_id)
         with self.lock:
+            if generation is not None and not self._alive(generation):
+                return
+            payload.setdefault("match_id", self.match_id)
             self.event_seq += 1
             payload.setdefault("event_id", self.event_seq)
             seat = payload.get("seat", 0)
@@ -1423,7 +1451,11 @@ class GameSession:
         with self.lock:
             self._emit_state_locked()
 
-    def _emit_blinds_up_locked(self, before: tuple[int, int]) -> None:
+    def _emit_blinds_up_locked(
+        self,
+        before: tuple[int, int],
+        generation: Optional[int] = None,
+    ) -> None:
         """Announce a blind increase after a hand starts."""
         if not self.game:
             return
@@ -1437,10 +1469,11 @@ class GameSession:
                 "text": self._t(
                     "session.event.blinds_up", small=after[0], big=after[1]
                 ),
-            }
+            },
+            generation=generation,
         )
 
-    def _finish_hand_locked(self) -> None:
+    def _finish_hand_locked(self, generation: Optional[int] = None) -> None:
         if not self.game or not self.game.result:
             return
         if self._last_result_hand_id == self.game.hand_id:
@@ -1466,7 +1499,8 @@ class GameSession:
                 "hand_id": self.game.hand_id,
                 "result": result,
                 "match_over": self.game.match_over,
-            }
+            },
+            generation=generation,
         )
         self._broadcast_state()
 

@@ -18,7 +18,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Sequence
 
-_AGGRESSIVE = {"bet", "raise", "all_in"}
 _VOLUNTARY = {"call", "bet", "raise", "all_in"}
 _SCOPES = ("current_match", "completed_matches", "both")
 _FOCUS_GROUPS = ("all", "preflop", "postflop", "showdown", "result", "table_talk")
@@ -77,12 +76,39 @@ def _position(record: Mapping, seat: int) -> str:
     return "button" if record.get("button") == _seat_index(seat) else "bb"
 
 
-def _is_aggressive(action: Mapping) -> bool:
-    return str(action.get("type") or "") in _AGGRESSIVE
-
-
 def _is_voluntary(action: Mapping) -> bool:
     return str(action.get("type") or "") in _VOLUNTARY
+
+
+def _annotate_actions(actions: Iterable[Mapping]) -> list[dict]:
+    """Copy actions with the street betting state before each decision.
+
+    ``all_in`` can be either a raise or a call. The public record stores the
+    raise-to total for an all-in raise and the chips added for an all-in call,
+    so comparing it with the current bet separates the two. ``raise_level``
+    counts actual raises on this street and keeps 4-bets out of 3-bet stats.
+    """
+    current_bet = 0
+    raise_level = 0
+    annotated: list[dict] = []
+    for action in actions:
+        action_type = str(action.get("type") or "")
+        amount = max(0, int(action.get("amount", 0) or 0))
+        if action_type in ("bet", "raise"):
+            aggressive = True
+        elif action_type == "all_in":
+            aggressive = amount > current_bet
+        else:
+            aggressive = False
+        item = dict(action)
+        item["_aggressive"] = aggressive
+        item["_current_bet_before"] = current_bet
+        item["_raise_level_before"] = raise_level
+        annotated.append(item)
+        if aggressive:
+            current_bet = max(current_bet, amount)
+            raise_level += 1
+    return annotated
 
 
 def _actions_for(record: Mapping, seat: int, street: Optional[str] = None) -> list[dict]:
@@ -132,8 +158,8 @@ def _saw_flop(record: Mapping, seat: int) -> bool:
 
 def _preflop_aggressor(record: Mapping) -> Optional[int]:
     aggressor: Optional[int] = None
-    for action in _all_actions(record, "preflop"):
-        if _is_aggressive(action):
+    for action in _annotate_actions(_all_actions(record, "preflop")):
+        if action["_aggressive"]:
             aggressor = action.get("seat")
     return aggressor
 
@@ -155,27 +181,27 @@ def _compute_one(record: Mapping, seat: int) -> dict:
     _increment(counters, "pot_total", int(record.get("pot", 0) or 0))
     counters["bb_net"] = float(counters["bb_net"]) + net / big_blind
 
-    preflop = _all_actions(record, "preflop")
-    seat_preflop = _actions_for(record, seat, "preflop")
+    preflop = _annotate_actions(_all_actions(record, "preflop"))
+    seat_preflop = [action for action in preflop if action.get("seat") == seat]
     if any(_is_voluntary(action) for action in seat_preflop):
         _increment(counters, "vpip")
-    if any(_is_aggressive(action) for action in seat_preflop):
+    if any(action["_aggressive"] for action in seat_preflop):
         _increment(counters, "pfr")
 
     position = _position(record, seat)
     if position == "button":
         _increment(counters, "steal_opps")
-        if any(_is_aggressive(action) for action in seat_preflop):
+        if any(action["_aggressive"] for action in seat_preflop):
             _increment(counters, "steals")
         if (
-            not any(_is_aggressive(action) for action in seat_preflop)
+            not any(action["_aggressive"] for action in seat_preflop)
             and any(str(action.get("type") or "") == "call" for action in seat_preflop)
         ):
             _increment(counters, "limps")
 
     if position == "bb":
         button_raised = any(
-            action.get("seat") == record.get("button") and _is_aggressive(action)
+            action.get("seat") == record.get("button") and action["_aggressive"]
             for action in preflop
         )
         if button_raised:
@@ -183,27 +209,25 @@ def _compute_one(record: Mapping, seat: int) -> dict:
             if any(str(action.get("type") or "") == "fold" for action in seat_preflop):
                 _increment(counters, "fold_to_steals")
 
-    raises_so_far = 0
-    faced_raise = False
+    three_bet_opp = False
     faced_three_bet = False
     three_bet_made = False
     folded_to_three_bet = False
     for action in preflop:
-        is_seat = action.get("seat") == seat
+        if action.get("seat") != seat:
+            continue
         action_type = str(action.get("type") or "")
-        if is_seat:
-            if raises_so_far >= 1:
-                faced_raise = True
-            if raises_so_far >= 2:
-                faced_three_bet = True
-                if action_type == "fold":
-                    folded_to_three_bet = True
-            if raises_so_far >= 1 and _is_aggressive(action):
+        raise_level = int(action.get("_raise_level_before", 0) or 0)
+        if raise_level == 1:
+            three_bet_opp = True
+            if action["_aggressive"]:
                 three_bet_made = True
-        if _is_aggressive(action):
-            raises_so_far += 1
+        if raise_level == 2:
+            faced_three_bet = True
+            if action_type == "fold":
+                folded_to_three_bet = True
 
-    if faced_raise:
+    if three_bet_opp:
         _increment(counters, "three_bet_opps")
     if three_bet_made:
         _increment(counters, "three_bets")
@@ -217,29 +241,29 @@ def _compute_one(record: Mapping, seat: int) -> dict:
         _increment(counters, "saw_flop")
 
     aggressor = _preflop_aggressor(record)
-    flop = _all_actions(record, "flop")
+    flop = _annotate_actions(_all_actions(record, "flop"))
     if saw_flop and aggressor == seat:
         seat_flop = [action for action in flop if action.get("seat") == seat]
         opponent_bet_first = False
         for action in flop:
             if action.get("seat") == seat:
                 break
-            if _is_aggressive(action):
+            if action["_aggressive"]:
                 opponent_bet_first = True
                 break
         if seat_flop and not opponent_bet_first:
             _increment(counters, "c_bet_opps")
-            if _is_aggressive(seat_flop[0]):
+            if seat_flop[0]["_aggressive"]:
                 _increment(counters, "c_bets")
 
     if saw_flop and aggressor is not None and aggressor != seat:
         cbet_index: Optional[int] = None
         for index, action in enumerate(flop):
-            if action.get("seat") == aggressor and _is_aggressive(action):
+            if action.get("seat") == aggressor and action["_aggressive"]:
                 cbet_index = index
                 break
         if cbet_index is not None:
-            prior_bets = any(_is_aggressive(action) for action in flop[:cbet_index])
+            prior_bets = any(action["_aggressive"] for action in flop[:cbet_index])
             if not prior_bets:
                 response = next(
                     (
@@ -256,7 +280,10 @@ def _compute_one(record: Mapping, seat: int) -> dict:
 
     for street in ("flop", "turn", "river"):
         checked = False
-        for action in _actions_for(record, seat, street):
+        street_actions = _annotate_actions(_all_actions(record, street))
+        for action in (
+            item for item in street_actions if item.get("seat") == seat
+        ):
             action_type = str(action.get("type") or "")
             if action_type == "check":
                 checked = True
@@ -269,11 +296,14 @@ def _compute_one(record: Mapping, seat: int) -> dict:
                     _increment(counters, "check_raises")
                     checked = False
             elif action_type == "all_in":
-                _increment(counters, "postflop_raises")
                 _increment(counters, "all_ins")
-                if checked:
-                    _increment(counters, "check_raises")
-                    checked = False
+                if action["_aggressive"]:
+                    _increment(counters, "postflop_raises")
+                    if checked:
+                        _increment(counters, "check_raises")
+                        checked = False
+                else:
+                    _increment(counters, "postflop_calls")
             elif action_type == "call":
                 _increment(counters, "postflop_calls")
             elif action_type == "fold":
@@ -523,19 +553,37 @@ def _empty_report(seat: int, opponent_identity: str) -> dict:
     }
 
 
-def _match_sides(match: Mapping, hero_identity: str, opponent_identity: str) -> Optional[tuple[int, int]]:
-    """Return the historical seats for the hero and the opponent."""
+def _match_sides(
+    match: Mapping,
+    hero_identity: str,
+    opponent_identity: str,
+    *,
+    require_opponent: bool = True,
+) -> Optional[tuple[int, int]]:
+    """Return the historical seats for the hero and the opponent.
+
+    ``overall`` aggregates only matches that contain this hero and must not be
+    filtered by the current opponent. ``vs_current_opponent`` requires both
+    identities. Never fall back to ``(0, 1)`` when an identity was supplied:
+    that silently counts a different player as the hero.
+    """
     identities = list(match.get("identities") or [])
     if len(identities) != 2:
         return None
-    if hero_identity and opponent_identity:
+    if hero_identity:
         for seat in (0, 1):
-            if identities[seat] == hero_identity and identities[1 - seat] == opponent_identity:
-                return seat, 1 - seat
+            if identities[seat] != hero_identity:
+                continue
+            other = 1 - seat
+            if require_opponent and opponent_identity and identities[other] != opponent_identity:
+                return None
+            return seat, other
+        return None
     if opponent_identity:
         for seat in (0, 1):
             if identities[1 - seat] == opponent_identity:
                 return seat, 1 - seat
+        return None
     return 0, 1
 
 
@@ -544,13 +592,20 @@ def _completed_block(
     hero_identity: str,
     opponent_identity: str,
     focus: str,
+    *,
+    require_opponent: bool = True,
 ) -> dict:
     hero_counters: list[Mapping] = []
     opponent_counters: list[Mapping] = []
     recent: list[dict] = []
     hands = 0
     for match in matches:
-        sides = _match_sides(match, hero_identity, opponent_identity)
+        sides = _match_sides(
+            match,
+            hero_identity,
+            opponent_identity,
+            require_opponent=require_opponent,
+        )
         if sides is None:
             continue
         hero_seat, opponent_seat = sides
@@ -731,7 +786,11 @@ def build_history_report(
             vs_matches, hero_identity, opponent_identity, focus
         )
         report["completed_matches"]["overall"] = _completed_block(
-            completed_matches, hero_identity, opponent_identity, focus
+            completed_matches,
+            hero_identity,
+            opponent_identity,
+            focus,
+            require_opponent=False,
         )
         report["completed_matches"]["overall"]["opponents"] = "mixed"
 

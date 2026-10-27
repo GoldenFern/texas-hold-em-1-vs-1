@@ -292,6 +292,47 @@ def estimate_hand_cost(
     )
 
 
+def usage_fields(agent: Optional[object], args: argparse.Namespace) -> dict:
+    """Return billable usage for one hand attempt.
+
+    Usage is kept even when the hand fails: the tokens were already spent and
+    must count toward the experiment budget.
+    """
+    usage = getattr(agent, "total_usage", {}) if agent is not None else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    input_tokens = max(0, int(usage.get("input_tokens", 0) or 0))
+    output_tokens = max(0, int(usage.get("output_tokens", 0) or 0))
+    cached_tokens = min(
+        input_tokens,
+        max(0, int(usage.get("cached_input_tokens", 0) or 0)),
+    )
+    cache_miss_tokens = max(
+        0,
+        int(
+            usage.get("cache_miss_input_tokens")
+            or max(0, input_tokens - cached_tokens)
+        ),
+    )
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_tokens,
+        "cache_miss_input_tokens": cache_miss_tokens,
+        "cache_hit_rate": round(cache_hit_rate(input_tokens, cached_tokens), 4),
+        "output_tokens": output_tokens,
+        "reasoning_tokens": max(0, int(usage.get("reasoning_tokens", 0) or 0)),
+        "est_cost_cny": round(
+            estimate_hand_cost(
+                input_tokens,
+                output_tokens,
+                args,
+                cached_tokens=cached_tokens,
+            ),
+            6,
+        ),
+    }
+
+
 class RetryingClient:
     """Compatibility wrapper; ``LLMClient`` owns the retry budget."""
 
@@ -655,6 +696,14 @@ def load_runtime(args: argparse.Namespace) -> dict:
             for item in str(args.summary_retries).split(",")
             if item.strip()
         ]
+    # The agent creates the shared RetryBudget for the whole turn, so the
+    # client-side policy alone cannot honor these command-line flags.
+    runtime["max_retries"] = int(args.llm_retries)
+    runtime["retry_base_delay_ms"] = float(args.retry_backoff) * 1000.0
+    runtime["retry_max_delay_ms"] = max(
+        float(runtime["retry_base_delay_ms"]),
+        10000.0,
+    )
     return runtime
 
 
@@ -887,6 +936,7 @@ def play_hand(
     events: List[dict] = []
     game: Optional[HeadsUpGame] = None
     client: Optional[RetryingClient] = None
+    llm: Optional[LLMAgent] = None
 
     def emit(event: dict) -> None:
         event = dict(event)
@@ -1085,19 +1135,19 @@ def play_hand(
             "random_calls": 0,
             "call_ev_calls": 0,
             "call_ev_not_applicable": 0,
-            "api_calls": 0,
-            "input_tokens": 0,
-            "cached_input_tokens": 0,
-            "cache_miss_input_tokens": 0,
-            "cache_hit_rate": 0.0,
-            "output_tokens": 0,
-            "reasoning_tokens": 0,
-            "est_cost_cny": 0.0,
+            "api_calls": sum(
+                1 for event in events if event.get("type") == "llm_request"
+            ),
+            **usage_fields(llm, args),
             "auto_turns": 0,
             "invalid_action_auto": 0,
             "api_error_auto": 0,
-            "retry_attempts": 0,
-            "api_errors": 0,
+            "retry_attempts": sum(
+                1 for event in events if event.get("type") == "retry_scheduled"
+            ),
+            "api_errors": sum(
+                1 for event in events if event.get("type") == "error"
+            ),
             "infra_error": 0,
             "fatal_error": f"{type(exc).__name__}: {exc}",
             "duration_sec": round(time.perf_counter() - started, 3),
@@ -1121,18 +1171,62 @@ def run_task(
     runtime: dict,
     args: argparse.Namespace,
 ) -> dict:
-    """Run one hand, retrying API/fatal failures when requested."""
+    """Run one hand, retrying API/fatal failures when requested.
+
+    Retries replace the hand result but not the money already spent. Keep a
+    per-attempt usage ledger and expose the sum on the final row so budget
+    checks and reports include failed attempts.
+    """
     row: dict = {}
+    attempt_rows: List[dict] = []
+    usage_keys = (
+        "input_tokens",
+        "cached_input_tokens",
+        "cache_miss_input_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "est_cost_cny",
+        "api_calls",
+        "retry_attempts",
+    )
     for attempt in range(args.retries + 1):
         row = play_hand(task, spec, registry, runtime, args)
-        row["attempts"] = attempt + 1
         retryable = bool(row.get("fatal_error")) or bool(row.get("infra_error"))
         if getattr(args, "retry_api_errors", False) and int(row.get("api_errors", 0)) > 0:
             retryable = True
+        attempt_rows.append(
+            {
+                "attempt": attempt + 1,
+                "fatal_error": str(row.get("fatal_error") or ""),
+                "api_errors": int(row.get("api_errors", 0) or 0),
+                **{key: row.get(key, 0) for key in usage_keys},
+            }
+        )
         if not retryable:
             break
         if attempt < args.retries:
             time.sleep(1.5 + attempt)
+
+    row["attempts"] = len(attempt_rows)
+    row["attempt_rows"] = attempt_rows
+    for key in usage_keys:
+        if key in ("est_cost_cny",):
+            row[key] = round(
+                sum(float(item.get(key, 0.0) or 0.0) for item in attempt_rows),
+                6,
+            )
+        else:
+            row[key] = sum(int(item.get(key, 0) or 0) for item in attempt_rows)
+    row["cache_hit_rate"] = round(
+        cache_hit_rate(
+            int(row.get("input_tokens", 0) or 0),
+            int(row.get("cached_input_tokens", 0) or 0),
+        ),
+        4,
+    )
+    row["attempt_api_errors"] = sum(
+        int(item.get("api_errors", 0) or 0) for item in attempt_rows
+    )
     return row
 
 
@@ -1143,6 +1237,24 @@ def _pct(counter: Counter, key: str, total: int) -> float:
 def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
     valid = [row for row in rows if not row.get("fatal_error")]
     failed = [row for row in rows if row.get("fatal_error")]
+    # Failed hands still spend tokens. Keep billing totals over every row, and
+    # use ``valid`` only for poker-performance statistics.
+    total_input_tokens = sum(int(row.get("input_tokens", 0)) for row in rows)
+    total_output_tokens = sum(int(row.get("output_tokens", 0)) for row in rows)
+    total_cached_input_tokens = sum(
+        int(row.get("cached_input_tokens", 0)) for row in rows
+    )
+    total_cache_miss_input_tokens = sum(
+        int(row.get("cache_miss_input_tokens", 0)) for row in rows
+    )
+    if total_input_tokens > 0 and not (
+        total_cached_input_tokens or total_cache_miss_input_tokens
+    ):
+        total_cache_miss_input_tokens = total_input_tokens
+    billable_cost = round(
+        sum(float(row.get("est_cost_cny", 0.0) or 0.0) for row in rows),
+        6,
+    )
     if not valid:
         return {
             "hands": 0,
@@ -1156,13 +1268,22 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
             "opponent_name": OPPONENT_LABELS.get(
                 getattr(args, "opponent_kind", "project"), "Opponent"
             ),
-            "input_tokens": 0,
-            "total_cached_input_tokens": 0,
-            "total_cache_miss_input_tokens": 0,
-            "cache_hit_rate": 0.0,
+            "input_tokens": total_input_tokens,
+            "total_cached_input_tokens": total_cached_input_tokens,
+            "total_cache_miss_input_tokens": total_cache_miss_input_tokens,
+            "cache_hit_rate": round(
+                cache_hit_rate(total_input_tokens, total_cached_input_tokens), 4
+            ),
             "cache_hit_rate_mean": 0.0,
-            "output_tokens": 0,
-            "est_cost_cny": 0.0,
+            "output_tokens": total_output_tokens,
+            "reasoning_tokens": sum(
+                int(row.get("reasoning_tokens", 0)) for row in rows
+            ),
+            "est_cost_cny": billable_cost,
+            "api_calls": sum(int(row.get("api_calls", 0)) for row in rows),
+            "retry_attempts": sum(
+                int(row.get("retry_attempts", 0)) for row in rows
+            ),
             "error": "all hands failed",
         }
 
@@ -1215,12 +1336,14 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
     bot_total_actions = sum(bot_counter.values())
     total_pot = sum(int(row["pot"]) for row in valid)
     total_net = sum(nets)
-    api_errors = sum(int(row.get("api_errors", 0)) for row in valid)
+    api_errors = sum(
+        int(row.get("attempt_api_errors", row.get("api_errors", 0))) for row in rows
+    )
     auto_turns = sum(int(row.get("auto_turns", 0)) for row in valid)
     invalid_auto = sum(int(row.get("invalid_action_auto", 0)) for row in valid)
     api_error_auto = sum(int(row.get("api_error_auto", 0)) for row in valid)
     llm_turns = sum(int(row.get("llm_turns", 0)) for row in valid)
-    retry_attempts = sum(int(row.get("retry_attempts", 0)) for row in valid)
+    retry_attempts = sum(int(row.get("retry_attempts", 0)) for row in rows)
     aux_tool_calls = sum(int(row.get("aux_tool_calls", 0)) for row in valid)
     tool_turns = sum(int(row.get("tool_turns", 0)) for row in valid)
     aux_tool_errors = sum(int(row.get("aux_tool_errors", 0)) for row in valid)
@@ -1231,19 +1354,6 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
     call_ev_not_applicable = sum(
         int(row.get("call_ev_not_applicable", 0)) for row in valid
     )
-    total_input_tokens = sum(int(row.get("input_tokens", 0)) for row in valid)
-    total_output_tokens = sum(int(row.get("output_tokens", 0)) for row in valid)
-    total_cached_input_tokens = sum(
-        int(row.get("cached_input_tokens", 0)) for row in valid
-    )
-    total_cache_miss_input_tokens = sum(
-        int(row.get("cache_miss_input_tokens", 0)) for row in valid
-    )
-    if total_input_tokens > 0 and not (
-        total_cached_input_tokens or total_cache_miss_input_tokens
-    ):
-        # Rows produced before cache accounting existed: treat all input as miss.
-        total_cache_miss_input_tokens = total_input_tokens
     hand_cache_hit_rates = [
         cache_hit_rate(
             int(row.get("input_tokens", 0)),
@@ -1327,7 +1437,7 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
         "call_ev_calls": call_ev_calls,
         "call_ev_not_applicable": call_ev_not_applicable,
         "call_ev_applicable_calls": call_ev_calls - call_ev_not_applicable,
-        "api_calls": sum(int(row.get("api_calls", 0)) for row in valid),
+        "api_calls": sum(int(row.get("api_calls", 0)) for row in rows),
         "input_tokens": total_input_tokens,
         "total_cached_input_tokens": total_cached_input_tokens,
         "total_cache_miss_input_tokens": total_cache_miss_input_tokens,
@@ -1340,20 +1450,20 @@ def summarize(rows: Sequence[dict], args: argparse.Namespace) -> dict:
         if hand_cache_hit_rates
         else 0.0,
         "output_tokens": total_output_tokens,
-        "reasoning_tokens": sum(int(row.get("reasoning_tokens", 0)) for row in valid),
-        "est_cost_cny": round(
-            sum(float(row.get("est_cost_cny", 0.0)) for row in valid), 6
-        ),
+        "reasoning_tokens": sum(int(row.get("reasoning_tokens", 0)) for row in rows),
+        "est_cost_cny": billable_cost,
         "opponent_kind": getattr(args, "opponent_kind", "project"),
         "opponent_name": OPPONENT_LABELS.get(
             getattr(args, "opponent_kind", "project"), "Opponent"
         ),
         "api_errors": api_errors,
         "hands_with_api_error": sum(
-            1 for row in valid if int(row.get("api_errors", 0)) > 0
+            1
+            for row in rows
+            if int(row.get("attempt_api_errors", row.get("api_errors", 0))) > 0
         ),
         "hands_with_retry": sum(
-            1 for row in valid if int(row.get("attempts", 1)) > 1
+            1 for row in rows if int(row.get("attempts", 1)) > 1
         ),
         "auto_turns": auto_turns,
         "invalid_action_auto": invalid_auto,

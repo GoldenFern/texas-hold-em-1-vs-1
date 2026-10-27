@@ -25,6 +25,7 @@ def test_short_stack_refund_is_removed() -> None:
     assert result.effective_pot == 300
     assert result.ev_call == pytest.approx(200.0)
     assert result.breakeven_equity == pytest.approx(1.0 / 3.0)
+    assert result.pot_to_call_ratio == pytest.approx(2.0)
     assert result.static_positive is True
 
 

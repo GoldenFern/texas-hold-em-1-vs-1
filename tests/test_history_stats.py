@@ -163,6 +163,78 @@ def test_preflop_counters_and_sample_sizes() -> None:
     assert villain["preflop"]["fold_to_steal"]["n"] == 2
 
 
+def test_all_in_call_is_not_counted_as_aggressive() -> None:
+    records = [
+        hand(
+            1,
+            0,
+            [
+                action(0, "preflop", "all_in", 1000),
+                action(1, "preflop", "all_in", 1000),
+            ],
+            reason="showdown",
+            winner=0,
+        )
+    ]
+    sb = finalize_counters(compute_counters(records, 0))
+    bb = finalize_counters(compute_counters(records, 1))
+
+    assert sb["preflop"]["pfr"]["value"] == 1.0
+    assert bb["preflop"]["pfr"]["value"] == 0.0
+    assert bb["preflop"]["three_bet"]["value"] == 0.0
+
+
+def test_postflop_all_in_call_is_not_counted_as_raise() -> None:
+    records = [
+        hand(
+            1,
+            0,
+            [
+                action(0, "preflop", "raise", 30),
+                action(1, "preflop", "call", 30),
+                action(1, "flop", "all_in", 500),
+                action(0, "flop", "all_in", 500),
+            ],
+            board=["Qh", "Jh", "2c"],
+            reason="showdown",
+            winner=0,
+        )
+    ]
+    hero = finalize_counters(compute_counters(records, 0))
+    villain = finalize_counters(compute_counters(records, 1))
+
+    assert hero["postflop"]["raises"] == 0
+    assert hero["postflop"]["calls"] == 1
+    assert hero["result"]["all_ins"] == 1
+    assert villain["postflop"]["raises"] == 1
+    assert villain["postflop"]["calls"] == 0
+
+
+def test_four_bet_does_not_pollute_three_bet_metrics() -> None:
+    records = [
+        hand(
+            1,
+            0,
+            [
+                action(0, "preflop", "raise", 30),
+                action(1, "preflop", "raise", 90),
+                action(0, "preflop", "raise", 270),
+                action(1, "preflop", "fold"),
+            ],
+            reason="fold",
+            winner=0,
+        )
+    ]
+    sb = finalize_counters(compute_counters(records, 0))
+    bb = finalize_counters(compute_counters(records, 1))
+
+    # The small blind made a 4-bet, not a 3-bet.
+    assert sb["preflop"]["three_bet"]["value"] is None
+    # The big blind made the only 3-bet and folded to a 4-bet.
+    assert bb["preflop"]["three_bet"]["value"] == 1.0
+    assert bb["preflop"]["fold_to_three_bet"]["value"] is None
+
+
 def test_postflop_c_bet_and_fold_to_c_bet() -> None:
     records = four_hands()
     hero = finalize_counters(compute_counters(records, 0))
@@ -295,6 +367,57 @@ def test_history_report_merges_completed_matches_and_filters_opponent() -> None:
     )
     assert other["completed_matches"]["vs_current_opponent"]["matches"] == 0
     assert other["completed_matches"]["overall"]["matches"] == 1
+
+
+def test_overall_history_uses_hero_identity_not_current_opponent() -> None:
+    records = [
+        hand(
+            1,
+            0,
+            [
+                action(0, "preflop", "raise", 30),
+                action(1, "preflop", "fold"),
+            ],
+            reason="fold",
+            winner=0,
+        )
+    ]
+    match = build_match_record(
+        "match-1",
+        records,
+        ["llm:other", "llm:hero"],
+        rules={"big_blind": 10},
+    )
+
+    report = build_history_report(
+        [],
+        [match],
+        0,
+        scope="completed_matches",
+        hero_identity="llm:hero",
+        opponent_identity="llm:villain",
+    )
+    overall = report["completed_matches"]["overall"]
+    assert overall["matches"] == 1
+    # Hero was seat 1 and never acted voluntarily. The old fallback mapped
+    # seat 0 to "you" and reported a 100% VPIP.
+    assert overall["you"]["preflop"]["vpip"]["value"] == 0.0
+
+    unrelated = build_match_record(
+        "match-2",
+        records,
+        ["llm:other", "llm:third"],
+        rules={"big_blind": 10},
+    )
+    skipped = build_history_report(
+        [],
+        [unrelated],
+        0,
+        scope="completed_matches",
+        hero_identity="llm:hero",
+        opponent_identity="llm:villain",
+    )
+    assert skipped["completed_matches"]["overall"]["matches"] == 0
 
 
 def test_checkpoint_snapshot_is_compact_and_does_not_leak_cards() -> None:

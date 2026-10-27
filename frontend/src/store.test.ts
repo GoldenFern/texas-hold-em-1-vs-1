@@ -188,6 +188,55 @@ describe("transcript resync", () => {  it("replays live events that arrive while
   });
 });
 
+describe("aborted transcript replay", () => {
+  it("settles running turns and tools after replaying an aborted match", async () => {
+    socketMock.handlers.state?.(snapshot({
+      seq: 5,
+      match: {
+        ...snapshot().match,
+        aborted: true,
+        match_over: true,
+      },
+    }));
+    mockedApi.transcripts.mockResolvedValueOnce({
+      match_id: "m1",
+      seats: {
+        "0": [
+          turnEvent(100, "aborted-turn"),
+          {
+            ...turnEvent(101, "aborted-turn"),
+            type: "retry_scheduled",
+            scope: "turn",
+            attempt: 2,
+            max_retries: 10,
+            delay_ms: 4000,
+            at: Date.now() + 4000,
+            text: "retry",
+          },
+          {
+            ...turnEvent(102, "aborted-turn"),
+            type: "tool_call_start",
+            message_id: "msg-1",
+            index: 0,
+            call_id: "call-1",
+            name: "apply_action",
+          },
+        ],
+      },
+    });
+
+    await refreshTranscripts();
+
+    const turn = (game.turns[0] || []).find(
+      (item) => item.id === "aborted-turn",
+    ) as any;
+    expect(turn?.status).toBe("done");
+    expect(turn?.retry).toBeNull();
+    expect(turn?.messages[0]?.status).toBe("error");
+    expect(turn?.messages[0]?.tools[0]?.status).toBe("error");
+  });
+});
+
 describe("hand result", () => {
   it("keeps the result available for the table without an overlay", () => {
     const boardCodes = ["2c", "7d", "Th", "Jh", "As"];

@@ -331,6 +331,13 @@ def main() -> int:
         raise SystemExit(f"missing API key: {spec.api_key_env}")
 
     app, socketio_server, session = create_app()
+    session._game_config.setdefault("llm_runtime", {}).update(
+        {
+            "max_retries": int(args.llm_retries),
+            "retry_base_delay_ms": float(args.retry_backoff) * 1000.0,
+            "retry_max_delay_ms": 10000.0,
+        }
+    )
     base_client = LLMClient(
         registry,
         connect_timeout=args.connect_timeout,

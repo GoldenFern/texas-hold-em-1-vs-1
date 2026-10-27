@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 import time
@@ -161,6 +162,71 @@ def test_abort_during_start_cancels_pending_start() -> None:
         with pytest.raises(ValueError):
             session.start_match(human_vs_random())
         assert session.game is None
+    finally:
+        session.shutdown()
+
+
+def test_abort_cancels_start_queued_before_lock() -> None:
+    session = make_session()
+    captured = threading.Event()
+    original_snapshot = session._start_epoch_snapshot
+    result: dict = {}
+
+    def snapshot() -> int:
+        value = original_snapshot()
+        captured.set()
+        return value
+
+    session._start_epoch_snapshot = snapshot  # type: ignore[method-assign]
+    session._start_lock.acquire()
+    try:
+        def run() -> None:
+            try:
+                session.start_match(fast_human_vs_random())
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        assert captured.wait(2.0)
+        session.abort_match()
+    finally:
+        session._start_lock.release()
+    thread.join(3.0)
+    try:
+        assert not thread.is_alive()
+        assert isinstance(result.get("error"), ValueError)
+        assert session.game is None
+    finally:
+        session.shutdown()
+
+
+def test_make_emit_drops_events_after_match_change() -> None:
+    session = make_session()
+    session.match_id = "old-match"
+    session._generation = 0
+    session._stop_event.clear()
+    emit = session._make_emit(0, 0)
+    try:
+        session.match_id = "new-match"
+        session.transcripts = {0: [], 1: []}
+        session.event_seq = 0
+        emit({"type": "note", "text": "stale"})
+        assert session.transcripts[0] == []
+        assert session.socketio.events == []
+    finally:
+        session.shutdown()
+
+
+def test_emit_generation_guard_drops_stale_event() -> None:
+    session = make_session()
+    session.match_id = "current"
+    session._generation = 1
+    session._stop_event.clear()
+    try:
+        session._emit({"type": "note", "text": "stale"}, generation=0)
+        assert session.transcripts[0] == []
+        assert session.socketio.events == []
     finally:
         session.shutdown()
 

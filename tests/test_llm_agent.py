@@ -2052,6 +2052,62 @@ def test_incomplete_with_valid_action_is_executed_once() -> None:
     assert not [event for event in events if event["type"] == "retry_scheduled"]
 
 
+def test_partial_timeout_uses_timeout_budget() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Partial after output",
+                "incomplete": True,
+                "incomplete_reason": "timeout",
+            },
+            {
+                "content": "Still timing out",
+                "incomplete": True,
+                "incomplete_reason": "timeout",
+            },
+        ],
+        runtime={"max_retries": 5, "max_timeout_retries": 1},
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is True
+    assert agent.client.calls == 2
+    retries = [event for event in events if event["type"] == "retry_scheduled"]
+    assert len(retries) == 1
+    assert retries[0]["error_kind"] == "timeout"
+
+
+def test_partial_timeout_restart_uses_timeout_budget() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "content": "Discard after timeout",
+                "incomplete": True,
+                "incomplete_reason": "timeout",
+            },
+            {
+                "content": "Still timing out",
+                "incomplete": True,
+                "incomplete_reason": "timeout",
+            },
+        ],
+        runtime={
+            "max_retries": 5,
+            "max_timeout_retries": 1,
+            "partial_retry_mode": "restart",
+        },
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert action.auto is True
+    assert agent.client.calls == 2
+    retries = [event for event in events if event["type"] == "retry_scheduled"]
+    assert len(retries) == 1
+    assert retries[0]["error_kind"] == "timeout"
+
+
 def test_incomplete_restart_discards_partial_message() -> None:
     agent, events = build_agent(
         [
@@ -2233,6 +2289,47 @@ def test_truncated_action_arguments_are_not_executed() -> None:
     assert errors
 
 
+def test_fallback_emits_tool_result_for_skipped_calls() -> None:
+    agent, events = build_agent(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "bad-action",
+                        "name": "apply_action",
+                        "arguments": '{"action":"bet","amount":5}',
+                    },
+                    {
+                        "id": "skipped-estimate",
+                        "name": "estimate_equity",
+                        "arguments": "{}",
+                    },
+                ]
+            }
+        ],
+        failures=1,
+    )
+    action = agent.decide(make_view(), events.append)
+
+    assert action.type == ActionType.FOLD
+    assert action.auto is True
+    results = {
+        event["call_id"]: event
+        for event in events
+        if event.get("type") == "tool_result"
+    }
+    assert results["bad-action"]["ok"] is False
+    assert results["skipped-estimate"]["ok"] is False
+    assert results["skipped-estimate"]["ignored"] is True
+    assert results["skipped-estimate"]["summary"]
+    answered = {
+        message.get("tool_call_id")
+        for message in agent.messages
+        if message.get("role") == "tool"
+    }
+    assert {"bad-action", "skipped-estimate"} <= answered
+
+
 def test_checkpoint_summary_retries_incomplete_draft() -> None:
     agent, client, events = make_checkpoint_agent(
         [
@@ -2260,6 +2357,33 @@ def test_checkpoint_summary_retries_incomplete_draft() -> None:
     retries = [event for event in events if event["type"] == "retry_scheduled"]
     assert retries and retries[0]["scope"] == "summary"
     assert retries[0]["attempt"] == 2
+
+
+def test_checkpoint_summary_timeout_uses_timeout_budget() -> None:
+    agent, client, events = make_checkpoint_agent(
+        [
+            {
+                "content": "Partial checkpoint draft",
+                "incomplete": True,
+                "incomplete_reason": "timeout",
+            },
+            {
+                "tool_calls": [
+                    {"name": "apply_action", "arguments": '{"action":"check"}'}
+                ]
+            },
+        ],
+        runtime_extra={"max_timeout_retries": 0},
+    )
+    action = agent.decide(checkpoint_view(), events.append)
+
+    assert action.type == ActionType.CHECK
+    assert agent._summary_calls == 1
+    assert len(client.requests) == 2
+    failed = next(
+        event for event in events if event.get("type") == "context_summary_failed"
+    )
+    assert failed["kind"] == "timeout"
 
 
 def test_checkpoint_summary_rejects_length_without_retry() -> None:

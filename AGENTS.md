@@ -329,6 +329,17 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - 模型文件是 torch pickle，只加载可信来源。
 - 桌边喊话是模型生成文本，前端只用文本插值渲染，不使用 `v-html`。系统不做真伪核查，也不承诺防止语义或字面泄漏；它只限制长度、格式和频率。
 
+## 2026-10-27 审核修复（26916dc 之后）
+
+- 部分输出后的读超时保留原始 `incomplete_reason`，continue、restart 和 checkpoint 摘要都走 `timeout` 预算；只有 `missing_finish` / `unknown_finish` 才退回 `incomplete_stream`。
+- `_ensure_tool_replies` 现在同时写模型 tool 消息和 `tool_result` 事件，批量调用提前 fallback 时被跳过的工具卡片会结束。
+- `_make_emit` 创建时捕获 `match_id`，写 transcript 时在同一把锁里复核 generation 和 match_id；`_emit(..., generation=...)` 供旧线程路径使用；下一手分支在锁内重新检查 generation。
+- `start_match` 在排队前捕获 `_start_epoch`，中止会取消已经排队的启动请求。
+- 实验脚本把 `--llm-retries` / `--retry-backoff` 写入 runtime；`run_task` 保留 attempt 级 usage，`summarize` 的费用和 token 统计包含 fatal 行。
+- 历史统计先为每条街标注 `current_bet` / `raise_level`；`all_in` 只有提高下注额才算进攻，3-bet 只在 level 1，fold-to-3-bet 只在 level 2；`overall` 只按 hero 身份匹配，不再回退 `(0, 1)`。
+- `pot_to_call_ratio` 和 ActionBar 的盈亏平衡门槛都使用退款后的有效底池与实际跟注额。
+- 前端重放 transcript 后按 `match.aborted` 统一收尾 running turn/tool，并处理 `match_aborted` 事件。
+
 ## 当前取舍
 
 - 单桌、内存态；不做账号/持久化/多房间。历史研究只覆盖当前进程内的当前对局和已完成对局，重启后丢失；已完成对局最多保留 50 场聚合记录。

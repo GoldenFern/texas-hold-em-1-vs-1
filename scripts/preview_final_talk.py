@@ -110,6 +110,9 @@ def run_once(
         "max_steps_per_turn": 12,
         "max_consecutive_failures": 3,
         "request_timeout_seconds": args.timeout,
+        "max_retries": int(args.llm_retries),
+        "retry_base_delay_ms": float(args.retry_backoff) * 1000.0,
+        "retry_max_delay_ms": 10000.0,
     }
     client = RetryingClient(
         LLMClient(

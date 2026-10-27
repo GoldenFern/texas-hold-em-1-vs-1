@@ -228,6 +228,9 @@ def play_session(args: argparse.Namespace) -> dict:
                 if item.strip()
             ],
             "max_context_tokens_estimate": args.max_context,
+            "max_retries": int(args.llm_retries),
+            "retry_base_delay_ms": float(args.retry_backoff) * 1000.0,
+            "retry_max_delay_ms": 10000.0,
         }
     )
 

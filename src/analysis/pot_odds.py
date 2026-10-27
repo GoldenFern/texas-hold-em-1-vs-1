@@ -107,7 +107,8 @@ def analyze_call(
 
     ev_call = equity * effective_pot - call_amount
     breakeven = call_amount / effective_pot
-    pot_to_call_ratio = pot / call_amount
+    # Profit-to-risk ratio after removing the opponent's uncalled refund.
+    pot_to_call_ratio = (effective_pot - call_amount) / call_amount
     return CallEvResult(
         pot=int(pot),
         to_call=int(to_call),

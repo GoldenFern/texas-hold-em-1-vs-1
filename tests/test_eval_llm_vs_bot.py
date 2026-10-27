@@ -13,11 +13,14 @@ from scripts.eval_llm_vs_bot import (
     count_auto_turns,
     estimate_hand_cost,
     hand_tool_stats,
+    load_runtime,
     make_opponent,
     resolve_tool_names,
+    run_task,
     summarize,
 )
 from src.agents.scripted_bot import ScriptedBot
+from src.llm.retry import RetryPolicy
 
 
 def test_resolve_tool_names_always_keeps_apply_action() -> None:
@@ -167,6 +170,93 @@ def test_estimate_hand_cost_falls_back_to_input_price_without_cache_price() -> N
     assert estimate_hand_cost(
         1_000_000, 0, legacy_args, cached_tokens=1_000_000
     ) == pytest.approx(0.045)
+
+
+def test_load_runtime_applies_cli_retry_policy() -> None:
+    args = SimpleNamespace(
+        max_steps=None,
+        context_policy=None,
+        max_context_tokens=None,
+        keep_recent_tokens=None,
+        buffer_tokens=None,
+        summary_max_tokens=None,
+        summary_retries=None,
+        llm_retries=1,
+        retry_backoff=0.0,
+    )
+    runtime = load_runtime(args)
+    policy = RetryPolicy.from_runtime(runtime)
+    assert policy.max_retries == 1
+    assert policy.base_delay == 0.0
+    assert policy.max_delay == pytest.approx(10.0)
+
+
+def test_run_task_accumulates_usage_from_failed_attempts(monkeypatch) -> None:
+    rows = [
+        {
+            "fatal_error": "boom",
+            "api_errors": 1,
+            "input_tokens": 900,
+            "cached_input_tokens": 0,
+            "cache_miss_input_tokens": 900,
+            "output_tokens": 100,
+            "reasoning_tokens": 10,
+            "est_cost_cny": 0.9,
+            "api_calls": 3,
+            "retry_attempts": 1,
+        },
+        {
+            "fatal_error": "",
+            "api_errors": 0,
+            "input_tokens": 100,
+            "cached_input_tokens": 40,
+            "cache_miss_input_tokens": 60,
+            "output_tokens": 20,
+            "reasoning_tokens": 2,
+            "est_cost_cny": 0.1,
+            "api_calls": 1,
+            "retry_attempts": 0,
+        },
+    ]
+    monkeypatch.setattr("scripts.eval_llm_vs_bot.play_hand", lambda *args: rows.pop(0))
+    monkeypatch.setattr("scripts.eval_llm_vs_bot.time.sleep", lambda _seconds: None)
+    row = run_task(
+        HandTask(index=0, deal_index=0, assignment=0, seed=1),
+        None,
+        None,
+        {},
+        SimpleNamespace(retries=1, retry_api_errors=False),
+    )
+
+    assert row["attempts"] == 2
+    assert row["input_tokens"] == 1_000
+    assert row["output_tokens"] == 120
+    assert row["est_cost_cny"] == pytest.approx(1.0)
+    assert row["attempt_api_errors"] == 1
+    assert len(row["attempt_rows"]) == 2
+
+
+def test_summarize_counts_cost_from_failed_rows() -> None:
+    valid = _cache_row(0, input_tokens=1_000, cached_tokens=0)
+    valid["est_cost_cny"] = 0.1
+    failed = {
+        "fatal_error": "boom",
+        "input_tokens": 2_000,
+        "cached_input_tokens": 0,
+        "cache_miss_input_tokens": 2_000,
+        "output_tokens": 500,
+        "reasoning_tokens": 0,
+        "est_cost_cny": 0.5,
+        "api_calls": 1,
+        "retry_attempts": 0,
+    }
+    summary = summarize(
+        [valid, failed],
+        SimpleNamespace(bb=10, agent_locale="zh-CN"),
+    )
+    assert summary["input_tokens"] == 3_000
+    assert summary["output_tokens"] == 500
+    assert summary["est_cost_cny"] == pytest.approx(0.6)
 
 
 def test_cache_hit_rate_handles_empty_and_bounded_input() -> None:
