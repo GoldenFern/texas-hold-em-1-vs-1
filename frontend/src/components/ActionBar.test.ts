@@ -32,6 +32,8 @@ function snapshot(overrides: Record<string, any> = {}) {
     street: "flop",
     pot: 30,
     current_bet: 10,
+    small_blind: 5,
+    big_blind: 10,
     min_raise_to: 20,
     max_raise_to: 900,
     to_call: 0,
@@ -89,6 +91,14 @@ describe("ActionBar raise type", () => {
     expect(button).toBeTruthy();
     await button!.trigger("click");
     expect(storeMock.humanAction).toHaveBeenCalledWith("bet", 20);
+    wrapper.unmount();
+  });
+
+  it("steps the raise amount by one big blind", () => {
+    const wrapper = mount(ActionBar);
+    const input = wrapper.find('input[type="number"]');
+    expect(input.exists()).toBe(true);
+    expect(input.attributes("step")).toBe("10");
     wrapper.unmount();
   });
 

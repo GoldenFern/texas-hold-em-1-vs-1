@@ -44,6 +44,10 @@ const canFold = computed(() => legal.value.includes("fold"));
 const canAllIn = computed(() => legal.value.includes("all_in") && isRaise.value);
 const pot = computed(() => Number(snapshot.value?.pot || 0));
 const currentBet = computed(() => Number(snapshot.value?.current_bet || 0));
+const bigBlind = computed(() => {
+  const value = Number(snapshot.value?.big_blind || 0);
+  return Number.isFinite(value) && value > 0 ? value : 1;
+});
 const minRaise = computed(() => Number(snapshot.value?.min_raise_to || 0));
 const maxRaise = computed(() => Number(snapshot.value?.max_raise_to || 0));
 const humanPlayer = computed(() => {
@@ -288,6 +292,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
               type="number"
               :min="minRaise"
               :max="maxRaise"
+              :step="bigBlind"
               :value="raiseDraft"
               @input="onRaiseInput"
               @blur="onRaiseBlur"
