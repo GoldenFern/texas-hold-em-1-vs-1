@@ -33,6 +33,22 @@ def test_provider_metadata_has_english_fields() -> None:
     assert "hint_en" in public["controls"]["temperature"]
 
 
+def test_adjustable_reasoning_effort_defaults_to_low() -> None:
+    registry = ProviderRegistry()
+    adjustable = [
+        ("deepseek", "deepseek-flash"),
+        ("minimax", "MiniMax-M3.1-Flash"),
+        ("zhipu", "glm-5.3-flash"),
+        ("4router", "gpt-6-luna"),
+    ]
+
+    for provider_id, model_id in adjustable:
+        spec = registry.resolve(provider_id, model_id)
+        options = spec.controls["reasoning_effort"]["options"]
+        assert "low" in options
+        assert spec.default_params()["reasoning_effort"] == "low"
+
+
 def test_mimo_payload_uses_thinking_toggle() -> None:
     registry = ProviderRegistry()
     spec = registry.resolve("mimo", "mimo-v2.6-flash")

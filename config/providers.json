@@ -26,7 +26,7 @@
             "top_p": 1.0,
             "max_tokens": 32768,
             "thinking": true,
-            "reasoning_effort": "high"
+            "reasoning_effort": "low"
           },
           "controls": {
             "temperature": {
@@ -172,7 +172,7 @@
             "top_p": 0.95,
             "max_tokens": 32768,
             "thinking": true,
-            "reasoning_effort": "high"
+            "reasoning_effort": "low"
           },
           "controls": {
             "temperature": {
@@ -215,8 +215,8 @@
                 "xhigh",
                 "max"
               ],
-              "hint": "推理深度，默认 max",
-              "hint_en": "Reasoning depth; default max"
+              "hint": "推理深度，默认 low",
+              "hint_en": "Reasoning depth; default low"
             }
           },
           "tagline_en": "1M context · interleaved thinking · native tools"
@@ -324,7 +324,7 @@
             "top_p": 0.95,
             "max_tokens": 32768,
             "thinking": true,
-            "reasoning_effort": "high"
+            "reasoning_effort": "low"
           },
           "controls": {
             "temperature": {
@@ -365,8 +365,8 @@
                 "high",
                 "max"
               ],
-              "hint": "默认 max；low 更省 token",
-              "hint_en": "Default max; low saves tokens"
+              "hint": "默认 low；越低越省 token",
+              "hint_en": "Default low; lower effort saves tokens"
             }
           },
           "tagline_en": "1M context · native multimodal · long-horizon agent"
@@ -611,7 +611,7 @@
             "top_p": 1.0,
             "max_tokens": 32768,
             "thinking": true,
-            "reasoning_effort": "high"
+            "reasoning_effort": "low"
           },
           "controls": {
             "temperature": {
@@ -655,8 +655,8 @@
                 "xhigh",
                 "max"
               ],
-              "hint": "推理深度，默认 high",
-              "hint_en": "Reasoning depth; default high"
+              "hint": "推理深度，默认 low",
+              "hint_en": "Reasoning depth; default low"
             }
           },
           "tagline_en": "272K budget tier · reasoning model · 4Router 0.45 tier"

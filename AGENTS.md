@@ -203,6 +203,7 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 
 ## Provider 事实（2026-10）
 
+- 可调 `reasoning_effort` 的模型（DeepSeek、MiniMax、GLM、4Router）默认值为 `low`；Provider 卡片里的提示文案也按 low 维护。
 - DeepSeek：`thinking: {type}` + `reasoning_effort: low/high/max`；思考模式工具回合必须回传 reasoning_content，否则 400。官方上下文 1,048,576，最大输出 393,216（384K）。
 - 火山方舟：OpenAI 兼容，`thinking: {type: enabled/disabled}`；模型 `doubao-seed-2-1-turbo-260628`，256K 上下文、256K 最大输出。
 - MiniMax M3.1 Flash：始终思考，`thinking.type` 只接受 adaptive；忽略 temperature/top_p；有 `reasoning_effort`；1M 上下文、128K 输出。
@@ -258,6 +259,9 @@ python scripts/reconstruct_live_match.py --run tmp/live_match/<run>  # 进程中
 - `prefers-reduced-motion` 下队列直接展示最终牌面，底牌 hold 也跳过。
 
 ## 前端约定
+
+- `SetupModal` 主界面只保留快速开始、对局双方、模型、喊话风格、起始筹码和小盲/大盲；模型参数、Bot 算法与模型文件、随机种子、盲注递增、自动重购、上帝视角、Agent 语言都折叠在底部「高级设置」里。校验失败涉及隐藏项时自动展开高级设置。
+- 新配置默认 `reasoning_effort=low`（可调模型）、Agent 语言 `auto`、双 LLM 喊话开启。上帝视角按阵容自动默认：有人类参与时关闭，没有人类时开启；用户在高级设置里手动改过后保留手动选择。配置存储 key 已升到 `heads-up-lab.setup.v2`，旧的 v1 配置不再读取。
 
 - 主界面信息只保留一份：底池在牌桌中央，阶段在牌桌工具栏，行动状态在 `ActionBar`；不要再往 `TopBar`、`SeatPod` 或牌桌上加同类状态。
 - `TopBar` 常态只显示品牌、双方图标、手牌编号和操作按钮；连接正常时不显示 LIVE，仅在断线时显示离线提示。对局双方用厂商/角色图标表达，完整名称放 `title`，不要重复“厂商 · 模型”长文本。

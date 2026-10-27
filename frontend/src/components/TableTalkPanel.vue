@@ -51,11 +51,6 @@ function seatStyleAggressive(entry: TableTalkEntry): boolean {
 
 <template>
   <div class="talk-panel">
-    <div class="talk-note">
-      <AppIcon name="shield" :size="12" />
-      <span>{{ t("talk.note") }}</span>
-    </div>
-
     <div v-if="!entries.length" class="talk-empty">
       <div class="talk-empty-orb"><AppIcon name="message" :size="22" /></div>
       <strong>{{ t("talk.emptyTitle") }}</strong>
@@ -102,24 +97,6 @@ function seatStyleAggressive(entry: TableTalkEntry): boolean {
   flex-direction: column;
   gap: 10px;
   padding: 4px 2px 10px;
-}
-
-.talk-note {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 7px 9px;
-  border-radius: 8px;
-  border: 1px solid rgba(232, 195, 122, 0.2);
-  background: rgba(232, 195, 122, 0.05);
-  color: var(--muted);
-  font-size: calc(9px * var(--type-scale));
-  line-height: 1.55;
-}
-
-.talk-note .app-icon {
-  color: var(--gold);
-  margin-top: 1px;
 }
 
 .talk-empty {

@@ -95,6 +95,7 @@ describe("AnalysisPanel collapsed summary", () => {
 
     expect(wrapper.find(".chart").exists()).toBe(true);
     expect(wrapper.findAll(".chart-row")).toHaveLength(3);
+    expect(wrapper.find(".analysis-foot").exists()).toBe(false);
     expect(window.localStorage.getItem("hulab.analysis.expanded")).toBe("1");
     wrapper.unmount();
   });

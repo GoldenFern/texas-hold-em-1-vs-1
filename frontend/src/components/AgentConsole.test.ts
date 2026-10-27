@@ -104,7 +104,7 @@ describe("AgentConsole stream", () => {
     await nextTick();
 
     expect(wrapper.find(".talk-tab").exists()).toBe(true);
-    expect(wrapper.text()).toContain("不做真伪核查");
+    expect(wrapper.find(".talk-note").exists()).toBe(false);
     expect(wrapper.text()).toContain("我这次不会再让你便宜看牌。");
     wrapper.unmount();
   });

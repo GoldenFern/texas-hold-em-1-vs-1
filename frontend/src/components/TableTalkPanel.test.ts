@@ -9,7 +9,7 @@ const seats = [
 ];
 
 describe("TableTalkPanel", () => {
-  it("shows the untrusted-content note and groups messages by hand", () => {
+  it("groups messages by hand", () => {
     const wrapper = mount(TableTalkPanel, {
       props: {
         seats,
@@ -21,7 +21,7 @@ describe("TableTalkPanel", () => {
       },
     });
 
-    expect(wrapper.text()).toContain("不做真伪核查");
+    expect(wrapper.find(".talk-note").exists()).toBe(false);
     expect(wrapper.findAll(".talk-group")).toHaveLength(2);
     expect(wrapper.text()).toContain("第一句");
     expect(wrapper.text()).toContain("第二句");

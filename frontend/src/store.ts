@@ -30,7 +30,7 @@ import type {
 
 export type ConsoleMode = "stream" | "log" | "talk";
 
-const STORAGE_KEY = "heads-up-lab.setup.v1";
+const STORAGE_KEY = "heads-up-lab.setup.v2";
 
 interface StoreState {
   boot: Bootstrap | null;
@@ -189,6 +189,11 @@ export function defaultTableTalkStyle(): string {
   return styles.find((style) => style.default)?.id || styles[0]?.id || "gentle";
 }
 
+/** God view defaults on only when no human takes a seat. */
+export function defaultGodView(seats: SeatSetup[]): boolean {
+  return !seats.some((seat) => seat.kind === "human");
+}
+
 function tableTalkStyleIds(): Set<string> {
   return new Set((state.boot?.table_talk_styles || []).map((style) => style.id));
 }
@@ -224,14 +229,15 @@ export function buildDefaultSetup(): MatchSetupPayload {
     blind_increase_every_hands: 0,
     blind_increase_factor: 2,
     seed: null,
-    god_view: true,
+    god_view: false,
     table_talk: true,
   };
   const model = pickDefaultModel();
   const saved = loadSavedSetup();
   if (saved) return saved;
+  const seats: [SeatSetup, SeatSetup] = [defaultSeat("llm", model), defaultSeat("human")];
   return {
-    seats: [defaultSeat("llm", model), defaultSeat("human")],
+    seats,
     rules: {
       starting_chips: defaults.starting_chips,
       small_blind: defaults.small_blind,
@@ -242,7 +248,7 @@ export function buildDefaultSetup(): MatchSetupPayload {
       blind_increase_every_hands: defaults.blind_increase_every_hands ?? 0,
       blind_increase_factor: defaults.blind_increase_factor ?? 2,
       seed: defaults.seed,
-      god_view: defaults.god_view,
+      god_view: defaultGodView(seats),
     },
     table_talk: defaults.table_talk ?? true,
     table_talk_style: defaults.table_talk_style || defaultTableTalkStyle(),

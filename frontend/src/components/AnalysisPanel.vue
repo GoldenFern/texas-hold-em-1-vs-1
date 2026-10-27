@@ -47,13 +47,6 @@ const topCategory = computed(() => {
   if (!list.length) return null;
   return list.reduce((best, item) => (item.probability > best.probability ? item : best));
 });
-const methodText = computed(() => {
-  if (!analysis.value) return "";
-  const count = analysis.value.total.toLocaleString("en-US");
-  return analysis.value.method === "exact"
-    ? t("analysis.exact", { count })
-    : t("analysis.monteCarlo", { count });
-});
 const stale = computed(() => {
   if (!analysis.value || !snapshot.value) return false;
   return analysis.value.hand_id !== snapshot.value.hand_id || analysis.value.street !== snapshot.value.street;
@@ -184,11 +177,6 @@ function toggleExpanded(): void {
         <span class="spinner"></span>
         {{ t("analysis.waitingData") }}
       </div>
-
-      <footer v-if="analysis" class="analysis-foot">
-        <span class="foot-note">{{ t("analysis.foot") }}</span>
-        <span class="mono faint">{{ methodText }} · {{ analysis.elapsed_ms.toFixed(1) }}ms</span>
-      </footer>
     </div>
   </section>
 </template>
@@ -383,25 +371,6 @@ function toggleExpanded(): void {
 }
 
 .chart-row.best .chart-pct { color: var(--gold); }
-
-.analysis-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding-top: 6px;
-  border-top: 1px solid var(--line);
-}
-
-.foot-note {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: calc(9px * var(--type-scale));
-  color: var(--faint);
-  line-height: 1.5;
-}
 
 .analysis-empty {
   display: flex;

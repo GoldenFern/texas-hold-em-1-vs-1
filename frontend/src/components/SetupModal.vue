@@ -9,11 +9,11 @@ import {
   abortMatch,
   buildDefaultSetup,
   closeSetup,
+  defaultGodView,
   defaultSeat,
   defaultTableTalkStyle,
   game,
   modelFor,
-  providerOf,
   pushToast,
   startMatch,
   testProvider,
@@ -38,7 +38,7 @@ const FALLBACK_RULES: SetupDraft["rules"] = {
   blind_increase_every_hands: 0,
   blind_increase_factor: 2,
   seed: null,
-  god_view: true,
+  god_view: false,
 };
 
 const BOT_DELAY_DEFAULT = 3;
@@ -68,6 +68,8 @@ const tableTalkStyles = computed<TableTalkStyleInfo[]>(
   () => boot.value?.table_talk_styles || [],
 );
 const tableTalkTouched = ref(false);
+const godViewTouched = ref(false);
+const advancedOpen = ref(false);
 const modalRef = ref<HTMLElement | null>(null);
 
 function tableTalkStyle(id: string | undefined): TableTalkStyleInfo | null {
@@ -117,6 +119,24 @@ function toggleTableTalk(): void {
   setup.table_talk = !setup.table_talk;
 }
 
+watch(
+  () => setup.seats.map((item) => item.kind).join("|"),
+  () => {
+    if (!godViewTouched.value) {
+      setup.rules.god_view = defaultGodView(setup.seats);
+    }
+  },
+);
+
+function toggleGodView(): void {
+  godViewTouched.value = true;
+  setup.rules.god_view = !setup.rules.god_view;
+}
+
+function toggleAdvanced(): void {
+  advancedOpen.value = !advancedOpen.value;
+}
+
 function deepCopy<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
@@ -135,6 +155,11 @@ function resetSetup(): void {
   setup.rules = { ...copy.rules };
   setup.agent_locale = copy.agent_locale || "auto";
   setup.table_talk_style = normalizeTableTalkStyle(copy.table_talk_style);
+  const autoGodView = defaultGodView(setup.seats);
+  const savedGodView = copy.rules.god_view ?? autoGodView;
+  setup.rules.god_view = Boolean(savedGodView);
+  godViewTouched.value = Boolean(savedGodView) !== autoGodView;
+  advancedOpen.value = false;
   for (const config of setup.seats) {
     if (config.kind === "llm") {
       config.table_talk_style = normalizeTableTalkStyle(config.table_talk_style);
@@ -342,6 +367,27 @@ function botModels(agentType: string) {
   return models.filter((model) => model.name.includes("_project") === project);
 }
 
+function botAgentName(index: number): string {
+  const agentType = seat(index).bot?.agent_type || "random";
+  const agent = (rlcard.value?.agents || []).find((item) => item.id === agentType);
+  return agent?.name || (agentType.startsWith("project_") ? "Project Bot" : "RLCard");
+}
+
+function botModelName(index: number): string {
+  const path = seat(index).bot?.model_path;
+  if (!path) return "";
+  const model = (rlcard.value?.models || []).find((item) => item.path === path);
+  if (model) return model.name;
+  return path.split(/[\\/]/).pop() || path;
+}
+
+function seatSummary(index: number): string {
+  const config = seat(index);
+  if (config.kind === "llm") return currentModel(index)?.name || "LLM";
+  if (config.kind === "bot") return botAgentName(index);
+  return t("setup.human");
+}
+
 function setBotModel(index: number, path: string): void {
   const bot = seat(index).bot || { agent_type: "random", model_path: null };
   setup.seats[index] = {
@@ -473,6 +519,30 @@ const validation = computed(() => {
 });
 
 const canStart = computed(() => !validation.value && !busy.value && !starting.value);
+
+const advancedValidationError = computed(() => {
+  for (const [key, label] of [
+    ["rebuy_amount", t("setup.rebuyAmount")],
+    ["max_hands", t("setup.maxHands")],
+    ["blind_increase_every_hands", t("setup.blindIncreaseEvery")],
+  ] as const) {
+    if (limitError(key, label)) return true;
+  }
+  if (numericRule("max_hands") < 0) return true;
+  if (blindIncreaseEnabled.value) {
+    const factor = numericRule("blind_increase_factor");
+    if (factor < 1 || factor > 10) return true;
+  }
+  return setup.seats.some((config) => {
+    if (config.kind !== "bot") return false;
+    const agentType = config.bot?.agent_type || "random";
+    return agentType !== "random" && !config.bot?.model_path;
+  });
+});
+
+watch(advancedValidationError, (hasError) => {
+  if (hasError) advancedOpen.value = true;
+});
 const canAbort = computed(() => Boolean(
   starting.value
   || (
@@ -630,15 +700,11 @@ function close(): void {
 
               <!-- Human -->
               <div v-if="config.kind === 'human'" class="seat-body human-body">
-                <div class="human-orb"><AppIcon name="user" :size="24" /></div>
-                <h4>{{ t("setup.humanTitle") }}</h4>
-                <p>{{ t("setup.humanBody") }}</p>
-                <div class="human-features">
-                  <span class="chip"><AppIcon name="eye" :size="10" /> {{ t("setup.humanFeatureHole") }}</span>
-                  <span class="chip"><AppIcon name="clock" :size="10" /> {{ t("setup.humanFeatureTime") }}</span>
-                  <span class="chip"><AppIcon name="cards" :size="10" /> {{ t("setup.humanFeatureGod") }}</span>
+                <div class="human-orb"><AppIcon name="user" :size="20" /></div>
+                <div class="human-copy">
+                  <h4>{{ t("setup.humanTitle") }}</h4>
+                  <p>{{ t("setup.humanCompact") }}</p>
                 </div>
-                <blockquote class="human-quote">{{ t("setup.humanQuote") }}</blockquote>
               </div>
 
               <!-- LLM -->
@@ -662,6 +728,123 @@ function close(): void {
                 </div>
 
                 <template v-if="currentModel(index)">
+                  <div class="model-summary" :style="{ '--provider-accent': currentModel(index)!.accent }">
+                    <span class="model-icon logo-tile"><img :src="iconUrl(currentModel(index)!.icon)" :alt="modelProviderName(currentModel(index)!)" /></span>
+                    <strong>{{ currentModel(index)!.name }}</strong>
+                    <span v-if="!currentModel(index)!.key_present" class="key-state missing">
+                      <AppIcon name="alert" :size="11" />
+                      {{ t("setup.keyMissing", { env: currentModel(index)!.api_key_env }) }}
+                    </span>
+                  </div>
+
+                  <label
+                    v-if="canTableTalk && setup.table_talk && tableTalkStyles.length"
+                    class="table-talk-style"
+                  >
+                    <div class="mode-label">
+                      <span>{{ t("setup.tableTalkStyle") }}</span>
+                      <span class="param-hint">{{ t("setup.tableTalkStyleHint") }}</span>
+                    </div>
+                    <select
+                      class="input"
+                      :value="config.table_talk_style || defaultTableTalkStyle()"
+                      @change="setSeatTableTalkStyle(index, $event)"
+                    >
+                      <option
+                        v-for="style in tableTalkStyles"
+                        :key="style.id"
+                        :value="style.id"
+                      >
+                        {{ tableTalkStyleName(style) }}
+                      </option>
+                    </select>
+                    <p class="param-hint">{{ tableTalkStyleDescription(config.table_talk_style) }}</p>
+                    <p class="style-sample">
+                      {{ t("setup.tableTalkStyleSample", { sample: tableTalkStyleSample(config.table_talk_style) }) }}
+                    </p>
+                  </label>
+                </template>
+                <div v-else class="seat-placeholder">{{ t("setup.selectProviderModel") }}</div>
+              </div>
+
+              <!-- Bot -->
+              <div v-else class="seat-body bot-body">
+                <div class="bot-summary">
+                  <span class="bot-icon"><AppIcon name="bot" :size="18" /></span>
+                  <div class="bot-text">
+                    <strong>{{ botAgentName(index) }}</strong>
+                    <small>{{ botModelName(index) || t("setup.botRandomHint") }}</small>
+                  </div>
+                </div>
+                <p class="field-hint">{{ t("setup.botAdvancedHint") }}</p>
+                <div v-if="rlcard && !rlcard.available" class="inline-warning">
+                  <AppIcon name="alert" :size="12" />
+                  {{ t("setup.rlcardMissing") }}
+                </div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="setup-section">
+          <div class="section-head">
+            <div>
+              <span class="section-kicker">02</span>
+              <h3>{{ t("setup.rules") }}</h3>
+            </div>
+            <span class="section-note">{{ t("setup.rulesMainHint") }}</span>
+          </div>
+
+          <div class="rules-grid main-rules">
+            <label class="field">
+              <span class="field-label">{{ t("setup.startingChips") }}</span>
+              <input class="input" type="number" :min="limits.starting_chips?.min || 100" :max="limits.starting_chips?.max || 100000" :value="numericRule('starting_chips')" @input="setNumericRule('starting_chips', $event)" />
+            </label>
+            <label class="field">
+              <span class="field-label">{{ t("setup.blinds") }}</span>
+              <div class="blind-row">
+                <input class="input" type="number" :min="1" :value="numericRule('small_blind')" @input="setNumericRule('small_blind', $event)" />
+                <span class="blind-sep">/</span>
+                <input class="input" type="number" :min="2" :value="numericRule('big_blind')" @input="setNumericRule('big_blind', $event)" />
+              </div>
+            </label>
+          </div>
+
+          <div class="blind-presets">
+            <span class="faint">{{ t("setup.quickBlinds") }}</span>
+            <button class="chip" @click="setBlinds(5, 10)">5 / 10</button>
+            <button class="chip" @click="setBlinds(10, 20)">10 / 20</button>
+            <button class="chip" @click="setBlinds(25, 50)">25 / 50</button>
+          </div>
+        </section>
+
+        <section class="setup-section advanced-section">
+          <button
+            type="button"
+            class="advanced-toggle"
+            :aria-expanded="advancedOpen"
+            @click="toggleAdvanced"
+          >
+            <span class="advanced-title">
+              <span class="section-kicker">03</span>
+              <span class="advanced-heading">{{ t("setup.advanced") }}</span>
+            </span>
+            <span v-if="advancedValidationError" class="advanced-error">
+              <AppIcon name="alert" :size="11" />
+              {{ t("setup.advancedError") }}
+            </span>
+            <span v-else class="advanced-summary">{{ t("setup.advancedHint") }}</span>
+            <AppIcon name="chevronDown" :size="16" class="advanced-chevron" :class="{ open: advancedOpen }" />
+          </button>
+
+          <div v-if="advancedOpen" class="advanced-body">
+            <div class="advanced-seat-grid">
+              <section v-for="(config, index) in setup.seats" :key="`advanced-${index}`" class="advanced-block">
+                <header class="advanced-head">
+                  <h4>{{ t("setup.seatLabel", { seat: index === 0 ? "A" : "B" }) }} · {{ seatSummary(index) }}</h4>
+                </header>
+
+                <template v-if="config.kind === 'llm' && currentModel(index)">
                   <div class="model-card" :style="{ '--provider-accent': currentModel(index)!.accent }">
                     <div class="model-head">
                       <span class="model-icon logo-tile"><img :src="iconUrl(currentModel(index)!.icon)" :alt="modelProviderName(currentModel(index)!)" /></span>
@@ -787,33 +970,6 @@ function close(): void {
                       <span>{{ modelQuirk(currentModel(index)!) }}</span>
                     </div>
 
-                    <label
-                      v-if="canTableTalk && setup.table_talk && tableTalkStyles.length"
-                      class="table-talk-style"
-                    >
-                      <div class="mode-label">
-                        <span>{{ t("setup.tableTalkStyle") }}</span>
-                        <span class="param-hint">{{ t("setup.tableTalkStyleHint") }}</span>
-                      </div>
-                      <select
-                        class="input"
-                        :value="config.table_talk_style || defaultTableTalkStyle()"
-                        @change="setSeatTableTalkStyle(index, $event)"
-                      >
-                        <option
-                          v-for="style in tableTalkStyles"
-                          :key="style.id"
-                          :value="style.id"
-                        >
-                          {{ tableTalkStyleName(style) }}
-                        </option>
-                      </select>
-                      <p class="param-hint">{{ tableTalkStyleDescription(config.table_talk_style) }}</p>
-                      <p class="style-sample">
-                        {{ t("setup.tableTalkStyleSample", { sample: tableTalkStyleSample(config.table_talk_style) }) }}
-                      </p>
-                    </label>
-
                     <div class="test-row">
                       <button class="btn btn-sm" :disabled="!currentModel(index)!.key_present || isTesting(index)" @click="testConnection(index)">
                         <span v-if="isTesting(index)" class="spinner"></span>
@@ -830,198 +986,185 @@ function close(): void {
                     </div>
                   </div>
                 </template>
-                <div v-else class="seat-placeholder">{{ t("setup.selectProviderModel") }}</div>
+
+                <template v-else-if="config.kind === 'bot'">
+                  <div class="bot-grid">
+                    <button
+                      v-for="agent in rlcard?.agents || []"
+                      :key="agent.id"
+                      class="bot-option"
+                      :class="{ active: config.bot?.agent_type === agent.id }"
+                      @click="setBotType(index, agent.id)"
+                    >
+                      <span class="bot-icon"><AppIcon :name="agent.id === 'random' ? 'zap' : 'brain'" :size="16" /></span>
+                      <span class="bot-text">
+                        <strong>{{ agent.name }}</strong>
+                        <small>{{ botDescription(agent) }}</small>
+                      </span>
+                    </button>
+                  </div>
+
+                  <label class="field">
+                    <div class="param-head">
+                      <span>{{ t("setup.botDelay") }} <span class="param-en">delay</span></span>
+                      <strong class="mono">{{ botDelay(index).toFixed(1) }}s</strong>
+                    </div>
+                    <input
+                      class="range"
+                      type="range"
+                      :min="BOT_DELAY_MIN"
+                      :max="BOT_DELAY_MAX"
+                      step="0.5"
+                      :value="botDelay(index)"
+                      :style="{ '--pct': rangePct(botDelay(index), BOT_DELAY_MIN, BOT_DELAY_MAX) }"
+                      @input="setBotDelay(index, $event)"
+                    />
+                    <span class="field-hint">{{ t("setup.botDelayHint") }}</span>
+                  </label>
+
+                  <label v-if="config.bot?.agent_type !== 'random'" class="field">
+                    <span class="field-label">{{ t("setup.modelFile") }}</span>
+                    <select class="input" :value="config.bot?.model_path || ''" @change="setBotModel(index, ($event.target as HTMLSelectElement).value)">
+                      <option value="">{{ t("setup.selectModel", { dir: rlcard?.model_dir || "" }) }}</option>
+                      <option v-for="model in botModels(config.bot?.agent_type || 'random')" :key="model.path" :value="model.path">
+                        {{ model.name }} · {{ model.size_kb }} KB
+                      </option>
+                    </select>
+                    <span class="field-hint" v-if="!(rlcard?.models || []).length">
+                      {{ t("setup.noModels") }}
+                    </span>
+                  </label>
+
+                  <div class="bot-note">
+                    <AppIcon name="bot" :size="13" />
+                    <span>{{ t("setup.botNoReasoning") }}</span>
+                  </div>
+
+                  <div v-if="rlcard && !rlcard.available" class="inline-warning">
+                    <AppIcon name="alert" :size="12" />
+                    {{ t("setup.rlcardMissing") }}
+                  </div>
+                </template>
+
+                <p v-else-if="config.kind === 'llm'" class="field-hint">{{ t("setup.selectProviderModel") }}</p>
+                <p v-else class="field-hint">{{ t("setup.humanAdvancedHint") }}</p>
+              </section>
+            </div>
+
+            <section class="advanced-block">
+              <header class="advanced-head">
+                <h4>{{ t("setup.advancedTable") }}</h4>
+              </header>
+              <div class="rules-grid">
+                <label class="field">
+                  <span class="field-label">{{ t("setup.maxHands") }} <span class="field-hint-inline">{{ t("setup.unlimited") }}</span></span>
+                  <input class="input" type="number" min="0" :max="limits.max_hands?.max || 1000" :value="numericRule('max_hands')" @input="setNumericRule('max_hands', $event)" />
+                </label>
+                <label class="field">
+                  <span class="field-label">{{ t("setup.seed") }} <span class="field-hint-inline">{{ t("setup.seedHint") }}</span></span>
+                  <input class="input" type="number" :placeholder="t('setup.seedPlaceholder')" :value="setup.rules.seed ?? ''" @input="setSeed" />
+                </label>
               </div>
 
-              <!-- Bot -->
-              <div v-else class="seat-body">
-                <div class="bot-grid">
+              <div class="rules-row blind-rules">
+                <div class="rule-toggle">
+                  <div class="rule-text">
+                    <strong>{{ t("setup.blindIncrease") }}</strong>
+                    <span>{{ t("setup.blindIncreaseHint") }}</span>
+                  </div>
                   <button
-                    v-for="agent in rlcard?.agents || []"
-                    :key="agent.id"
-                    class="bot-option"
-                    :class="{ active: config.bot?.agent_type === agent.id }"
-                    @click="setBotType(index, agent.id)"
-                  >
-                    <span class="bot-icon"><AppIcon :name="agent.id === 'random' ? 'zap' : 'brain'" :size="16" /></span>
-                    <span class="bot-text">
-                      <strong>{{ agent.name }}</strong>
-                      <small>{{ botDescription(agent) }}</small>
+                    class="toggle"
+                    :class="{ on: blindIncreaseEnabled }"
+                    @click="toggleBlindIncrease"
+                  ></button>
+                </div>
+                <label v-if="blindIncreaseEnabled" class="field blind-every-field">
+                  <span class="field-label">{{ t("setup.blindIncreaseEvery") }}</span>
+                  <input
+                    class="input"
+                    type="number"
+                    min="1"
+                    :max="limits.blind_increase_every_hands?.max || 1000"
+                    :value="numericRule('blind_increase_every_hands')"
+                    @input="setNumericRule('blind_increase_every_hands', $event)"
+                  />
+                </label>
+                <label v-if="blindIncreaseEnabled" class="field blind-factor-field">
+                  <span class="field-label">{{ t("setup.blindIncreaseFactor") }}</span>
+                  <select class="input" :value="numericRule('blind_increase_factor')" @change="setBlindFactor">
+                    <option :value="1.5">1.5×</option>
+                    <option :value="2">2×</option>
+                    <option :value="3">3×</option>
+                  </select>
+                </label>
+              </div>
+
+              <div class="rules-row">
+                <div class="rule-toggle">
+                  <div class="rule-text">
+                    <strong>{{ t("setup.autoRebuy") }}</strong>
+                    <span>{{ t("setup.autoRebuyHint") }}</span>
+                  </div>
+                  <button class="toggle" :class="{ on: setup.rules.auto_rebuy }" @click="setRule('auto_rebuy', !setup.rules.auto_rebuy)"></button>
+                </div>
+                <label v-if="setup.rules.auto_rebuy" class="field rebuy-field">
+                  <span class="field-label">{{ t("setup.rebuyAmount") }}</span>
+                  <input class="input" type="number" :min="limits.rebuy_amount?.min || 100" :max="limits.rebuy_amount?.max || 100000" :value="numericRule('rebuy_amount')" @input="setNumericRule('rebuy_amount', $event)" />
+                </label>
+              </div>
+            </section>
+
+            <section class="advanced-block">
+              <header class="advanced-head">
+                <h4>{{ t("setup.advancedView") }}</h4>
+                <span class="param-hint">{{ t("setup.godViewNote") }}</span>
+              </header>
+              <div class="rules-row">
+                <div class="rule-toggle god-view-toggle">
+                  <div class="rule-text">
+                    <strong>{{ t("setup.godView") }}</strong>
+                    <span>{{ t("setup.godViewHint") }}</span>
+                  </div>
+                  <button class="toggle" :class="{ on: setup.rules.god_view }" @click="toggleGodView"></button>
+                </div>
+                <div class="rule-toggle" :class="{ disabled: !canTableTalk }">
+                  <div class="rule-text">
+                    <strong>{{ t("setup.tableTalk") }}</strong>
+                    <span>
+                      {{ canTableTalk ? t("setup.tableTalkHint") : t("setup.tableTalkUnavailable") }}
                     </span>
+                  </div>
+                  <button
+                    class="toggle"
+                    :class="{ on: setup.table_talk }"
+                    :disabled="!canTableTalk"
+                    @click="toggleTableTalk"
+                  ></button>
+                </div>
+              </div>
+
+              <div v-if="setup.seats.some((item) => item.kind === 'llm')" class="rule-toggle agent-language">
+                <div class="rule-text">
+                  <strong>{{ t("setup.agentLanguage") }}</strong>
+                  <span>{{ t("setup.agentLanguageHint") }}</span>
+                  <span class="field-hint-inline">{{ t("setup.agentLanguageResolved", { language: resolvedAgentLanguage }) }}</span>
+                </div>
+                <div class="segmented effort-switch">
+                  <button :class="{ active: setup.agent_locale === 'auto' }" @click="setAgentLocale('auto')">
+                    {{ t("setup.agentLanguageAuto") }}
+                  </button>
+                  <button :class="{ active: setup.agent_locale === 'zh-CN' }" @click="setAgentLocale('zh-CN')">
+                    {{ t("setup.agentLanguageZh") }}
+                  </button>
+                  <button :class="{ active: setup.agent_locale === 'en-US' }" @click="setAgentLocale('en-US')">
+                    {{ t("setup.agentLanguageEn") }}
                   </button>
                 </div>
-
-                <label class="field">
-                  <div class="param-head">
-                    <span>{{ t("setup.botDelay") }} <span class="param-en">delay</span></span>
-                    <strong class="mono">{{ botDelay(index).toFixed(1) }}s</strong>
-                  </div>
-                  <input
-                    class="range"
-                    type="range"
-                    :min="BOT_DELAY_MIN"
-                    :max="BOT_DELAY_MAX"
-                    step="0.5"
-                    :value="botDelay(index)"
-                    :style="{ '--pct': rangePct(botDelay(index), BOT_DELAY_MIN, BOT_DELAY_MAX) }"
-                    @input="setBotDelay(index, $event)"
-                  />
-                  <span class="field-hint">{{ t("setup.botDelayHint") }}</span>
-                </label>
-
-                <label v-if="config.bot?.agent_type !== 'random'" class="field">
-                  <span class="field-label">{{ t("setup.modelFile") }}</span>
-                  <select class="input" :value="config.bot?.model_path || ''" @change="setBotModel(index, ($event.target as HTMLSelectElement).value)">
-                    <option value="">{{ t("setup.selectModel", { dir: rlcard?.model_dir || "" }) }}</option>
-                    <option v-for="model in botModels(config.bot?.agent_type || 'random')" :key="model.path" :value="model.path">
-                      {{ model.name }} · {{ model.size_kb }} KB
-                    </option>
-                  </select>
-                  <span class="field-hint" v-if="!(rlcard?.models || []).length">
-                    {{ t("setup.noModels") }}
-                  </span>
-                </label>
-
-                <div class="bot-note">
-                  <AppIcon name="bot" :size="13" />
-                  <span>{{ t("setup.botNoReasoning") }}</span>
-                </div>
-
-                <div v-if="rlcard && !rlcard.available" class="inline-warning">
-                  <AppIcon name="alert" :size="12" />
-                  {{ t("setup.rlcardMissing") }}
-                </div>
               </div>
-            </article>
+            </section>
           </div>
         </section>
 
-        <section class="setup-section">
-          <div class="section-head">
-            <div>
-              <span class="section-kicker">02</span>
-              <h3>{{ t("setup.rules") }}</h3>
-            </div>
-            <span class="section-note">{{ t("setup.godViewNote") }}</span>
-          </div>
-
-          <div class="rules-grid">
-            <label class="field">
-              <span class="field-label">{{ t("setup.startingChips") }}</span>
-              <input class="input" type="number" :min="limits.starting_chips?.min || 100" :max="limits.starting_chips?.max || 100000" :value="numericRule('starting_chips')" @input="setNumericRule('starting_chips', $event)" />
-            </label>
-            <label class="field">
-              <span class="field-label">{{ t("setup.blinds") }}</span>
-              <div class="blind-row">
-                <input class="input" type="number" :min="1" :value="numericRule('small_blind')" @input="setNumericRule('small_blind', $event)" />
-                <span class="blind-sep">/</span>
-                <input class="input" type="number" :min="2" :value="numericRule('big_blind')" @input="setNumericRule('big_blind', $event)" />
-              </div>
-            </label>
-            <label class="field">
-              <span class="field-label">{{ t("setup.maxHands") }} <span class="field-hint-inline">{{ t("setup.unlimited") }}</span></span>
-              <input class="input" type="number" min="0" :max="limits.max_hands?.max || 1000" :value="numericRule('max_hands')" @input="setNumericRule('max_hands', $event)" />
-            </label>
-            <label class="field">
-              <span class="field-label">{{ t("setup.seed") }} <span class="field-hint-inline">{{ t("setup.seedHint") }}</span></span>
-              <input class="input" type="number" :placeholder="t('setup.seedPlaceholder')" :value="setup.rules.seed ?? ''" @input="setSeed" />
-            </label>
-          </div>
-
-          <div class="rules-row blind-rules">
-            <div class="rule-toggle">
-              <div class="rule-text">
-                <strong>{{ t("setup.blindIncrease") }}</strong>
-                <span>{{ t("setup.blindIncreaseHint") }}</span>
-              </div>
-              <button
-                class="toggle"
-                :class="{ on: blindIncreaseEnabled }"
-                @click="toggleBlindIncrease"
-              ></button>
-            </div>
-            <label v-if="blindIncreaseEnabled" class="field blind-every-field">
-              <span class="field-label">{{ t("setup.blindIncreaseEvery") }}</span>
-              <input
-                class="input"
-                type="number"
-                min="1"
-                :max="limits.blind_increase_every_hands?.max || 1000"
-                :value="numericRule('blind_increase_every_hands')"
-                @input="setNumericRule('blind_increase_every_hands', $event)"
-              />
-            </label>
-            <label v-if="blindIncreaseEnabled" class="field blind-factor-field">
-              <span class="field-label">{{ t("setup.blindIncreaseFactor") }}</span>
-              <select class="input" :value="numericRule('blind_increase_factor')" @change="setBlindFactor">
-                <option :value="1.5">1.5×</option>
-                <option :value="2">2×</option>
-                <option :value="3">3×</option>
-              </select>
-            </label>
-          </div>
-
-          <div class="rules-row">
-            <div class="rule-toggle">
-              <div class="rule-text">
-                <strong>{{ t("setup.autoRebuy") }}</strong>
-                <span>{{ t("setup.autoRebuyHint") }}</span>
-              </div>
-              <button class="toggle" :class="{ on: setup.rules.auto_rebuy }" @click="setRule('auto_rebuy', !setup.rules.auto_rebuy)"></button>
-            </div>
-            <label v-if="setup.rules.auto_rebuy" class="field rebuy-field">
-              <span class="field-label">{{ t("setup.rebuyAmount") }}</span>
-              <input class="input" type="number" :min="limits.rebuy_amount?.min || 100" :max="limits.rebuy_amount?.max || 100000" :value="numericRule('rebuy_amount')" @input="setNumericRule('rebuy_amount', $event)" />
-            </label>
-            <div class="rule-toggle">
-              <div class="rule-text">
-                <strong>{{ t("setup.godView") }}</strong>
-                <span>{{ t("setup.godViewHint") }}</span>
-              </div>
-              <button class="toggle" :class="{ on: setup.rules.god_view }" @click="setRule('god_view', !setup.rules.god_view)"></button>
-            </div>
-            <div class="rule-toggle" :class="{ disabled: !canTableTalk }">
-              <div class="rule-text">
-                <strong>{{ t("setup.tableTalk") }}</strong>
-                <span>
-                  {{ canTableTalk ? t("setup.tableTalkHint") : t("setup.tableTalkUnavailable") }}
-                </span>
-              </div>
-              <button
-                class="toggle"
-                :class="{ on: setup.table_talk }"
-                :disabled="!canTableTalk"
-                @click="toggleTableTalk"
-              ></button>
-            </div>
-          </div>
-
-          <div v-if="setup.seats.some((item) => item.kind === 'llm')" class="rule-toggle agent-language">
-            <div class="rule-text">
-              <strong>{{ t("setup.agentLanguage") }}</strong>
-              <span>{{ t("setup.agentLanguageHint") }}</span>
-              <span class="field-hint-inline">{{ t("setup.agentLanguageResolved", { language: resolvedAgentLanguage }) }}</span>
-            </div>
-            <div class="segmented effort-switch">
-              <button :class="{ active: setup.agent_locale === 'auto' }" @click="setAgentLocale('auto')">
-                {{ t("setup.agentLanguageAuto") }}
-              </button>
-              <button :class="{ active: setup.agent_locale === 'zh-CN' }" @click="setAgentLocale('zh-CN')">
-                {{ t("setup.agentLanguageZh") }}
-              </button>
-              <button :class="{ active: setup.agent_locale === 'en-US' }" @click="setAgentLocale('en-US')">
-                {{ t("setup.agentLanguageEn") }}
-              </button>
-            </div>
-          </div>
-
-          <div class="blind-presets">
-            <span class="faint">{{ t("setup.quickBlinds") }}</span>
-            <button class="chip" @click="setBlinds(5, 10)">5 / 10</button>
-            <button class="chip" @click="setBlinds(10, 20)">10 / 20</button>
-            <button class="chip" @click="setBlinds(25, 50)">25 / 50</button>
-          </div>
-        </section>
       </div>
 
       <footer class="modal-footer">
@@ -1203,43 +1346,33 @@ function close(): void {
 .human-body {
   align-items: center;
   justify-content: center;
-  text-align: center;
+  flex-direction: row;
+  gap: 12px;
+  text-align: left;
   padding: 18px 22px;
-  min-height: 260px;
+  min-height: 200px;
 }
 
+.human-copy { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+
 .human-orb {
-  width: 54px;
-  height: 54px;
+  width: 46px;
+  height: 46px;
   display: grid;
   place-items: center;
   border-radius: 50%;
   border: 1px solid rgba(84, 214, 168, 0.24);
   background: radial-gradient(circle at 35% 28%, rgba(84, 214, 168, 0.18), transparent 60%);
   color: var(--emerald);
-  margin-bottom: 2px;
+  flex: none;
 }
 
 .human-body h4 { margin: 0; font-size: calc(14px * var(--type-scale)); font-weight: 750; }
 .human-body p { margin: 0; max-width: 280px; font-size: calc(10.5px * var(--type-scale)); line-height: 1.65; color: var(--muted); }
-.human-features { display: flex; gap: 5px; flex-wrap: wrap; justify-content: center; margin-top: 3px; }
-
-.human-quote {
-  margin: 10px 0 0;
-  padding: 9px 12px;
-  max-width: 300px;
-  border-left: 2px solid rgba(232, 195, 122, 0.3);
-  background: linear-gradient(90deg, rgba(232, 195, 122, 0.045), transparent);
-  color: var(--faint);
-  font-size: calc(9.5px * var(--type-scale));
-  line-height: 1.7;
-  text-align: left;
-  border-radius: 0 8px 8px 0;
-}
 
 .provider-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 4px;
 }
 
@@ -1292,6 +1425,41 @@ function close(): void {
 
 .key-dot.ok { background: var(--emerald); box-shadow: 0 0 6px rgba(84, 214, 168, 0.5); }
 .key-dot.missing { background: var(--red); }
+
+.model-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in srgb, var(--provider-accent) 28%, var(--line));
+  background: color-mix(in srgb, var(--provider-accent) 7%, rgba(4, 12, 9, 0.35));
+}
+
+.model-summary strong {
+  font-size: calc(11.5px * var(--type-scale));
+  font-weight: 750;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-summary .key-state { margin-left: auto; }
+
+.bot-body { justify-content: center; }
+
+.bot-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.022);
+}
+
+.bot-summary .bot-icon { margin-top: 0; }
 
 .model-card {
   display: flex;
@@ -1475,6 +1643,67 @@ function close(): void {
 .blind-presets .chip { cursor: pointer; }
 .blind-presets .chip:hover { color: var(--gold); border-color: rgba(232, 195, 122, 0.3); }
 
+.main-rules { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+.advanced-section { gap: 8px; }
+
+.advanced-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.022);
+  text-align: left;
+}
+
+.advanced-toggle:hover {
+  border-color: var(--line-strong);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.advanced-title { display: flex; align-items: baseline; gap: 8px; flex: none; }
+.advanced-heading { font-size: calc(14px * var(--type-scale)); font-weight: 750; letter-spacing: -0.01em; }
+.advanced-summary { font-size: calc(9.5px * var(--type-scale)); color: var(--faint); min-width: 0; }
+.advanced-error { display: inline-flex; align-items: center; gap: 4px; font-size: calc(9.5px * var(--type-scale)); color: var(--red); }
+.advanced-chevron { margin-left: auto; color: var(--faint); transition: transform 0.18s ease; flex: none; }
+.advanced-chevron.open { transform: rotate(180deg); }
+
+.advanced-body { display: flex; flex-direction: column; gap: 10px; }
+
+.advanced-seat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.advanced-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.018);
+  min-width: 0;
+}
+
+.advanced-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--line);
+}
+
+.advanced-head h4 { margin: 0; font-size: calc(11px * var(--type-scale)); font-weight: 750; }
+.advanced-block .rules-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.advanced-block .agent-language { margin-top: 0; }
+
 .footer-note { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .validation { display: inline-flex; align-items: center; gap: 5px; font-size: calc(10px * var(--type-scale)); }
 .validation.ok { color: var(--emerald); }
@@ -1496,5 +1725,8 @@ function close(): void {
   .preset-hint { display: none; }
   .footer-note { display: none; }
   .footer-actions { width: 100%; justify-content: flex-end; }
+  .advanced-seat-grid { grid-template-columns: minmax(0, 1fr); }
+  .advanced-summary { display: none; }
+  .advanced-toggle { flex-wrap: wrap; }
 }
 </style>

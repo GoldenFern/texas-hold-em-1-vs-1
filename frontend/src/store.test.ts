@@ -39,6 +39,7 @@ import { api } from "./api";
 import {
   boot,
   buildDefaultSetup,
+  defaultGodView,
   defaultSeat,
   game,
   humanAction,
@@ -309,6 +310,37 @@ describe("table-talk style setup", () => {
     expect(setup.table_talk_style).toBe("gentle");
     expect(setup.seats[0].table_talk_style).toBe("gentle");
     expect(defaultSeat("llm").table_talk_style).toBe("gentle");
+  });
+});
+
+describe("match defaults", () => {
+  it("turns god view off for the default human match", () => {
+    localStorage.clear();
+    const setup = buildDefaultSetup();
+    expect(setup.rules.god_view).toBe(false);
+    expect(setup.table_talk).toBe(true);
+    expect(setup.agent_locale).toBe("auto");
+  });
+
+  it("derives god view from the seat composition", () => {
+    expect(defaultGodView([{ kind: "human" } as any, { kind: "llm" } as any])).toBe(false);
+    expect(defaultGodView([{ kind: "llm" } as any, { kind: "llm" } as any])).toBe(true);
+    expect(defaultGodView([{ kind: "bot" } as any, { kind: "bot" } as any])).toBe(true);
+  });
+
+  it("ignores the old v1 saved setup", () => {
+    localStorage.clear();
+    localStorage.setItem("heads-up-lab.setup.v1", JSON.stringify({
+      seats: [{ kind: "llm" }, { kind: "llm" }],
+      rules: { god_view: true },
+      table_talk: false,
+      agent_locale: "en-US",
+    }));
+
+    const setup = buildDefaultSetup();
+    expect(setup.seats[1].kind).toBe("human");
+    expect(setup.rules.god_view).toBe(false);
+    expect(setup.agent_locale).toBe("auto");
   });
 });
 

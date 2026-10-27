@@ -35,7 +35,7 @@
           "tagline": "1M 上下文 · 原生工具调用",
           "context_window": 1000000,
           "max_output": 131072,
-          "defaults": {"temperature": 1.0, "top_p": 1.0, "max_tokens": 32768, "thinking": true, "reasoning_effort": "high"},
+          "defaults": {"temperature": 1.0, "top_p": 1.0, "max_tokens": 32768, "thinking": true, "reasoning_effort": "low"},
           "controls": {
             "temperature": {"show": true, "min": 0, "max": 2, "step": 0.1, "hint": "..."},
             "thinking": {"mode": "toggle", "label": "深度思考", "hint": "..."}
@@ -76,7 +76,7 @@ Key 值永远不会返回；只有 `key_present`。
       "name": "DeepSeek",
       "provider_id": "deepseek",
       "model_id": "deepseek-flash",
-      "params": {"temperature": 1.0, "max_tokens": 32768, "thinking": true, "reasoning_effort": "high"},
+      "params": {"temperature": 1.0, "max_tokens": 32768, "thinking": true, "reasoning_effort": "low"},
       "table_talk_style": "gentle"
     },
     {
